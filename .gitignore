@@ -1,0 +1,19 @@
+# System / IDE
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+
+# Sensitive environment files
+.env
+*.token
+
+# Python cache (if any)
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Antigravity agent temp artifacts (if needed)
+.system_generated/
