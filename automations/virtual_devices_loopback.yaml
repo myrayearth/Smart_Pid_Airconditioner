@@ -1,0 +1,74 @@
+# Home Assistant Automations for Virtual Test Devices (MQTT Loopback)
+# These automations echo commands back as states so the virtual devices behave interactively in HA UI.
+
+- alias: "Virtual Climate - Loopback State Update"
+  id: virtual_climate_loopback
+  trigger:
+    - platform: mqtt
+      topic: "homeassistant/climate/test/mode/set"
+      id: mode
+    - platform: mqtt
+      topic: "homeassistant/climate/test/temp/set"
+      id: temp
+    - platform: mqtt
+      topic: "homeassistant/climate/test/fan_mode/set"
+      id: fan_mode
+  action:
+    - choose:
+        - conditions: "{{ trigger.id == 'mode' }}"
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "homeassistant/climate/test/mode/state"
+                payload: "{{ trigger.payload }}"
+                retain: true
+        - conditions: "{{ trigger.id == 'temp' }}"
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "homeassistant/climate/test/temp/state"
+                payload: "{{ trigger.payload }}"
+                retain: true
+        - conditions: "{{ trigger.id == 'fan_mode' }}"
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "homeassistant/climate/test/fan_mode/state"
+                payload: "{{ trigger.payload }}"
+                retain: true
+
+- alias: "Virtual Humidifier - Loopback State Update"
+  id: virtual_humidifier_loopback
+  trigger:
+    - platform: mqtt
+      topic: "homeassistant/humidifier/test/set"
+      id: power
+    - platform: mqtt
+      topic: "homeassistant/humidifier/test/humidity/set"
+      id: humidity
+    - platform: mqtt
+      topic: "homeassistant/humidifier/test/mode/set"
+      id: mode
+  action:
+    - choose:
+        - conditions: "{{ trigger.id == 'power' }}"
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "homeassistant/humidifier/test/state"
+                payload: "{{ trigger.payload }}"
+                retain: true
+        - conditions: "{{ trigger.id == 'humidity' }}"
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "homeassistant/humidifier/test/humidity/state"
+                payload: "{{ trigger.payload }}"
+                retain: true
+        - conditions: "{{ trigger.id == 'mode' }}"
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "homeassistant/humidifier/test/mode/state"
+                payload: "{{ trigger.payload }}"
+                retain: true

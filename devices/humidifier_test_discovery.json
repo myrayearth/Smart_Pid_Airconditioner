@@ -1,0 +1,26 @@
+{
+  "name": "Virtual Humidifier (Test)",
+  "unique_id": "test_humidifier_001",
+  "device_class": "humidifier",
+  "min_humidity": 30,
+  "max_humidity": 80,
+  "modes": [
+    "normal",
+    "eco",
+    "sleep",
+    "turbo",
+    "auto"
+  ],
+  "command_topic": "homeassistant/humidifier/test/set",
+  "state_topic": "homeassistant/humidifier/test/state",
+  "target_humidity_command_topic": "homeassistant/humidifier/test/humidity/set",
+  "target_humidity_state_topic": "homeassistant/humidifier/test/humidity/state",
+  "mode_command_topic": "homeassistant/humidifier/test/mode/set",
+  "mode_state_topic": "homeassistant/humidifier/test/mode/state",
+  "device": {
+    "identifiers": ["virtual_humidifier_test"],
+    "name": "Virtual Humidifier / Dehumidifier",
+    "model": "Smart Humidity Simulator",
+    "manufacturer": "Antigravity Lab"
+  }
+}
