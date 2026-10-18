@@ -1,0 +1,10 @@
+{
+  "domain": "smart_pid_airconditioner",
+  "name": "Smart PID Air Conditioner",
+  "codeowners": ["@myrayearth"],
+  "config_flow": true,
+  "documentation": "https://github.com/myrayearth/Smart_Pid_Airconditioner",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "version": "0.0.1"
+}

@@ -1,0 +1,773 @@
+{
+  "config": {
+    "error": {
+      "min_temp_greater_than_max": "최저 설정 온도는 최고 설정 온도보다 낮아야 합니다.",
+      "invalid_section_order": "구간 최대 출력값은 '구간 1 < 구간 2 < 구간 3' 순서로 커져야 합니다.",
+      "target_device_must_be_climate": "Air conditioner 모드의 에어컨/보일러에서는 대상 기기로 에어컨/온도조절기(climate)를 선택해야 합니다.",
+      "target_device_must_be_humidifier": "Air conditioner 모드의 가습기/제습기에서는 대상 기기로 가습기(humidifier)를 선택해야 합니다.",
+      "target_device_must_be_switch": "스위치 PWM 모드에서는 대상 기기로 스위치(switch) 또는 input_boolean을 선택해야 합니다.",
+      "target_device_cool_must_be_switch": "냉방 제어 대상 기기는 스위치(switch) 또는 input_boolean이어야 합니다.",
+      "target_device_heat_must_be_switch": "난방 제어 대상 기기는 스위치(switch) 또는 input_boolean이어야 합니다.",
+      "target_device_dehumidity_must_be_switch": "제습 제어 대상 기기는 스위치(switch) 또는 input_boolean이어야 합니다.",
+      "target_device_humidity_must_be_switch": "가습 제어 대상 기기는 스위치(switch) 또는 input_boolean이어야 합니다.",
+      "target_device_cool_required": "PWM 냉/난방 겸용 모드에서는 냉방 제어 대상 기기(스위치)를 지정해야 합니다.",
+      "target_device_heat_required": "PWM 냉/난방 겸용 모드에서는 난방 제어 대상 기기(스위치)를 지정해야 합니다.",
+      "target_device_dehumidity_required": "PWM 가습/제습기 모드에서는 제습 제어 대상 기기(스위치)를 지정해야 합니다.",
+      "target_device_humidity_required": "PWM 가습/제습기 모드에서는 가습 제어 대상 기기(스위치)를 지정해야 합니다.",
+      "target_device_required": "제어 대상 기기를 선택해야 합니다.",
+      "min_times_exceed_pwm_duration": "최소 가동 시간과 최소 정지 시간의 합은 PWM 제어 주기보다 작아야 합니다."
+    },
+    "step": {
+      "user": {
+        "title": "제어 방식 및 제어기 유형 선택 (1/3)",
+        "description": "제어 방식(Air Conditioner 모드 또는 PWM 모드)과 제어기 유형(에어컨, 보일러, 냉방/난방 겸용, 제습기, 가습기, 가습/제습 겸용)을 선택합니다.",
+        "data": {
+          "control_mode": "제어 방식",
+          "thermostat_type": "제어기 유형"
+        }
+      },
+      "device_sensor": {
+        "title": "기기 및 센서 설정 (2/3)",
+        "description": "제어 대상 기기 및 센서, 기본 PID 파라미터를 설정합니다.",
+        "data": {
+          "target_device": "제어 대상 기기",
+          "target_device_cool": "냉방 제어 대상 기기 (스위치/릴레이)",
+          "target_device_heat": "난방 제어 대상 기기 (스위치/릴레이)",
+          "target_device_dehumidity": "제습 제어 대상 기기 (스위치/릴레이)",
+          "target_device_humidity": "가습 제어 대상 기기 (스위치/릴레이)",
+          "target_climate": "제어 대상 기기 (Air conditioner / Humidifier)",
+          "indoor_sensor": "실내 센서 (온도 또는 습도)",
+          "outdoor_sensor": "실외 센서 (온도 또는 습도)",
+          "available_hvac_modes": "사용 가능한 동작방식 (운전 모드)",
+          "available_fan_modes": "사용 가능한 팬 속도",
+          "initial_target_temp": "초기 목표값 (°C 또는 %)",
+          "min_temp": "최저 설정 가능값 (°C 또는 %)",
+          "max_temp": "최고 설정 가능값 (°C 또는 %)",
+          "temp_step": "조절 단위 (Step)",
+          "off_temp_action": "꺼짐(OFF) 상태에서 설정값 변경 시 동작",
+          "sync_slave_state": "실제 기기 외부 상태 변경 감지 및 양방향 동기화",
+          "kp": "비례 게인 (Kp)",
+          "ki": "적분 게인 (Ki)",
+          "kd": "미분 게인 (Kd)",
+          "ke": "외기 단열 계수 (Ke)",
+          "pwm_duration": "PWM 제어 주기 (초, 0=연속제어)",
+          "sample_period": "PID 연산 주기 (초)"
+        }
+      },
+      "sections": {
+        "title": "출력 구간별 상세 설정 (2/2)",
+        "description": "PID 출력(%) 구간에 따른 동작방식, 목표값 보정값(Delta)과 팬 속도를 지정합니다. 체크된 항목만 기기에 반영되며, 체크 해제된 항목은 현재 상태를 그대로 유지합니다.",
+        "sections": {
+          "section_1": {
+            "name": "━━━ 구간 1 설정 (0% ~ 구간 1 최대) ━━━",
+            "description": "0% ~ 구간 1 최대 출력 시의 목표값, 팬 속도, 운전 모드를 설정합니다.",
+            "data": {
+              "sec1_max": "[구간 1] 최대 출력 (%)",
+              "sec1_apply_temp": "[구간 1] 설정값 변경",
+              "sec1_delta": "[구간 1] 보정값 (Delta)",
+              "sec1_apply_fan": "[구간 1] 팬 속도(Fan) 적용",
+              "sec1_fan": "[구간 1] 팬 속도 선택",
+              "sec1_apply_hvac_mode": "[구간 1] 동작방식(운전 모드) 적용",
+              "sec1_hvac_mode": "[구간 1] 동작방식(운전 모드) 선택",
+              "sec1_apply_action": "[구간 1] 동작방식 적용",
+              "sec1_action": "[구간 1] 동작방식 선택",
+              "sec1_apply_mode": "[구간 1] 모드 적용",
+              "sec1_mode": "[구간 1] 모드 선택"
+            }
+          },
+          "section_2": {
+            "name": "━━━ 구간 2 설정 (구간 1 초과 ~ 구간 2 최대) ━━━",
+            "description": "구간 1 초과 ~ 구간 2 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec2_max": "[구간 2] 최대 출력 (%)",
+              "sec2_apply_temp": "[구간 2] 설정값 변경",
+              "sec2_delta": "[구간 2] 보정값 (Delta)",
+              "sec2_apply_fan": "[구간 2] 팬 속도(Fan) 적용",
+              "sec2_fan": "[구간 2] 팬 속도 선택",
+              "sec2_apply_hvac_mode": "[구간 2] 동작방식(운전 모드) 적용",
+              "sec2_hvac_mode": "[구간 2] 동작방식(운전 모드) 선택",
+              "sec2_apply_action": "[구간 2] 동작방식 적용",
+              "sec2_action": "[구간 2] 동작방식 선택",
+              "sec2_apply_mode": "[구간 2] 모드 적용",
+              "sec2_mode": "[구간 2] 모드 선택"
+            }
+          },
+          "section_3": {
+            "name": "━━━ 구간 3 설정 (구간 2 초과 ~ 구간 3 최대) ━━━",
+            "description": "구간 2 초과 ~ 구간 3 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec3_max": "[구간 3] 최대 출력 (%)",
+              "sec3_apply_temp": "[구간 3] 설정값 변경",
+              "sec3_delta": "[구간 3] 보정값 (Delta)",
+              "sec3_apply_fan": "[구간 3] 팬 속도(Fan) 적용",
+              "sec3_fan": "[구간 3] 팬 속도 선택",
+              "sec3_apply_hvac_mode": "[구간 3] 동작방식(운전 모드) 적용",
+              "sec3_hvac_mode": "[구간 3] 동작방식(운전 모드) 선택",
+              "sec3_apply_action": "[구간 3] 동작방식 적용",
+              "sec3_action": "[구간 3] 동작방식 선택",
+              "sec3_apply_mode": "[구간 3] 모드 적용",
+              "sec3_mode": "[구간 3] 모드 선택"
+            }
+          },
+          "section_4": {
+            "name": "━━━ 구간 4 설정 (구간 3 초과 ~ 100%) ━━━",
+            "description": "구간 3 초과 ~ 100% 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec4_apply_temp": "[구간 4] 설정값 변경",
+              "sec4_delta": "[구간 4] 보정값 (Delta)",
+              "sec4_apply_fan": "[구간 4] 팬 속도(Fan) 적용",
+              "sec4_fan": "[구간 4] 팬 속도 선택",
+              "sec4_apply_hvac_mode": "[구간 4] 동작방식(운전 모드) 적용",
+              "sec4_hvac_mode": "[구간 4] 동작방식(운전 모드) 선택",
+              "sec4_apply_action": "[구간 4] 동작방식 적용",
+              "sec4_action": "[구간 4] 동작방식 선택",
+              "sec4_apply_mode": "[구간 4] 모드 적용",
+              "sec4_mode": "[구간 4] 모드 선택"
+            }
+          }
+        },
+        "data": {
+          "sec1_max": "[구간 1] 최대 출력 (%)",
+          "sec1_apply_temp": "[구간 1] 설정값 변경",
+          "sec1_delta": "[구간 1] 보정값 (Delta)",
+          "sec1_apply_fan": "[구간 1] 팬 속도(Fan) 적용",
+          "sec1_fan": "[구간 1] 팬 속도 선택",
+          "sec1_apply_hvac_mode": "[구간 1] 동작방식(운전 모드) 적용",
+          "sec1_hvac_mode": "[구간 1] 동작방식(운전 모드) 선택",
+          "sec2_max": "[구간 2] 최대 출력 (%)",
+          "sec2_apply_temp": "[구간 2] 설정값 변경",
+          "sec2_delta": "[구간 2] 보정값 (Delta)",
+          "sec2_apply_fan": "[구간 2] 팬 속도(Fan) 적용",
+          "sec2_fan": "[구간 2] 팬 속도 선택",
+          "sec2_apply_hvac_mode": "[구간 2] 동작방식(운전 모드) 적용",
+          "sec2_hvac_mode": "[구간 2] 동작방식(운전 모드) 선택",
+          "sec3_max": "[구간 3] 최대 출력 (%)",
+          "sec3_apply_temp": "[구간 3] 설정값 변경",
+          "sec3_delta": "[구간 3] 보정값 (Delta)",
+          "sec3_apply_fan": "[구간 3] 팬 속도(Fan) 적용",
+          "sec3_fan": "[구간 3] 팬 속도 선택",
+          "sec3_apply_hvac_mode": "[구간 3] 동작방식(운전 모드) 적용",
+          "sec3_hvac_mode": "[구간 3] 동작방식(운전 모드) 선택",
+          "sec4_apply_temp": "[구간 4] 설정값 변경",
+          "sec4_delta": "[구간 4] 보정값 (Delta)",
+          "sec4_apply_fan": "[구간 4] 팬 속도(Fan) 적용",
+          "sec4_fan": "[구간 4] 팬 속도 선택",
+          "sec4_apply_hvac_mode": "[구간 4] 동작방식(운전 모드) 적용",
+          "sec4_hvac_mode": "[구간 4] 동작방식(운전 모드) 선택",
+          "sec1_apply_action": "[구간 1] 동작방식 적용",
+          "sec1_action": "[구간 1] 동작방식 선택",
+          "sec1_apply_mode": "[구간 1] 모드 적용",
+          "sec1_mode": "[구간 1] 모드 선택",
+          "sec2_apply_action": "[구간 2] 동작방식 적용",
+          "sec2_action": "[구간 2] 동작방식 선택",
+          "sec2_apply_mode": "[구간 2] 모드 적용",
+          "sec2_mode": "[구간 2] 모드 선택",
+          "sec3_apply_action": "[구간 3] 동작방식 적용",
+          "sec3_action": "[구간 3] 동작방식 선택",
+          "sec3_apply_mode": "[구간 3] 모드 적용",
+          "sec3_mode": "[구간 3] 모드 선택",
+          "sec4_apply_action": "[구간 4] 동작방식 적용",
+          "sec4_action": "[구간 4] 동작방식 선택",
+          "sec4_apply_mode": "[구간 4] 모드 적용",
+          "sec4_mode": "[구간 4] 모드 선택"
+        }
+      },
+      "sections_climate": {
+        "title": "구간별 동작 및 모드 설정 (3/3)",
+        "description": "PID 출력(%) 구간에 따른 목표값 보정값(Delta)과 동작 모드 / 팬 속도를 지정합니다.",
+        "sections": {
+          "section_1": {
+            "name": "━━━ 구간 1 설정 (0% ~ 구간 1 최대) ━━━",
+            "description": "0% ~ 구간 1 최대 출력 시의 목표값, 팬 속도, 운전 모드를 설정합니다.",
+            "data": {
+              "sec1_max": "[구간 1] 최대 출력 (%)",
+              "sec1_apply_temp": "[구간 1] 설정값 변경",
+              "sec1_delta": "[구간 1] 보정값 (Delta)",
+              "sec1_apply_fan": "[구간 1] 팬 속도(Fan) 적용",
+              "sec1_fan": "[구간 1] 팬 속도 선택",
+              "sec1_apply_hvac_mode": "[구간 1] 동작방식(운전 모드) 적용",
+              "sec1_hvac_mode": "[구간 1] 동작방식(운전 모드) 선택",
+              "sec1_apply_action": "[구간 1] 동작방식 적용",
+              "sec1_action": "[구간 1] 동작방식 선택",
+              "sec1_apply_mode": "[구간 1] 모드 적용",
+              "sec1_mode": "[구간 1] 모드 선택"
+            }
+          },
+          "section_2": {
+            "name": "━━━ 구간 2 설정 (구간 1 초과 ~ 구간 2 최대) ━━━",
+            "description": "구간 1 초과 ~ 구간 2 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec2_max": "[구간 2] 최대 출력 (%)",
+              "sec2_apply_temp": "[구간 2] 설정값 변경",
+              "sec2_delta": "[구간 2] 보정값 (Delta)",
+              "sec2_apply_fan": "[구간 2] 팬 속도(Fan) 적용",
+              "sec2_fan": "[구간 2] 팬 속도 선택",
+              "sec2_apply_hvac_mode": "[구간 2] 동작방식(운전 모드) 적용",
+              "sec2_hvac_mode": "[구간 2] 동작방식(운전 모드) 선택",
+              "sec2_apply_action": "[구간 2] 동작방식 적용",
+              "sec2_action": "[구간 2] 동작방식 선택",
+              "sec2_apply_mode": "[구간 2] 모드 적용",
+              "sec2_mode": "[구간 2] 모드 선택"
+            }
+          },
+          "section_3": {
+            "name": "━━━ 구간 3 설정 (구간 2 초과 ~ 구간 3 최대) ━━━",
+            "description": "구간 2 초과 ~ 구간 3 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec3_max": "[구간 3] 최대 출력 (%)",
+              "sec3_apply_temp": "[구간 3] 설정값 변경",
+              "sec3_delta": "[구간 3] 보정값 (Delta)",
+              "sec3_apply_fan": "[구간 3] 팬 속도(Fan) 적용",
+              "sec3_fan": "[구간 3] 팬 속도 선택",
+              "sec3_apply_hvac_mode": "[구간 3] 동작방식(운전 모드) 적용",
+              "sec3_hvac_mode": "[구간 3] 동작방식(운전 모드) 선택",
+              "sec3_apply_action": "[구간 3] 동작방식 적용",
+              "sec3_action": "[구간 3] 동작방식 선택",
+              "sec3_apply_mode": "[구간 3] 모드 적용",
+              "sec3_mode": "[구간 3] 모드 선택"
+            }
+          },
+          "section_4": {
+            "name": "━━━ 구간 4 설정 (구간 3 초과 ~ 100%) ━━━",
+            "description": "구간 3 초과 ~ 100% 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec4_apply_temp": "[구간 4] 설정값 변경",
+              "sec4_delta": "[구간 4] 보정값 (Delta)",
+              "sec4_apply_fan": "[구간 4] 팬 속도(Fan) 적용",
+              "sec4_fan": "[구간 4] 팬 속도 선택",
+              "sec4_apply_hvac_mode": "[구간 4] 동작방식(운전 모드) 적용",
+              "sec4_hvac_mode": "[구간 4] 동작방식(운전 모드) 선택",
+              "sec4_apply_action": "[구간 4] 동작방식 적용",
+              "sec4_action": "[구간 4] 동작방식 선택",
+              "sec4_apply_mode": "[구간 4] 모드 적용",
+              "sec4_mode": "[구간 4] 모드 선택"
+            }
+          }
+        },
+        "data": {
+          "sec1_max": "[구간 1] 최대 출력 (%)",
+          "sec1_apply_temp": "[구간 1] 설정값 변경",
+          "sec1_delta": "[구간 1] 보정값 (Delta)",
+          "sec1_apply_fan": "[구간 1] 팬 속도(Fan) 적용",
+          "sec1_fan": "[구간 1] 팬 속도 선택",
+          "sec1_apply_hvac_mode": "[구간 1] 동작방식(운전 모드) 적용",
+          "sec1_hvac_mode": "[구간 1] 동작방식(운전 모드) 선택",
+          "sec2_max": "[구간 2] 최대 출력 (%)",
+          "sec2_apply_temp": "[구간 2] 설정값 변경",
+          "sec2_delta": "[구간 2] 보정값 (Delta)",
+          "sec2_apply_fan": "[구간 2] 팬 속도(Fan) 적용",
+          "sec2_fan": "[구간 2] 팬 속도 선택",
+          "sec2_apply_hvac_mode": "[구간 2] 동작방식(운전 모드) 적용",
+          "sec2_hvac_mode": "[구간 2] 동작방식(운전 모드) 선택",
+          "sec3_max": "[구간 3] 최대 출력 (%)",
+          "sec3_apply_temp": "[구간 3] 설정값 변경",
+          "sec3_delta": "[구간 3] 보정값 (Delta)",
+          "sec3_apply_fan": "[구간 3] 팬 속도(Fan) 적용",
+          "sec3_fan": "[구간 3] 팬 속도 선택",
+          "sec3_apply_hvac_mode": "[구간 3] 동작방식(운전 모드) 적용",
+          "sec3_hvac_mode": "[구간 3] 동작방식(운전 모드) 선택",
+          "sec4_apply_temp": "[구간 4] 설정값 변경",
+          "sec4_delta": "[구간 4] 보정값 (Delta)",
+          "sec4_apply_fan": "[구간 4] 팬 속도(Fan) 적용",
+          "sec4_fan": "[구간 4] 팬 속도 선택",
+          "sec4_apply_hvac_mode": "[구간 4] 동작방식(운전 모드) 적용",
+          "sec4_hvac_mode": "[구간 4] 동작방식(운전 모드) 선택",
+          "sec1_apply_action": "[구간 1] 동작방식 적용",
+          "sec1_action": "[구간 1] 동작방식 선택",
+          "sec1_apply_mode": "[구간 1] 모드 적용",
+          "sec1_mode": "[구간 1] 모드 선택",
+          "sec2_apply_action": "[구간 2] 동작방식 적용",
+          "sec2_action": "[구간 2] 동작방식 선택",
+          "sec2_apply_mode": "[구간 2] 모드 적용",
+          "sec2_mode": "[구간 2] 모드 선택",
+          "sec3_apply_action": "[구간 3] 동작방식 적용",
+          "sec3_action": "[구간 3] 동작방식 선택",
+          "sec3_apply_mode": "[구간 3] 모드 적용",
+          "sec3_mode": "[구간 3] 모드 선택",
+          "sec4_apply_action": "[구간 4] 동작방식 적용",
+          "sec4_action": "[구간 4] 동작방식 선택",
+          "sec4_apply_mode": "[구간 4] 모드 적용",
+          "sec4_mode": "[구간 4] 모드 선택"
+        }
+      },
+      "sections_pwm": {
+        "title": "스위치 PWM 상세 제어 설정 (3/3)",
+        "description": "ON/OFF 스위치 시분할 제어 주기 및 압축기 보호 시간을 설정합니다.",
+        "data": {
+          "pwm_duration": "PWM 제어 1주기 시간 (시:분:초)",
+          "min_on_time": "최소 가동 시간 (시:분:초)",
+          "min_off_time": "최소 정지 시간 (압축기 보호, 시:분:초)",
+          "keep_alive": "상태 재전송 주기 (시:분:초)",
+          "output_safety": "센서 고장 시 안전 출력 (%)"
+        }
+      }
+    }
+  },
+  "options": {
+    "error": {
+      "min_temp_greater_than_max": "최저 설정 온도는 최고 설정 온도보다 낮아야 합니다.",
+      "invalid_section_order": "구간 최대 출력값은 '구간 1 < 구간 2 < 구간 3' 순서로 커져야 합니다.",
+      "target_device_must_be_climate": "Air conditioner 모드의 에어컨/보일러에서는 대상 기기로 에어컨/온도조절기(climate)를 선택해야 합니다.",
+      "target_device_must_be_humidifier": "Air conditioner 모드의 가습기/제습기에서는 대상 기기로 가습기(humidifier)를 선택해야 합니다.",
+      "target_device_must_be_switch": "스위치 PWM 모드에서는 대상 기기로 스위치(switch) 또는 input_boolean을 선택해야 합니다.",
+      "target_device_cool_must_be_switch": "냉방 제어 대상 기기는 스위치(switch) 또는 input_boolean이어야 합니다.",
+      "target_device_heat_must_be_switch": "난방 제어 대상 기기는 스위치(switch) 또는 input_boolean이어야 합니다.",
+      "target_device_dehumidity_must_be_switch": "제습 제어 대상 기기는 스위치(switch) 또는 input_boolean이어야 합니다.",
+      "target_device_humidity_must_be_switch": "가습 제어 대상 기기는 스위치(switch) 또는 input_boolean이어야 합니다.",
+      "target_device_cool_required": "PWM 냉/난방 겸용 모드에서는 냉방 제어 대상 기기(스위치)를 지정해야 합니다.",
+      "target_device_heat_required": "PWM 냉/난방 겸용 모드에서는 난방 제어 대상 기기(스위치)를 지정해야 합니다.",
+      "target_device_dehumidity_required": "PWM 가습/제습기 모드에서는 제습 제어 대상 기기(스위치)를 지정해야 합니다.",
+      "target_device_humidity_required": "PWM 가습/제습기 모드에서는 가습 제어 대상 기기(스위치)를 지정해야 합니다.",
+      "target_device_required": "제어 대상 기기를 선택해야 합니다.",
+      "min_times_exceed_pwm_duration": "최소 가동 시간과 최소 정지 시간의 합은 PWM 제어 주기보다 작아야 합니다."
+    },
+    "step": {
+      "init": {
+        "title": "기본 파라미터 수정",
+        "description": "제어기 유형, 센서, 사용 가능 모드 및 제어 파라미터를 수정합니다.",
+        "data": {
+          "control_mode": "제어 방식",
+          "target_device": "제어 대상 기기",
+          "target_device_cool": "냉방 제어 대상 기기 (스위치/릴레이)",
+          "target_device_heat": "난방 제어 대상 기기 (스위치/릴레이)",
+          "target_device_dehumidity": "제습 제어 대상 기기 (스위치/릴레이)",
+          "target_device_humidity": "가습 제어 대상 기기 (스위치/릴레이)",
+          "thermostat_type": "제어기 유형",
+          "indoor_sensor": "실내 센서 (온도 또는 습도)",
+          "outdoor_sensor": "실외 센서 (온도 또는 습도)",
+          "available_hvac_modes": "사용 가능한 동작방식 (운전 모드)",
+          "available_fan_modes": "사용 가능한 팬 속도",
+          "min_temp": "최저 설정 가능값 (°C 또는 %)",
+          "max_temp": "최고 설정 가능값 (°C 또는 %)",
+          "temp_step": "조절 단위 (Step)",
+          "off_temp_action": "꺼짐(OFF) 상태에서 설정값 변경 시 동작",
+          "sync_slave_state": "실제 기기 외부 상태 변경 감지 및 양방향 동기화",
+          "kp": "비례 게인 (Kp)",
+          "ki": "적분 게인 (Ki)",
+          "kd": "미분 게인 (Kd)",
+          "ke": "외기 단열 계수 (Ke)",
+          "pwm_duration": "PWM 제어 주기 (초)",
+          "sample_period": "PID 연산 주기 (초)"
+        }
+      },
+      "sections": {
+        "title": "출력 구간별 상세 설정 수정",
+        "description": "PID 출력 구간별 동작방식, 목표값 보정값(Delta) 및 팬 속도를 수정합니다. 체크된 항목만 반영되며, 체크 해제된 항목은 현재 상태를 유지합니다.",
+        "sections": {
+          "section_1": {
+            "name": "━━━ 구간 1 설정 (0% ~ 구간 1 최대) ━━━",
+            "description": "0% ~ 구간 1 최대 출력 시의 목표값, 팬 속도, 운전 모드를 설정합니다.",
+            "data": {
+              "sec1_max": "[구간 1] 최대 출력 (%)",
+              "sec1_apply_temp": "[구간 1] 설정값 변경",
+              "sec1_delta": "[구간 1] 보정값 (Delta)",
+              "sec1_apply_fan": "[구간 1] 팬 속도(Fan) 적용",
+              "sec1_fan": "[구간 1] 팬 속도 선택",
+              "sec1_apply_hvac_mode": "[구간 1] 동작방식(운전 모드) 적용",
+              "sec1_hvac_mode": "[구간 1] 동작방식(운전 모드) 선택",
+              "sec1_apply_action": "[구간 1] 동작방식 적용",
+              "sec1_action": "[구간 1] 동작방식 선택",
+              "sec1_apply_mode": "[구간 1] 모드 적용",
+              "sec1_mode": "[구간 1] 모드 선택"
+            }
+          },
+          "section_2": {
+            "name": "━━━ 구간 2 설정 (구간 1 초과 ~ 구간 2 최대) ━━━",
+            "description": "구간 1 초과 ~ 구간 2 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec2_max": "[구간 2] 최대 출력 (%)",
+              "sec2_apply_temp": "[구간 2] 설정값 변경",
+              "sec2_delta": "[구간 2] 보정값 (Delta)",
+              "sec2_apply_fan": "[구간 2] 팬 속도(Fan) 적용",
+              "sec2_fan": "[구간 2] 팬 속도 선택",
+              "sec2_apply_hvac_mode": "[구간 2] 동작방식(운전 모드) 적용",
+              "sec2_hvac_mode": "[구간 2] 동작방식(운전 모드) 선택",
+              "sec2_apply_action": "[구간 2] 동작방식 적용",
+              "sec2_action": "[구간 2] 동작방식 선택",
+              "sec2_apply_mode": "[구간 2] 모드 적용",
+              "sec2_mode": "[구간 2] 모드 선택"
+            }
+          },
+          "section_3": {
+            "name": "━━━ 구간 3 설정 (구간 2 초과 ~ 구간 3 최대) ━━━",
+            "description": "구간 2 초과 ~ 구간 3 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec3_max": "[구간 3] 최대 출력 (%)",
+              "sec3_apply_temp": "[구간 3] 설정값 변경",
+              "sec3_delta": "[구간 3] 보정값 (Delta)",
+              "sec3_apply_fan": "[구간 3] 팬 속도(Fan) 적용",
+              "sec3_fan": "[구간 3] 팬 속도 선택",
+              "sec3_apply_hvac_mode": "[구간 3] 동작방식(운전 모드) 적용",
+              "sec3_hvac_mode": "[구간 3] 동작방식(운전 모드) 선택",
+              "sec3_apply_action": "[구간 3] 동작방식 적용",
+              "sec3_action": "[구간 3] 동작방식 선택",
+              "sec3_apply_mode": "[구간 3] 모드 적용",
+              "sec3_mode": "[구간 3] 모드 선택"
+            }
+          },
+          "section_4": {
+            "name": "━━━ 구간 4 설정 (구간 3 초과 ~ 100%) ━━━",
+            "description": "구간 3 초과 ~ 100% 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec4_apply_temp": "[구간 4] 설정값 변경",
+              "sec4_delta": "[구간 4] 보정값 (Delta)",
+              "sec4_apply_fan": "[구간 4] 팬 속도(Fan) 적용",
+              "sec4_fan": "[구간 4] 팬 속도 선택",
+              "sec4_apply_hvac_mode": "[구간 4] 동작방식(운전 모드) 적용",
+              "sec4_hvac_mode": "[구간 4] 동작방식(운전 모드) 선택",
+              "sec4_apply_action": "[구간 4] 동작방식 적용",
+              "sec4_action": "[구간 4] 동작방식 선택",
+              "sec4_apply_mode": "[구간 4] 모드 적용",
+              "sec4_mode": "[구간 4] 모드 선택"
+            }
+          }
+        },
+        "data": {
+          "sec1_max": "[구간 1] 최대 출력 (%)",
+          "sec1_apply_temp": "[구간 1] 설정값 변경",
+          "sec1_delta": "[구간 1] 보정값 (Delta)",
+          "sec1_apply_fan": "[구간 1] 팬 속도(Fan) 적용",
+          "sec1_fan": "[구간 1] 팬 속도 선택",
+          "sec1_apply_hvac_mode": "[구간 1] 동작방식(운전 모드) 적용",
+          "sec1_hvac_mode": "[구간 1] 동작방식(운전 모드) 선택",
+          "sec2_max": "[구간 2] 최대 출력 (%)",
+          "sec2_apply_temp": "[구간 2] 설정값 변경",
+          "sec2_delta": "[구간 2] 보정값 (Delta)",
+          "sec2_apply_fan": "[구간 2] 팬 속도(Fan) 적용",
+          "sec2_fan": "[구간 2] 팬 속도 선택",
+          "sec2_apply_hvac_mode": "[구간 2] 동작방식(운전 모드) 적용",
+          "sec2_hvac_mode": "[구간 2] 동작방식(운전 모드) 선택",
+          "sec3_max": "[구간 3] 최대 출력 (%)",
+          "sec3_apply_temp": "[구간 3] 설정값 변경",
+          "sec3_delta": "[구간 3] 보정값 (Delta)",
+          "sec3_apply_fan": "[구간 3] 팬 속도(Fan) 적용",
+          "sec3_fan": "[구간 3] 팬 속도 선택",
+          "sec3_apply_hvac_mode": "[구간 3] 동작방식(운전 모드) 적용",
+          "sec3_hvac_mode": "[구간 3] 동작방식(운전 모드) 선택",
+          "sec4_apply_temp": "[구간 4] 설정값 변경",
+          "sec4_delta": "[구간 4] 보정값 (Delta)",
+          "sec4_apply_fan": "[구간 4] 팬 속도(Fan) 적용",
+          "sec4_fan": "[구간 4] 팬 속도 선택",
+          "sec4_apply_hvac_mode": "[구간 4] 동작방식(운전 모드) 적용",
+          "sec4_hvac_mode": "[구간 4] 동작방식(운전 모드) 선택",
+          "sec1_apply_action": "[구간 1] 동작방식 적용",
+          "sec1_action": "[구간 1] 동작방식 선택",
+          "sec1_apply_mode": "[구간 1] 모드 적용",
+          "sec1_mode": "[구간 1] 모드 선택",
+          "sec2_apply_action": "[구간 2] 동작방식 적용",
+          "sec2_action": "[구간 2] 동작방식 선택",
+          "sec2_apply_mode": "[구간 2] 모드 적용",
+          "sec2_mode": "[구간 2] 모드 선택",
+          "sec3_apply_action": "[구간 3] 동작방식 적용",
+          "sec3_action": "[구간 3] 동작방식 선택",
+          "sec3_apply_mode": "[구간 3] 모드 적용",
+          "sec3_mode": "[구간 3] 모드 선택",
+          "sec4_apply_action": "[구간 4] 동작방식 적용",
+          "sec4_action": "[구간 4] 동작방식 선택",
+          "sec4_apply_mode": "[구간 4] 모드 적용",
+          "sec4_mode": "[구간 4] 모드 선택"
+        }
+      },
+      "sections_climate": {
+        "title": "Air conditioner 출력 구간 및 팬 설정 수정",
+        "description": "PID 출력 구간별 동작방식, 목표값 보정값(Delta) 및 팬 속도를 수정합니다.",
+        "sections": {
+          "section_1": {
+            "name": "━━━ 구간 1 설정 (0% ~ 구간 1 최대) ━━━",
+            "description": "0% ~ 구간 1 최대 출력 시의 목표값, 팬 속도, 운전 모드를 설정합니다.",
+            "data": {
+              "sec1_max": "[구간 1] 최대 출력 (%)",
+              "sec1_apply_temp": "[구간 1] 설정값 변경",
+              "sec1_delta": "[구간 1] 보정값 (Delta)",
+              "sec1_apply_fan": "[구간 1] 팬 속도(Fan) 적용",
+              "sec1_fan": "[구간 1] 팬 속도 선택",
+              "sec1_apply_hvac_mode": "[구간 1] 동작방식(운전 모드) 적용",
+              "sec1_hvac_mode": "[구간 1] 동작방식(운전 모드) 선택",
+              "sec1_apply_action": "[구간 1] 동작방식 적용",
+              "sec1_action": "[구간 1] 동작방식 선택",
+              "sec1_apply_mode": "[구간 1] 모드 적용",
+              "sec1_mode": "[구간 1] 모드 선택"
+            }
+          },
+          "section_2": {
+            "name": "━━━ 구간 2 설정 (구간 1 초과 ~ 구간 2 최대) ━━━",
+            "description": "구간 1 초과 ~ 구간 2 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec2_max": "[구간 2] 최대 출력 (%)",
+              "sec2_apply_temp": "[구간 2] 설정값 변경",
+              "sec2_delta": "[구간 2] 보정값 (Delta)",
+              "sec2_apply_fan": "[구간 2] 팬 속도(Fan) 적용",
+              "sec2_fan": "[구간 2] 팬 속도 선택",
+              "sec2_apply_hvac_mode": "[구간 2] 동작방식(운전 모드) 적용",
+              "sec2_hvac_mode": "[구간 2] 동작방식(운전 모드) 선택",
+              "sec2_apply_action": "[구간 2] 동작방식 적용",
+              "sec2_action": "[구간 2] 동작방식 선택",
+              "sec2_apply_mode": "[구간 2] 모드 적용",
+              "sec2_mode": "[구간 2] 모드 선택"
+            }
+          },
+          "section_3": {
+            "name": "━━━ 구간 3 설정 (구간 2 초과 ~ 구간 3 최대) ━━━",
+            "description": "구간 2 초과 ~ 구간 3 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec3_max": "[구간 3] 최대 출력 (%)",
+              "sec3_apply_temp": "[구간 3] 설정값 변경",
+              "sec3_delta": "[구간 3] 보정값 (Delta)",
+              "sec3_apply_fan": "[구간 3] 팬 속도(Fan) 적용",
+              "sec3_fan": "[구간 3] 팬 속도 선택",
+              "sec3_apply_hvac_mode": "[구간 3] 동작방식(운전 모드) 적용",
+              "sec3_hvac_mode": "[구간 3] 동작방식(운전 모드) 선택",
+              "sec3_apply_action": "[구간 3] 동작방식 적용",
+              "sec3_action": "[구간 3] 동작방식 선택",
+              "sec3_apply_mode": "[구간 3] 모드 적용",
+              "sec3_mode": "[구간 3] 모드 선택"
+            }
+          },
+          "section_4": {
+            "name": "━━━ 구간 4 설정 (구간 3 초과 ~ 100%) ━━━",
+            "description": "구간 3 초과 ~ 100% 최대 출력 시의 동작을 설정합니다.",
+            "data": {
+              "sec4_apply_temp": "[구간 4] 설정값 변경",
+              "sec4_delta": "[구간 4] 보정값 (Delta)",
+              "sec4_apply_fan": "[구간 4] 팬 속도(Fan) 적용",
+              "sec4_fan": "[구간 4] 팬 속도 선택",
+              "sec4_apply_hvac_mode": "[구간 4] 동작방식(운전 모드) 적용",
+              "sec4_hvac_mode": "[구간 4] 동작방식(운전 모드) 선택",
+              "sec4_apply_action": "[구간 4] 동작방식 적용",
+              "sec4_action": "[구간 4] 동작방식 선택",
+              "sec4_apply_mode": "[구간 4] 모드 적용",
+              "sec4_mode": "[구간 4] 모드 선택"
+            }
+          }
+        },
+        "data": {
+          "sec1_max": "[구간 1] 최대 출력 (%)",
+          "sec1_apply_temp": "[구간 1] 설정값 변경",
+          "sec1_delta": "[구간 1] 보정값 (Delta)",
+          "sec1_apply_fan": "[구간 1] 팬 속도(Fan) 적용",
+          "sec1_fan": "[구간 1] 팬 속도 선택",
+          "sec1_apply_hvac_mode": "[구간 1] 동작방식(운전 모드) 적용",
+          "sec1_hvac_mode": "[구간 1] 동작방식(운전 모드) 선택",
+          "sec2_max": "[구간 2] 최대 출력 (%)",
+          "sec2_apply_temp": "[구간 2] 설정값 변경",
+          "sec2_delta": "[구간 2] 보정값 (Delta)",
+          "sec2_apply_fan": "[구간 2] 팬 속도(Fan) 적용",
+          "sec2_fan": "[구간 2] 팬 속도 선택",
+          "sec2_apply_hvac_mode": "[구간 2] 동작방식(운전 모드) 적용",
+          "sec2_hvac_mode": "[구간 2] 동작방식(운전 모드) 선택",
+          "sec3_max": "[구간 3] 최대 출력 (%)",
+          "sec3_apply_temp": "[구간 3] 설정값 변경",
+          "sec3_delta": "[구간 3] 보정값 (Delta)",
+          "sec3_apply_fan": "[구간 3] 팬 속도(Fan) 적용",
+          "sec3_fan": "[구간 3] 팬 속도 선택",
+          "sec3_apply_hvac_mode": "[구간 3] 동작방식(운전 모드) 적용",
+          "sec3_hvac_mode": "[구간 3] 동작방식(운전 모드) 선택",
+          "sec4_apply_temp": "[구간 4] 설정값 변경",
+          "sec4_delta": "[구간 4] 보정값 (Delta)",
+          "sec4_apply_fan": "[구간 4] 팬 속도(Fan) 적용",
+          "sec4_fan": "[구간 4] 팬 속도 선택",
+          "sec4_apply_hvac_mode": "[구간 4] 동작방식(운전 모드) 적용",
+          "sec4_hvac_mode": "[구간 4] 동작방식(운전 모드) 선택",
+          "sec1_apply_action": "[구간 1] 동작방식 적용",
+          "sec1_action": "[구간 1] 동작방식 선택",
+          "sec1_apply_mode": "[구간 1] 모드 적용",
+          "sec1_mode": "[구간 1] 모드 선택",
+          "sec2_apply_action": "[구간 2] 동작방식 적용",
+          "sec2_action": "[구간 2] 동작방식 선택",
+          "sec2_apply_mode": "[구간 2] 모드 적용",
+          "sec2_mode": "[구간 2] 모드 선택",
+          "sec3_apply_action": "[구간 3] 동작방식 적용",
+          "sec3_action": "[구간 3] 동작방식 선택",
+          "sec3_apply_mode": "[구간 3] 모드 적용",
+          "sec3_mode": "[구간 3] 모드 선택",
+          "sec4_apply_action": "[구간 4] 동작방식 적용",
+          "sec4_action": "[구간 4] 동작방식 선택",
+          "sec4_apply_mode": "[구간 4] 모드 적용",
+          "sec4_mode": "[구간 4] 모드 선택"
+        }
+      },
+      "sections_pwm": {
+        "title": "스위치 PWM 상세 제어 설정 수정",
+        "description": "ON/OFF 스위치 시분할 제어 주기 및 압축기 보호 시간을 수정합니다.",
+        "data": {
+          "pwm_duration": "PWM 제어 1주기 시간 (시:분:초)",
+          "min_on_time": "최소 가동 시간 (시:분:초)",
+          "min_off_time": "최소 정지 시간 (압축기 보호, 시:분:초)",
+          "keep_alive": "상태 재전송 주기 (시:분:초)",
+          "output_safety": "센서 고장 시 안전 출력 (%)"
+        }
+      }
+    }
+  },
+  "selector": {
+    "thermostat_type": {
+      "options": {
+        "cooler": "에어컨(Cooler / 냉방기)",
+        "heater": "보일러(Heater / 난방기)",
+        "heat_cool": "냉방/난방 겸용(Cooler / Heater)",
+        "dehumidifier": "제습기(Dehumidifier)",
+        "humidifier": "가습기(Humidifier)",
+        "humidity_dehumidity": "가습/제습 겸용(Humidifier / Dehumidifier)"
+      }
+    },
+    "off_temp_action": {
+      "options": {
+        "sync_only": "전원 꺼짐 유지 (목표값만 내부 반영)",
+        "turn_on": "설정 모드로 켜고 즉시 반영"
+      }
+    },
+    "available_hvac_modes": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "cool": "냉방 (Cool)",
+        "heat": "난방 (Heat)",
+        "fan_only": "송풍 (Fan Only)",
+        "dry": "제습 (Dry)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "silent": "저소음 / 정음 (Silent)"
+      }
+    },
+    "available_fan_modes": {
+      "options": {
+        "auto": "자동 (Auto)",
+        "low": "미풍 / 약 (Low)",
+        "medium": "약풍 / 중 (Medium)",
+        "high": "강풍 / 강 (High)",
+        "turbo": "터보 (Turbo)"
+      }
+    },
+    "fan_mode": {
+      "options": {
+        "auto": "자동 (Auto)",
+        "low": "미풍 / 약 (Low)",
+        "medium": "약풍 / 중 (Medium)",
+        "high": "강풍 / 강 (High)",
+        "turbo": "터보 (Turbo)"
+      }
+    },
+    "sec1_hvac_mode": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "cool": "냉방 (Cool)",
+        "heat": "난방 (Heat)",
+        "fan_only": "송풍 (Fan Only)",
+        "dry": "제습 (Dry)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "silent": "저소음 / 정음 (Silent)"
+      }
+    },
+    "sec2_hvac_mode": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "cool": "냉방 (Cool)",
+        "heat": "난방 (Heat)",
+        "fan_only": "송풍 (Fan Only)",
+        "dry": "제습 (Dry)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "silent": "저소음 / 정음 (Silent)"
+      }
+    },
+    "sec3_hvac_mode": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "cool": "냉방 (Cool)",
+        "heat": "난방 (Heat)",
+        "fan_only": "송풍 (Fan Only)",
+        "dry": "제습 (Dry)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "silent": "저소음 / 정음 (Silent)"
+      }
+    },
+    "sec4_hvac_mode": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "cool": "냉방 (Cool)",
+        "heat": "난방 (Heat)",
+        "fan_only": "송풍 (Fan Only)",
+        "dry": "제습 (Dry)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "silent": "저소음 / 정음 (Silent)"
+      }
+    },
+    "control_mode": {
+      "options": {
+        "climate_delta": "Air Conditioner 모드(온도조절기 / 가습기 / 제습기)",
+        "switch_pwm": "PWM 모드(On / Off)"
+      }
+    },
+    "sec1_action": {
+      "options": {
+        "on": "켜기 (On)",
+        "off": "끄기 (Off)"
+      }
+    },
+    "sec1_mode": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "silent": "저소음 / 정음 (Silent)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "fan_only": "송풍 (Fan Only)"
+      }
+    },
+    "sec2_action": {
+      "options": {
+        "on": "켜기 (On)",
+        "off": "끄기 (Off)"
+      }
+    },
+    "sec2_mode": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "silent": "저소음 / 정음 (Silent)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "fan_only": "송풍 (Fan Only)"
+      }
+    },
+    "sec3_action": {
+      "options": {
+        "on": "켜기 (On)",
+        "off": "끄기 (Off)"
+      }
+    },
+    "sec3_mode": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "silent": "저소음 / 정음 (Silent)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "fan_only": "송풍 (Fan Only)"
+      }
+    },
+    "sec4_action": {
+      "options": {
+        "on": "켜기 (On)",
+        "off": "끄기 (Off)"
+      }
+    },
+    "sec4_mode": {
+      "options": {
+        "off": "꺼짐 (Off)",
+        "auto": "자동 (Auto)",
+        "silent": "저소음 / 정음 (Silent)",
+        "humidity": "가습 (Humidifier)",
+        "dehumidity": "제습 (Dehumidifier)",
+        "fan_only": "송풍 (Fan Only)"
+      }
+    }
+  }
+}
