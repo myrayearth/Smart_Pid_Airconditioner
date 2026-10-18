@@ -831,8 +831,6 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             "outdoor_humidity": self._outdoor_humidity,
             "fail_safe_active": self._fail_safe_active,
         }
-        if is_humidity_type(self._thermostat_type):
-            attrs["target_humidity"] = self._target_temp
 
         if self._control_mode == CONTROL_MODE_SWITCH_PWM:
             attrs.update(
@@ -1908,6 +1906,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
                         self._integral = 0.0
                         self._prev_error = None
+                        self._prev_room_temp = None
                     self._is_heating = is_heating
 
                     if is_heating:
@@ -1932,7 +1931,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     # (2) P term: P(t) = Kp * e(t)
                     p_term = self._kp * error
 
-                    # (3) D term using error derivative with sample period normalization:
+                    # (3) D term using derivative on measurement with sample period normalization:
+                    # Prevents derivative kick on setpoint change
                     # Bound dt_norm >= 0.05 to prevent artificial derivative spikes from sensor noise
                     dt_norm = (
                         (dt / float(self._sample_period))
@@ -1942,8 +1942,14 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     if dt_norm < 0.05:
                         dt_norm = 0.05
 
-                    if self._prev_error is not None:
-                        d_term = self._kd * ((error - self._prev_error) / dt_norm)
+                    if self._prev_room_temp is not None:
+                        diff_temp = self._indoor_temp - self._prev_room_temp
+                        if is_heating:
+                            # Heating: demand increases as temperature drops
+                            d_term = -self._kd * (diff_temp / dt_norm)
+                        else:
+                            # Cooling: demand increases as temperature rises
+                            d_term = self._kd * (diff_temp / dt_norm)
                     else:
                         d_term = 0.0
                     self._prev_error = error
@@ -2219,6 +2225,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             )
             return
 
+        was_dispatching = self._is_dispatching
         self._is_dispatching = True
         self._is_dispatching_hvac_mode = True
         try:
@@ -2246,7 +2253,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 "Failed to set slave HVAC mode to %s: %s", effective_mode, err
             )
         finally:
-            self._is_dispatching = False
+            self._is_dispatching = was_dispatching
             self._is_dispatching_hvac_mode = False
 
     async def _async_dispatch_control(
@@ -2263,160 +2270,164 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         section_changed: bool = False,
     ) -> None:
         """Dispatch temperature, fan speed, and handle PWM or inverter continuous mode."""
-        if target_mode is None:
-            if self._thermostat_type == THERMOSTAT_TYPE_HEATER:
-                target_mode = HVACMode.HEAT
-            elif self._thermostat_type == THERMOSTAT_TYPE_HEAT_COOL:
-                target_mode = (
-                    HVACMode.HEAT if getattr(self, "_is_heating", False) else HVACMode.COOL
+        self._is_dispatching = True
+        try:
+            if target_mode is None:
+                if self._thermostat_type == THERMOSTAT_TYPE_HEATER:
+                    target_mode = HVACMode.HEAT
+                elif self._thermostat_type == THERMOSTAT_TYPE_HEAT_COOL:
+                    target_mode = (
+                        HVACMode.HEAT if getattr(self, "_is_heating", False) else HVACMode.COOL
+                    )
+                elif self._thermostat_type == THERMOSTAT_TYPE_HUMIDIFIER:
+                    target_mode = MODE_HUMIDITY
+                elif self._thermostat_type == THERMOSTAT_TYPE_DEHUMIDIFIER:
+                    target_mode = MODE_DEHUMIDITY
+                elif self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
+                    target_mode = (
+                        MODE_HUMIDITY if getattr(self, "_is_heating", False) else MODE_DEHUMIDITY
+                    )
+                else:
+                    target_mode = HVACMode.COOL
+            elif (
+                target_mode == HVACMode.AUTO
+                and self._thermostat_type == THERMOSTAT_TYPE_HEAT_COOL
+            ):
+                slave_state = self.hass.states.get(self._target_climate_id)
+                slave_modes = (
+                    slave_state.attributes.get("hvac_modes", []) if slave_state else []
                 )
-            elif self._thermostat_type == THERMOSTAT_TYPE_HUMIDIFIER:
-                target_mode = MODE_HUMIDITY
-            elif self._thermostat_type == THERMOSTAT_TYPE_DEHUMIDIFIER:
-                target_mode = MODE_DEHUMIDITY
-            elif self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
-                target_mode = (
-                    MODE_HUMIDITY if getattr(self, "_is_heating", False) else MODE_DEHUMIDITY
-                )
-            else:
-                target_mode = HVACMode.COOL
-        elif (
-            target_mode == HVACMode.AUTO
-            and self._thermostat_type == THERMOSTAT_TYPE_HEAT_COOL
-        ):
-            slave_state = self.hass.states.get(self._target_climate_id)
-            slave_modes = (
-                slave_state.attributes.get("hvac_modes", []) if slave_state else []
-            )
-            if (
-                slave_modes
-                and HVACMode.AUTO not in slave_modes
-                and HVACMode.AUTO.value not in slave_modes
+                if (
+                    slave_modes
+                    and HVACMode.AUTO not in slave_modes
+                    and HVACMode.AUTO.value not in slave_modes
+                ):
+                    target_mode = (
+                        HVACMode.HEAT
+                        if getattr(self, "_is_heating", False)
+                        else HVACMode.COOL
+                    )
+            elif (
+                (target_mode == HVACMode.AUTO or target_mode == "auto")
+                and self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY
             ):
                 target_mode = (
-                    HVACMode.HEAT
+                    MODE_HUMIDITY
                     if getattr(self, "_is_heating", False)
-                    else HVACMode.COOL
+                    else MODE_DEHUMIDITY
                 )
-        elif (
-            (target_mode == HVACMode.AUTO or target_mode == "auto")
-            and self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY
-        ):
-            target_mode = (
-                MODE_HUMIDITY
-                if getattr(self, "_is_heating", False)
-                else MODE_DEHUMIDITY
+
+            target_domain = (
+                self._target_climate_id.split(".")[0]
+                if "." in self._target_climate_id
+                else "climate"
             )
 
-        target_domain = (
-            self._target_climate_id.split(".")[0]
-            if "." in self._target_climate_id
-            else "climate"
-        )
+            has_sent_command = False
 
-        has_sent_command = False
+            async def _delay_before_command() -> None:
+                nonlocal has_sent_command
+                if not has_sent_command:
+                    if section_changed:
+                        _LOGGER.debug("Section changed -> waiting 1.0s before first command")
+                        await asyncio.sleep(1.0)
+                    has_sent_command = True
+                else:
+                    _LOGGER.debug("Multiple commands -> waiting 0.5s between commands")
+                    await asyncio.sleep(0.5)
 
-        async def _delay_before_command() -> None:
-            nonlocal has_sent_command
-            if not has_sent_command:
-                if section_changed:
-                    _LOGGER.debug("Section changed -> waiting 1.0s before first command")
-                    await asyncio.sleep(1.0)
-                has_sent_command = True
-            else:
-                _LOGGER.debug("Multiple commands -> waiting 0.5s between commands")
-                await asyncio.sleep(0.5)
+            if target_domain == "humidifier":
+                self._cancel_pwm_timers()
+                self._pwm_state = True
+                slave_state = self.hass.states.get(self._target_climate_id)
+                if slave_state and slave_state.state != STATE_ON:
+                    await _delay_before_command()
+                    await self._async_set_slave_hvac_mode("on")
+                if apply_temp:
+                    current_slave_temp = (
+                        slave_state.attributes.get("humidity") if slave_state else None
+                    )
+                    is_same_as_slave = (current_slave_temp == slave_temp)
+                    is_same_as_last = (self._last_dispatched_temp == slave_temp)
+                    if force or not (is_same_as_slave and is_same_as_last):
+                        await _delay_before_command()
+                        await self._async_send_temperature(slave_temp, force=force)
+                return
 
-        if target_domain == "humidifier":
+            async def _ensure_slave_mode(mode: HVACMode | str) -> bool:
+                if not apply_hvac_mode:
+                    return False
+
+                self._internal_pwm_slave_off = False
+                slave_state = self.hass.states.get(self._target_climate_id)
+                current_slave_state = (
+                    slave_state.state.lower().strip()
+                    if slave_state and slave_state.state
+                    else ""
+                )
+                target_mode_str = (
+                    mode.value if hasattr(mode, "value") else str(mode)
+                ).lower().strip()
+
+                if current_slave_state == target_mode_str:
+                    _LOGGER.debug(
+                        "Slave %s mode (%s) unchanged; skipping mode service call.",
+                        self._target_climate_id,
+                        target_mode_str,
+                    )
+                    return False
+
+                await _delay_before_command()
+                await self._async_set_slave_hvac_mode(mode)
+                return True
+
+            async def _dispatch_setpoints(force_call: bool = False) -> None:
+                if apply_fan and fan_mode:
+                    matched_fan = self._match_slave_fan_mode(fan_mode)
+                    slave_state = self.hass.states.get(self._target_climate_id)
+                    current_slave_fan = (
+                        slave_state.attributes.get(ATTR_FAN_MODE)
+                        if slave_state
+                        else None
+                    )
+                    is_same_as_slave = (
+                        current_slave_fan is not None
+                        and str(current_slave_fan).lower().strip()
+                        == str(matched_fan).lower().strip()
+                    )
+                    is_same_as_last = (
+                        self._last_dispatched_fan_mode is not None
+                        and str(self._last_dispatched_fan_mode).lower().strip()
+                        == str(matched_fan).lower().strip()
+                    )
+                    if force_call or not (is_same_as_slave and is_same_as_last):
+                        await _delay_before_command()
+                        await self._async_send_fan_mode(fan_mode, force=force_call)
+
+                if apply_temp:
+                    slave_state = self.hass.states.get(self._target_climate_id)
+                    current_slave_temp = (
+                        slave_state.attributes.get(ATTR_TEMPERATURE)
+                        if slave_state
+                        else None
+                    )
+                    is_same_as_slave = (current_slave_temp == slave_temp)
+                    is_same_as_last = (self._last_dispatched_temp == slave_temp)
+                    if force_call or not (is_same_as_slave and is_same_as_last):
+                        await _delay_before_command()
+                        await self._async_send_temperature(slave_temp, force=force_call)
+
+            # Continuous Inverter Dispatch (Keep slave HVAC mode active; do NOT shut off on low output)
             self._cancel_pwm_timers()
             self._pwm_state = True
-            slave_state = self.hass.states.get(self._target_climate_id)
-            if slave_state and slave_state.state != STATE_ON:
-                await _delay_before_command()
-                await self._async_set_slave_hvac_mode("on")
-            if apply_temp:
-                current_slave_temp = (
-                    slave_state.attributes.get("humidity") if slave_state else None
-                )
-                is_same_as_slave = (current_slave_temp == slave_temp)
-                is_same_as_last = (self._last_dispatched_temp == slave_temp)
-                if force or not (is_same_as_slave and is_same_as_last):
-                    await _delay_before_command()
-                    await self._async_send_temperature(slave_temp, force=force)
-            return
-
-        async def _ensure_slave_mode(mode: HVACMode | str) -> bool:
-            if not apply_hvac_mode:
-                return False
-
-            self._internal_pwm_slave_off = False
-            slave_state = self.hass.states.get(self._target_climate_id)
-            current_slave_state = (
-                slave_state.state.lower().strip()
-                if slave_state and slave_state.state
-                else ""
-            )
+            await _ensure_slave_mode(target_mode)
             target_mode_str = (
-                mode.value if hasattr(mode, "value") else str(mode)
-            ).lower().strip()
-
-            if current_slave_state == target_mode_str:
-                _LOGGER.debug(
-                    "Slave %s mode (%s) unchanged; skipping mode service call.",
-                    self._target_climate_id,
-                    target_mode_str,
-                )
-                return False
-
-            await _delay_before_command()
-            await self._async_set_slave_hvac_mode(mode)
-            return True
-
-        async def _dispatch_setpoints(force_call: bool = False) -> None:
-            if apply_fan and fan_mode:
-                matched_fan = self._match_slave_fan_mode(fan_mode)
-                slave_state = self.hass.states.get(self._target_climate_id)
-                current_slave_fan = (
-                    slave_state.attributes.get(ATTR_FAN_MODE)
-                    if slave_state
-                    else None
-                )
-                is_same_as_slave = (
-                    current_slave_fan is not None
-                    and str(current_slave_fan).lower().strip()
-                    == str(matched_fan).lower().strip()
-                )
-                is_same_as_last = (
-                    self._last_dispatched_fan_mode is not None
-                    and str(self._last_dispatched_fan_mode).lower().strip()
-                    == str(matched_fan).lower().strip()
-                )
-                if force_call or not (is_same_as_slave and is_same_as_last):
-                    await _delay_before_command()
-                    await self._async_send_fan_mode(fan_mode, force=force_call)
-
-            if apply_temp:
-                slave_state = self.hass.states.get(self._target_climate_id)
-                current_slave_temp = (
-                    slave_state.attributes.get(ATTR_TEMPERATURE)
-                    if slave_state
-                    else None
-                )
-                is_same_as_slave = (current_slave_temp == slave_temp)
-                is_same_as_last = (self._last_dispatched_temp == slave_temp)
-                if force_call or not (is_same_as_slave and is_same_as_last):
-                    await _delay_before_command()
-                    await self._async_send_temperature(slave_temp, force=force_call)
-
-        # Continuous Inverter Dispatch (Keep slave HVAC mode active; do NOT shut off on low output)
-        self._cancel_pwm_timers()
-        self._pwm_state = True
-        await _ensure_slave_mode(target_mode)
-        target_mode_str = (
-            target_mode.value if hasattr(target_mode, "value") else str(target_mode)
-        ).lower()
-        if target_mode_str not in ("off", HVACMode.OFF.value):
-            await _dispatch_setpoints(force_call=force)
+                target_mode.value if hasattr(target_mode, "value") else str(target_mode)
+            ).lower()
+            if target_mode_str not in ("off", HVACMode.OFF.value):
+                await _dispatch_setpoints(force_call=force)
+        finally:
+            self._is_dispatching = False
 
     async def _async_send_temperature(
         self, slave_temp: int, force: bool = False
@@ -2445,6 +2456,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         if not force and is_same_as_slave and is_same_as_last:
             return False
 
+        was_dispatching = self._is_dispatching
         self._is_dispatching = True
         try:
             if target_domain == "humidifier":
@@ -2492,7 +2504,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             )
             return False
         finally:
-            self._is_dispatching = False
+            self._is_dispatching = was_dispatching
 
     async def _async_send_fan_mode(
         self, fan_mode: str, force: bool = False
@@ -2530,6 +2542,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             )
             return False
 
+        was_dispatching = self._is_dispatching
         self._is_dispatching = True
         try:
             _LOGGER.info(
@@ -2559,7 +2572,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             )
             return False
         finally:
-            self._is_dispatching = False
+            self._is_dispatching = was_dispatching
 
     # ------------------------------------------------------------------
     # Switch PWM Control Methods

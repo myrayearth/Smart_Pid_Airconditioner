@@ -843,6 +843,12 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 if val is not None:
                     self._outdoor_humidity = val
                     self._last_outdoor_update = now
+                else:
+                    self._outdoor_humidity = None
+            else:
+                self._outdoor_humidity = None
+        else:
+            self._outdoor_humidity = None
 
     async def _async_entity_changed(self, event: Event[EventStateChangedData]) -> None:
         """Handle tracked entity state updates."""
@@ -857,6 +863,18 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             return
 
         if entity_id in (self._indoor_sensor_id, self._outdoor_sensor_id):
+            old_state = event.data.get("old_state")
+            if old_state and old_state.state == new_state.state:
+                old_attrs = old_state.attributes
+                new_attrs = new_state.attributes
+                hum_attr_changed = False
+                for attr in ("humidity", "current_humidity", "relative_humidity"):
+                    if attr in new_attrs and new_attrs.get(attr) != old_attrs.get(attr):
+                        hum_attr_changed = True
+                        break
+                if not hum_attr_changed:
+                    return
+
             self._update_sensor_values()
             await self._async_calculate_and_control()
             self.async_write_ha_state()
@@ -1159,8 +1177,15 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     if dt_norm < 0.05:
                         dt_norm = 0.05
 
-                    if self._prev_error is not None:
-                        d_term = self._kd * (error - self._prev_error) / dt_norm
+                    # D term on measurement to prevent derivative kick on target changes
+                    if getattr(self, "_prev_room_humidity", None) is not None:
+                        diff_humidity = self._indoor_humidity - self._prev_room_humidity
+                        if is_heating:
+                            # Humidifier: demand increases as humidity drops
+                            d_term = -self._kd * (diff_humidity / dt_norm)
+                        else:
+                            # Dehumidifier: demand increases as humidity rises
+                            d_term = self._kd * (diff_humidity / dt_norm)
                     else:
                         d_term = 0.0
 
@@ -1311,6 +1336,32 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     except Exception as err:
                         _LOGGER.warning("Failed to turn on slave humidifier %s: %s", target_id, err)
 
+                # Set Mode (before humidity to ensure preset mode doesn't override target humidity)
+                if apply_mode and mode:
+                    current_slave_mode = (
+                        slave_state.attributes.get("mode") if slave_state else None
+                    )
+                    is_same_mode = (
+                        current_slave_mode is not None
+                        and str(current_slave_mode).lower().strip() == str(mode).lower().strip()
+                    )
+                    is_same_last_mode = (
+                        self._last_dispatched_mode is not None
+                        and str(self._last_dispatched_mode).lower().strip() == str(mode).lower().strip()
+                    )
+                    if force or section_changed or not (is_same_mode and is_same_last_mode):
+                        try:
+                            await _delay_before_command()
+                            await self.hass.services.async_call(
+                                "humidifier",
+                                "set_mode",
+                                {ATTR_ENTITY_ID: target_id, "mode": mode},
+                                blocking=True,
+                            )
+                            self._last_dispatched_mode = mode
+                        except Exception as err:
+                            _LOGGER.debug("Slave humidifier does not support set_mode: %s", err)
+
                 # Set Target Humidity
                 if apply_temp:
                     current_slave_humidity = (
@@ -1337,32 +1388,6 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                             self._last_dispatched_humidity = target_humidity
                         except Exception as err:
                             _LOGGER.warning("Failed to set slave humidifier %s target humidity: %s", target_id, err)
-
-                # Set Mode
-                if apply_mode and mode:
-                    current_slave_mode = (
-                        slave_state.attributes.get("mode") if slave_state else None
-                    )
-                    is_same_mode = (
-                        current_slave_mode is not None
-                        and str(current_slave_mode).lower().strip() == str(mode).lower().strip()
-                    )
-                    is_same_last_mode = (
-                        self._last_dispatched_mode is not None
-                        and str(self._last_dispatched_mode).lower().strip() == str(mode).lower().strip()
-                    )
-                    if force or section_changed or not (is_same_mode and is_same_last_mode):
-                        try:
-                            await _delay_before_command()
-                            await self.hass.services.async_call(
-                                "humidifier",
-                                "set_mode",
-                                {ATTR_ENTITY_ID: target_id, "mode": mode},
-                                blocking=True,
-                            )
-                            self._last_dispatched_mode = mode
-                        except Exception as err:
-                            _LOGGER.debug("Slave humidifier does not support set_mode: %s", err)
 
                 self._last_dispatched_section = section
 
