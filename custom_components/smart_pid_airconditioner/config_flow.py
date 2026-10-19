@@ -20,6 +20,7 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    Selector,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
@@ -43,6 +44,7 @@ from .const import (
     CONF_KE,
     CONF_KI,
     CONF_KP,
+    CONF_MAX_I,
     CONF_OFF_TEMP_ACTION,
     CONF_OUTDOOR_SENSOR,
     CONF_OUTPUT_SAFETY,
@@ -118,6 +120,7 @@ from .const import (
     DEFAULT_KE,
     DEFAULT_KI,
     DEFAULT_KP,
+    DEFAULT_MAX_I,
     DEFAULT_OFF_TEMP_ACTION,
     DEFAULT_OUTPUT_SAFETY,
     DEFAULT_PWM_DURATION,
@@ -290,6 +293,78 @@ try:
     from homeassistant.data_entry_flow import section
 except ImportError:
     section = None
+
+
+class KiGridSelector(Selector):
+    """Custom selector that serializes Ki and Max I as a 2-column (5:5) ha-form-grid."""
+
+    selector_type = "grid"
+
+    def __init__(
+        self,
+        ki_default: float = DEFAULT_KI,
+        max_i_default: float = DEFAULT_MAX_I,
+    ) -> None:
+        """Initialize the Ki grid selector."""
+        self._ki_default = float(ki_default)
+        self._max_i_default = float(max_i_default)
+        self.config = {
+            CONF_KI: self._ki_default,
+            CONF_MAX_I: self._max_i_default,
+        }
+
+    def serialize(self) -> dict[str, Any]:
+        """Serialize into an ha-form-grid schema."""
+        return {
+            "type": "grid",
+            "schema": [
+                {
+                    "name": CONF_KI,
+                    "required": True,
+                    "default": self._ki_default,
+                    "selector": {
+                        "number": {
+                            "min": 0.0,
+                            "max": 100.0,
+                            "step": 0.001,
+                            "mode": "box",
+                        }
+                    },
+                },
+                {
+                    "name": CONF_MAX_I,
+                    "required": False,
+                    "default": self._max_i_default,
+                    "selector": {
+                        "number": {
+                            "min": 0.0,
+                            "max": 100.0,
+                            "step": 1.0,
+                            "mode": "box",
+                            "unit_of_measurement": "%",
+                        }
+                    },
+                },
+            ],
+        }
+
+    def __call__(self, data: Any) -> dict[str, float]:
+        """Validate the submitted ki_group dictionary."""
+        if not isinstance(data, dict):
+            raise vol.Invalid("Expected a dictionary for ki_group")
+        try:
+            ki_raw = data.get(CONF_KI, self._ki_default)
+            ki_val = float(self._ki_default if ki_raw in (None, "") else ki_raw)
+            max_i_raw = data.get(CONF_MAX_I, self._max_i_default)
+            max_i_val = float(
+                self._max_i_default if max_i_raw in (None, "") else max_i_raw
+            )
+        except (ValueError, TypeError) as err:
+            raise vol.Invalid(f"Invalid numeric value in ki_group: {err}") from err
+        return {
+            CONF_KI: max(0.0, min(100.0, ki_val)),
+            CONF_MAX_I: max(0.0, min(100.0, max_i_val)),
+        }
 
 
 def _flatten_sections_input(data: dict[str, Any] | None) -> dict[str, Any]:
@@ -487,7 +562,8 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         errors[CONF_TARGET_DEVICE] = "target_device_must_be_switch"
 
             if not errors:
-                self._data.update(user_input)
+                flat_user_input = _flatten_sections_input(user_input)
+                self._data.update(flat_user_input)
                 self._data[CONF_OUTDOOR_SENSOR] = user_input.get(CONF_OUTDOOR_SENSOR) or ""
                 self._data[CONF_TARGET_CLIMATE] = target_dev
                 self._data[CONF_TARGET_DEVICE] = target_dev
@@ -718,14 +794,10 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         mode=NumberSelectorMode.BOX,
                     )
                 ),
-                vol.Required(CONF_KI, default=DEFAULT_KI): NumberSelector(
-                    NumberSelectorConfig(
-                        min=0.0,
-                        max=10.0,
-                        step=0.001,
-                        mode=NumberSelectorMode.BOX,
-                    )
-                ),
+                vol.Required(
+                    "ki_group",
+                    default={CONF_KI: DEFAULT_KI, CONF_MAX_I: DEFAULT_MAX_I},
+                ): KiGridSelector(DEFAULT_KI, DEFAULT_MAX_I),
                 vol.Required(CONF_KD, default=DEFAULT_KD): NumberSelector(
                     NumberSelectorConfig(
                         min=0.0,
@@ -1253,7 +1325,7 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlow):
         val = self._config_entry.options.get(key)
         if val is not None:
             return val
-        for sec in ("section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
             sec_dict = self._config_entry.options.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -1262,7 +1334,7 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlow):
         val = self._config_entry.data.get(key)
         if val is not None:
             return val
-        for sec in ("section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
             sec_dict = self._config_entry.data.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -1383,7 +1455,8 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlow):
                         errors[CONF_TARGET_DEVICE] = "target_device_must_be_switch"
 
             if not errors:
-                self._options_data = dict(user_input)
+                flat_user_input = _flatten_sections_input(user_input)
+                self._options_data = dict(flat_user_input)
                 self._options_data[CONF_OUTDOOR_SENSOR] = user_input.get(CONF_OUTDOOR_SENSOR) or ""
                 self._options_data[CONF_TARGET_CLIMATE] = target_dev
                 self._options_data[CONF_TARGET_DEVICE] = target_dev
@@ -1673,15 +1746,14 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlow):
                     )
                 ),
                 vol.Required(
-                    CONF_KI,
-                    default=self._get_val(CONF_KI, DEFAULT_KI),
-                ): NumberSelector(
-                    NumberSelectorConfig(
-                        min=0.0,
-                        max=10.0,
-                        step=0.001,
-                        mode=NumberSelectorMode.BOX,
-                    )
+                    "ki_group",
+                    default={
+                        CONF_KI: float(self._get_val(CONF_KI, DEFAULT_KI)),
+                        CONF_MAX_I: float(self._get_val(CONF_MAX_I, DEFAULT_MAX_I)),
+                    },
+                ): KiGridSelector(
+                    float(self._get_val(CONF_KI, DEFAULT_KI)),
+                    float(self._get_val(CONF_MAX_I, DEFAULT_MAX_I)),
                 ),
                 vol.Required(
                     CONF_KD,

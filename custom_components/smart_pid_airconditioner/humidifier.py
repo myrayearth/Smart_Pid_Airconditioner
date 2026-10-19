@@ -47,6 +47,7 @@ from .const import (
     CONF_KE,
     CONF_KI,
     CONF_KP,
+    CONF_MAX_I,
     CONF_OFF_TEMP_ACTION,
     CONF_OUTDOOR_SENSOR,
     CONF_PWM_DURATION,
@@ -131,6 +132,7 @@ from .const import (
     DEFAULT_KE,
     DEFAULT_KI,
     DEFAULT_KP,
+    DEFAULT_MAX_I,
     DEFAULT_OFF_TEMP_ACTION,
     DEFAULT_OUTPUT_SAFETY,
     DEFAULT_PWM_DURATION,
@@ -327,7 +329,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         if val is not None:
             return val
 
-        for sec in ("section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
             sec_dict = self._entry.options.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -342,6 +344,13 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         val = self._entry.data.get(key)
         if val is not None:
             return val
+
+        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
+            sec_dict = self._entry.data.get(sec)
+            if isinstance(sec_dict, dict):
+                sec_val = sec_dict.get(key)
+                if sec_val is not None:
+                    return sec_val
         return default
 
     def _load_config(self) -> None:
@@ -389,6 +398,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
 
         self._kp: float = float(self._get_setting(CONF_KP, DEFAULT_KP))
         self._ki: float = float(self._get_setting(CONF_KI, DEFAULT_KI))
+        self._max_i: float = float(self._get_setting(CONF_MAX_I, DEFAULT_MAX_I))
         self._kd: float = float(self._get_setting(CONF_KD, DEFAULT_KD))
         self._ke: float = float(self._get_setting(CONF_KE, DEFAULT_KE))
 
@@ -669,6 +679,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             "pid_error": round(self._pid_error, 2) if self._pid_error is not None else None,
             "pid_p": round(self._pid_p, 2),
             "pid_i": round(self._pid_i, 2),
+            "max_i": self._max_i,
             "pid_d": round(self._pid_d, 2),
             "pid_e": round(self._pid_e, 2),
             "pid_output": round(self._pid_output, 2),
@@ -1192,7 +1203,8 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     self._prev_error = error
                     self._prev_room_humidity = self._indoor_humidity
 
-                    # Integral calculation with anti-windup clamping
+                    # Integral calculation with anti-windup and bidirectional Max I limit [-max_i, +max_i]
+                    max_i_limit = max(0.0, float(self._max_i))
                     tentative_output = p_term + (self._ki * self._integral) + d_term + e_term
                     is_saturated_high = (tentative_output >= 100.0)
                     is_saturated_low = (tentative_output <= 0.0)
@@ -1200,7 +1212,13 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     if not ((is_saturated_high and error > 0) or (is_saturated_low and error < 0)):
                         self._integral += error * dt_norm
 
-                    i_term = self._ki * self._integral
+                    raw_i_term = self._ki * self._integral
+                    i_term = max(-max_i_limit, min(max_i_limit, raw_i_term))
+                    if self._ki > 0:
+                        self._integral = i_term / self._ki
+                    else:
+                        self._integral = 0.0
+                        i_term = 0.0
                     raw_output = p_term + i_term + d_term + e_term
                     final_output = max(0.0, min(100.0, raw_output))
 

@@ -59,6 +59,7 @@ from .const import (
     CONF_KE,
     CONF_KI,
     CONF_KP,
+    CONF_MAX_I,
     CONF_OFF_TEMP_ACTION,
     CONF_OUTDOOR_SENSOR,
     CONF_PWM_DURATION,
@@ -131,6 +132,7 @@ from .const import (
     DEFAULT_KE,
     DEFAULT_KI,
     DEFAULT_KP,
+    DEFAULT_MAX_I,
     DEFAULT_OFF_TEMP_ACTION,
     DEFAULT_OUTPUT_SAFETY,
     DEFAULT_PWM_DURATION,
@@ -346,7 +348,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             return val
 
         # Check all sections in options
-        for sec in ("section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
             sec_dict = self._entry.options.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -365,7 +367,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             return val
 
         # Check all sections in entry data
-        for sec in ("section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
             sec_dict = self._entry.data.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -429,6 +431,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         )
         self._kp: float = float(self._get_setting(CONF_KP, DEFAULT_KP))
         self._ki: float = float(self._get_setting(CONF_KI, DEFAULT_KI))
+        self._max_i: float = float(self._get_setting(CONF_MAX_I, DEFAULT_MAX_I))
         self._kd: float = float(self._get_setting(CONF_KD, DEFAULT_KD))
         self._ke: float = float(self._get_setting(CONF_KE, DEFAULT_KE))
         self._min_on_time: int = duration_to_seconds(
@@ -822,6 +825,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             "pid_error": self._pid_error,
             "pid_p": self._pid_p,
             "pid_i": self._pid_i,
+            "max_i": self._max_i,
             "pid_d": self._pid_d,
             "pid_e": self._pid_e,
             "pid_output": self._pid_output,
@@ -1955,19 +1959,21 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     self._prev_error = error
                     self._prev_room_temp = self._indoor_temp
 
-                    # (5) I term with anti-windup:
+                    # (5) I term with anti-windup and bidirectional Max I limit [-max_i, +max_i]:
                     # Always calculate integral across all modes; reset to 0 only on HVAC mode transitions
+                    max_i_limit = max(0.0, float(self._max_i))
                     candidate_i = self._integral + (self._ki * error * dt)
+                    candidate_i = max(-max_i_limit, min(max_i_limit, candidate_i))
                     candidate_raw = p_term + candidate_i + d_term + e_term
 
                     # Anti-windup check:
                     # When raw output saturates and error reinforces saturation, stop accumulation
                     if candidate_raw >= 100.0 and error > 0:
-                        pass  # Keep self._integral unchanged
+                        self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
                     elif candidate_raw <= 0.0 and error < 0:
-                        pass  # Keep self._integral unchanged
+                        self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
                     else:
-                        self._integral = max(0.0, min(100.0, candidate_i))
+                        self._integral = candidate_i
 
                     i_term = self._integral
 

@@ -1,0 +1,48 @@
+name: Automatic Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "릴리즈를 생성할 태그명 (예: v0.1.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG_NAME#v}"
+          TITLE="ver ${VERSION}"
+
+          BODY=$(git log -1 --format="%b" "${TAG_NAME}")
+          SUBJECT=$(git log -1 --format="%s" "${TAG_NAME}")
+
+          if [ -n "${BODY}" ]; then
+            NOTES=$(printf "### Smart PID Air Conditioner & Humidifier %s\n\n#### %s\n%s\n" "${TAG_NAME}" "${SUBJECT}" "${BODY}")
+          else
+            NOTES=$(printf "### Smart PID Air Conditioner & Humidifier %s\n\n- %s\n" "${TAG_NAME}" "${SUBJECT}")
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release edit "${TAG_NAME}" --title "${TITLE}" --notes "${NOTES}"
+          else
+            gh release create "${TAG_NAME}" --title "${TITLE}" --notes "${NOTES}" --verify-tag
+          fi
