@@ -1,0 +1,17 @@
+reset_learning:
+  name: Reset Learning Data
+  description: Reset self-learning models, coasting history, and safety snapshots for a Smart PID controller.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: Optional config entry ID to reset. If omitted, resets all Smart PID entries.
+      required: false
+      selector:
+        text:
+    entity_id:
+      name: Entity ID
+      description: Optional entity ID whose config entry learning state will be reset.
+      required: false
+      selector:
+        entity:
+          integration: smart_pid_airconditioner

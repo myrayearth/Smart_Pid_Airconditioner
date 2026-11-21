@@ -53,6 +53,36 @@
           "ke": "외기 단열 계수 (Ke)",
           "pwm_duration": "PWM 제어 주기 (초, 0=연속제어)",
           "sample_period": "PID 연산 주기 (초)"
+        },
+        "sections": {
+          "ventilation": {
+            "name": "환기 감지 및 학습 보호 (선택)",
+            "description": "창문/문 열림 또는 환기 스위치 작동 시 제어를 보류하고 학습 오염을 차단합니다.",
+            "data": {
+              "vent_mode": "환기 감지 모드",
+              "vent_sensors": "창문/문 열림 센서 (복수 선택 가능)",
+              "vent_logic": "다중 센서 판정 논리",
+              "vent_switch": "환기 연동 스위치",
+              "vent_debounce_sec": "열림 감지 디바운스 시간",
+              "vent_cooldown_min": "닫힘 후 학습 쿨다운 (분)"
+            }
+          },
+          "adaptive_learning": {
+            "name": "스마트 자가학습 및 안전 보호 (선택)",
+            "description": "실내 열·수분 모델 자가학습, 조기 종료, 수동 조작 유예 및 하드웨어 워치독을 설정합니다.",
+            "data": {
+              "tuning_mode": "튜닝 모드",
+              "prediction_mode": "예측 성향 (SIMC)",
+              "inertia_profile": "건물/기기 열 관성 프로파일",
+              "aux_temp_sensor": "보조 실내 온도 센서 (절대습도 g/m³ 변환용)",
+              "coupled_dehumidifier": "동일 공간 제습기 (발열 보정용)",
+              "coupled_ac": "동일 공간 에어컨 (냉방 중 제습 억제용)",
+              "manual_override_min": "외부 수동 조작 유예 시간 (분)",
+              "max_run_min": "최대 연속 가동 워치독 (분, 0=비활성)",
+              "safety_rest_min": "워치독 강제 휴지 시간 (분)",
+              "recorder_bootstrap": "설치 직후 Recorder 과거 이력 부트스트랩"
+            }
+          }
         }
       },
       "sections": {
@@ -350,6 +380,36 @@
           "ke": "외기 단열 계수 (Ke)",
           "pwm_duration": "PWM 제어 주기 (초)",
           "sample_period": "PID 연산 주기 (초)"
+        },
+        "sections": {
+          "ventilation": {
+            "name": "환기 감지 및 학습 보호 (선택)",
+            "description": "창문/문 열림 또는 환기 스위치 작동 시 제어를 보류하고 학습 오염을 차단합니다.",
+            "data": {
+              "vent_mode": "환기 감지 모드",
+              "vent_sensors": "창문/문 열림 센서 (복수 선택 가능)",
+              "vent_logic": "다중 센서 판정 논리",
+              "vent_switch": "환기 연동 스위치",
+              "vent_debounce_sec": "열림 감지 디바운스 시간",
+              "vent_cooldown_min": "닫힘 후 학습 쿨다운 (분)"
+            }
+          },
+          "adaptive_learning": {
+            "name": "스마트 자가학습 및 안전 보호 (선택)",
+            "description": "실내 열·수분 모델 자가학습, 조기 종료, 수동 조작 유예 및 하드웨어 워치독을 설정합니다.",
+            "data": {
+              "tuning_mode": "튜닝 모드",
+              "prediction_mode": "예측 성향 (SIMC)",
+              "inertia_profile": "건물/기기 열 관성 프로파일",
+              "aux_temp_sensor": "보조 실내 온도 센서 (절대습도 g/m³ 변환용)",
+              "coupled_dehumidifier": "동일 공간 제습기 (발열 보정용)",
+              "coupled_ac": "동일 공간 에어컨 (냉방 중 제습 억제용)",
+              "manual_override_min": "외부 수동 조작 유예 시간 (분)",
+              "max_run_min": "최대 연속 가동 워치독 (분, 0=비활성)",
+              "safety_rest_min": "워치독 강제 휴지 시간 (분)",
+              "recorder_bootstrap": "설치 직후 Recorder 과거 이력 부트스트랩"
+            }
+          }
         }
       },
       "sections": {
@@ -770,6 +830,31 @@
         "dehumidity": "제습 (Dehumidifier)",
         "fan_only": "송풍 (Fan Only)"
       }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "learning_confidence": {
+        "name": "학습 신뢰도"
+      },
+      "cycle_phase": {
+        "name": "사이클 단계"
+      },
+      "predicted_coast": {
+        "name": "예측 코스팅량"
+      },
+      "recommended_tuning": {
+        "name": "자동 추천 제어 파라미터"
+      },
+      "ventilation_state": {
+        "name": "환기 상태"
+      }
+    }
+  },
+  "services": {
+    "reset_learning": {
+      "name": "자가학습 데이터 초기화",
+      "description": "저장된 열/수분 모델, 코스팅 이력 및 안전 스냅샷을 초기화합니다."
     }
   }
 }

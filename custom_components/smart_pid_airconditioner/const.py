@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 
 DOMAIN = "smart_pid_airconditioner"
-PLATFORMS = [Platform.CLIMATE, Platform.HUMIDIFIER]
+PLATFORMS = [Platform.CLIMATE, Platform.HUMIDIFIER, Platform.SENSOR]
 
 # Config & Option Keys - Step 1: Base settings
 CONF_CONTROL_MODE = "control_mode"
@@ -250,6 +250,100 @@ FAIL_SAFE_MULTIPLIER = 3
 
 DEFAULT_SLAVE_MIN_TEMP = 18.0
 DEFAULT_SLAVE_MAX_TEMP = 30.0
+
+# Stage 1: PID Numerical Stability Constants
+DEFAULT_TAU_D = 120.0
+MIN_DERIVATIVE_EVENT_DT = 10.0
+
+# Stage 2: Ventilation Guard Constants
+CONF_VENT_MODE = "vent_mode"
+CONF_VENT_SENSORS = "vent_sensors"
+CONF_VENT_LOGIC = "vent_logic"
+CONF_VENT_SWITCH = "vent_switch"
+CONF_VENT_DEBOUNCE_SEC = "vent_debounce_sec"
+CONF_VENT_COOLDOWN_MIN = "vent_cooldown_min"
+
+VENT_MODE_DISABLED = "disabled"
+VENT_MODE_SENSORS = "sensors"
+VENT_MODE_SWITCH = "switch"
+VENT_MODE_COMBINED = "combined"
+VENT_MODES = [
+    VENT_MODE_DISABLED,
+    VENT_MODE_SENSORS,
+    VENT_MODE_SWITCH,
+    VENT_MODE_COMBINED,
+]
+
+VENT_LOGIC_ALL = "all"
+VENT_LOGIC_ANY = "any"
+VENT_LOGICS = [VENT_LOGIC_ALL, VENT_LOGIC_ANY]
+
+DEFAULT_VENT_MODE = VENT_MODE_DISABLED
+DEFAULT_VENT_LOGIC = VENT_LOGIC_ALL
+DEFAULT_VENT_DEBOUNCE_SEC = 45
+DEFAULT_VENT_COOLDOWN_MIN = 20
+DEFAULT_VENT_UNAVAILABLE_GRACE_SEC = 300
+
+# Stage 2: Section 0 (Standby / Early-Stop) Constants
+CONF_SEC0_ACTION = "sec0_action"
+CONF_SEC0_DELTA = "sec0_delta"
+CONF_SEC0_THRESHOLD = "sec0_threshold"
+
+SEC0_ACTION_SETBACK = "setback"
+SEC0_ACTION_FAN_ONLY = "fan_only"
+SEC0_ACTION_OFF = "off"
+SEC0_ACTIONS = [
+    SEC0_ACTION_SETBACK,
+    SEC0_ACTION_FAN_ONLY,
+    SEC0_ACTION_OFF,
+]
+
+DEFAULT_SEC0_ACTION = SEC0_ACTION_SETBACK
+DEFAULT_SEC0_THRESHOLD = 5.0
+DEFAULT_SEC0_DELTA_COOL = 2.0
+DEFAULT_SEC0_DELTA_HEAT = -2.0
+DEFAULT_SEC0_DELTA_DEHUMIDIFY = 5.0
+DEFAULT_SEC0_DELTA_HUMIDIFY = -5.0
+MIN_DWELL_SEC0 = 300
+MIN_DWELL_ACTIVE = 240
+
+# Stage 4: Adaptive Learning & Shadow Learn Constants
+CONF_TUNING_MODE = "tuning_mode"
+CONF_PREDICTION_MODE = "prediction_mode"
+CONF_INERTIA_PROFILE = "inertia_profile"
+CONF_AUX_TEMP_SENSOR = "aux_temp_sensor"
+
+TUNING_MODE_MANUAL = "manual_pid"
+TUNING_MODE_SHADOW = "shadow_learn"
+TUNING_MODE_AUTO = "adaptive_auto"
+TUNING_MODES = [
+    TUNING_MODE_MANUAL,
+    TUNING_MODE_SHADOW,
+    TUNING_MODE_AUTO,
+]
+DEFAULT_TUNING_MODE = TUNING_MODE_SHADOW
+DEFAULT_PREDICTION_MODE = "balanced"
+DEFAULT_INERTIA_PROFILE = "fast_air"
+
+SERVICE_RESET_LEARNING = "reset_learning"
+
+# Stage 5: Manual Override, Safety Watchdog, Cross-Coupling, Dual Deadband & Recorder
+CONF_MANUAL_OVERRIDE_MIN = "manual_override_min"
+CONF_MAX_RUN_MIN = "max_run_min"
+CONF_SAFETY_REST_MIN = "safety_rest_min"
+CONF_COUPLED_DEHUMIDIFIER = "coupled_dehumidifier"
+CONF_COUPLED_AC = "coupled_ac"
+CONF_RECORDER_BOOTSTRAP = "recorder_bootstrap"
+
+DEFAULT_MANUAL_OVERRIDE_MIN = 30
+DEFAULT_MAX_RUN_MIN = 120
+DEFAULT_SAFETY_REST_MIN = 15
+DEFAULT_RECORDER_BOOTSTRAP = False
+
+DUAL_MIN_DEADBAND_TEMP = 2.0
+DUAL_MIN_DEADBAND_HUMIDITY = 5.0
+
+
 
 
 def is_humidity_type(controller_type: str | None) -> bool:

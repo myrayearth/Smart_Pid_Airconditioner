@@ -53,6 +53,36 @@
           "ke": "외기 단열 계수 (Ke)",
           "pwm_duration": "PWM 제어 주기 (초, 0=연속제어)",
           "sample_period": "PID 연산 주기 (초)"
+        },
+        "sections": {
+          "ventilation": {
+            "name": "Ventilation Guard & Learning Protection (Optional)",
+            "description": "Pause control and block learning contamination during ventilation.",
+            "data": {
+              "vent_mode": "Ventilation Detection Mode",
+              "vent_sensors": "Window/Door Binary Sensors",
+              "vent_logic": "Multi-Sensor Logic",
+              "vent_switch": "Ventilation Switch",
+              "vent_debounce_sec": "Open Debounce Duration",
+              "vent_cooldown_min": "Post-Close Learning Cooldown (min)"
+            }
+          },
+          "adaptive_learning": {
+            "name": "Adaptive Self-Learning & Safety Watchdog (Optional)",
+            "description": "Configure self-learning, early-stop coasting, manual override grace, and watchdog.",
+            "data": {
+              "tuning_mode": "Tuning Mode",
+              "prediction_mode": "Prediction Profile (SIMC)",
+              "inertia_profile": "Thermal Inertia Profile",
+              "aux_temp_sensor": "Auxiliary Indoor Temperature Sensor (for Absolute Humidity)",
+              "coupled_dehumidifier": "Coupled Dehumidifier (Heat Compensation)",
+              "coupled_ac": "Coupled Air Conditioner (Cooling Interlock)",
+              "manual_override_min": "Manual Override Grace Period (min)",
+              "max_run_min": "Max Continuous Run Watchdog (min, 0=disabled)",
+              "safety_rest_min": "Watchdog Forced Rest Duration (min)",
+              "recorder_bootstrap": "Bootstrap from Recorder History on First Install"
+            }
+          }
         }
       },
       "sections": {
@@ -350,6 +380,36 @@
           "ke": "외기 단열 계수 (Ke)",
           "pwm_duration": "PWM 제어 주기 (초)",
           "sample_period": "PID 연산 주기 (초)"
+        },
+        "sections": {
+          "ventilation": {
+            "name": "Ventilation Guard & Learning Protection (Optional)",
+            "description": "Pause control and block learning contamination during ventilation.",
+            "data": {
+              "vent_mode": "Ventilation Detection Mode",
+              "vent_sensors": "Window/Door Binary Sensors",
+              "vent_logic": "Multi-Sensor Logic",
+              "vent_switch": "Ventilation Switch",
+              "vent_debounce_sec": "Open Debounce Duration",
+              "vent_cooldown_min": "Post-Close Learning Cooldown (min)"
+            }
+          },
+          "adaptive_learning": {
+            "name": "Adaptive Self-Learning & Safety Watchdog (Optional)",
+            "description": "Configure self-learning, early-stop coasting, manual override grace, and watchdog.",
+            "data": {
+              "tuning_mode": "Tuning Mode",
+              "prediction_mode": "Prediction Profile (SIMC)",
+              "inertia_profile": "Thermal Inertia Profile",
+              "aux_temp_sensor": "Auxiliary Indoor Temperature Sensor (for Absolute Humidity)",
+              "coupled_dehumidifier": "Coupled Dehumidifier (Heat Compensation)",
+              "coupled_ac": "Coupled Air Conditioner (Cooling Interlock)",
+              "manual_override_min": "Manual Override Grace Period (min)",
+              "max_run_min": "Max Continuous Run Watchdog (min, 0=disabled)",
+              "safety_rest_min": "Watchdog Forced Rest Duration (min)",
+              "recorder_bootstrap": "Bootstrap from Recorder History on First Install"
+            }
+          }
         }
       },
       "sections": {
@@ -770,6 +830,31 @@
         "dehumidity": "제습 (Dehumidifier)",
         "fan_only": "송풍 (Fan Only)"
       }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "learning_confidence": {
+        "name": "Learning Confidence"
+      },
+      "cycle_phase": {
+        "name": "Cycle Phase"
+      },
+      "predicted_coast": {
+        "name": "Predicted Coast"
+      },
+      "recommended_tuning": {
+        "name": "Recommended Tuning"
+      },
+      "ventilation_state": {
+        "name": "Ventilation State"
+      }
+    }
+  },
+  "services": {
+    "reset_learning": {
+      "name": "Reset Learning Data",
+      "description": "Reset self-learning models, coasting history, and safety snapshots."
     }
   }
 }

@@ -34,6 +34,7 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.restore_state import RestoreEntity
 import homeassistant.util.dt as dt_util
 
+from .climate import SmartPIDExtraStoredData
 from .const import (
     DOMAIN,
     ALL_FAN_MODES,
@@ -158,10 +159,12 @@ from .const import (
     DEFAULT_SEC_APPLY_MODE,
     DEFAULT_SEC_MODE,
     DEFAULT_SYNC_SLAVE_STATE,
+    DEFAULT_TAU_D,
     DEFAULT_THERMOSTAT_TYPE,
     FAIL_SAFE_MULTIPLIER,
     FAIL_SAFE_OUTPUT,
     HYSTERESIS_BAND,
+    MIN_DERIVATIVE_EVENT_DT,
     OFF_ACTION_SYNC_ONLY,
     OFF_ACTION_TURN_ON,
     THERMOSTAT_TYPE_COOLER,
@@ -177,10 +180,28 @@ from .const import (
     MODE_DEHUMIDITY,
     MODE_FAN_ONLY,
     MODE_SILENT,
+    CONF_VENT_COOLDOWN_MIN,
+    CONF_VENT_DEBOUNCE_SEC,
+    CONF_VENT_LOGIC,
+    CONF_VENT_MODE,
+    CONF_VENT_SENSORS,
+    CONF_VENT_SWITCH,
+    DEFAULT_VENT_COOLDOWN_MIN,
+    DEFAULT_VENT_DEBOUNCE_SEC,
+    DEFAULT_VENT_LOGIC,
+    DEFAULT_VENT_MODE,
+    CONF_MANUAL_OVERRIDE_MIN,
+    CONF_MAX_RUN_MIN,
+    CONF_SAFETY_REST_MIN,
+    DEFAULT_MANUAL_OVERRIDE_MIN,
+    DEFAULT_MAX_RUN_MIN,
+    DEFAULT_SAFETY_REST_MIN,
+    DUAL_MIN_DEADBAND_HUMIDITY,
     is_humidity_type,
     is_dual_controller,
     duration_to_seconds,
 )
+from .ventilation import VentState, VentStatus, VentilationGuard
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -253,8 +274,10 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
 
         # PID algorithm state
         self._last_calc_time: datetime | None = None
+        self._last_d_calc_time: datetime | None = None
         self._prev_room_humidity: float | None = None
         self._prev_error: float | None = None
+        self._filtered_d: float = 0.0
         self._integral: float = 0.0
         self._pid_error: float | None = None
         self._pid_p: float = 0.0
@@ -263,6 +286,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._pid_e: float = 0.0
         self._pid_output: float = 0.0
         self._active_section: int = 1
+        self._vent_status: VentStatus = VentStatus(VentState.NORMAL, False, False, 0, False)
         self._raw_target_humidity: float = self._target_humidity
         self._dispatched_humidity: int | None = None
         self._dispatched_fan_mode: str | None = None
@@ -298,7 +322,12 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._unsub_sensor_track: CALLBACK_TYPE | None = None
         self._unsub_interval_tick: CALLBACK_TYPE | None = None
 
-        # Guard flags
+        # Guard flags & Stage 4/5 runtime, manual override, watchdog
+        self._runtime: Any = getattr(entry, "runtime_data", None)
+        self._unsub_runtime: CALLBACK_TYPE | None = None
+        self._manual_override_until: datetime | None = None
+        self._continuous_run_start: datetime | None = None
+        self._watchdog_rest_until: datetime | None = None
         self._is_dispatching: bool = False
 
     def _run_async(self, coro) -> None:
@@ -329,7 +358,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         if val is not None:
             return val
 
-        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_0", "section_1", "section_2", "section_3", "section_4", "ventilation"):
             sec_dict = self._entry.options.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -345,7 +374,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         if val is not None:
             return val
 
-        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_0", "section_1", "section_2", "section_3", "section_4", "ventilation"):
             sec_dict = self._entry.data.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -575,6 +604,37 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._sec4_apply_hvac_mode: bool = self._sec4_apply_mode
         self._sec4_hvac_mode: str = self._sec4_mode
 
+        vent_mode = str(self._get_setting(CONF_VENT_MODE, DEFAULT_VENT_MODE))
+        vent_sensors = self._get_setting(CONF_VENT_SENSORS, []) or []
+        if isinstance(vent_sensors, str):
+            vent_sensors = [vent_sensors] if vent_sensors else []
+        vent_logic = str(self._get_setting(CONF_VENT_LOGIC, DEFAULT_VENT_LOGIC))
+        vent_switch = self._get_setting(CONF_VENT_SWITCH, None)
+        vent_debounce = duration_to_seconds(
+            self._get_setting(CONF_VENT_DEBOUNCE_SEC, DEFAULT_VENT_DEBOUNCE_SEC),
+            DEFAULT_VENT_DEBOUNCE_SEC,
+        )
+        vent_cooldown = int(
+            float(self._get_setting(CONF_VENT_COOLDOWN_MIN, DEFAULT_VENT_COOLDOWN_MIN))
+        )
+        self._vent_guard = VentilationGuard(
+            mode=vent_mode,
+            sensors=list(vent_sensors),
+            logic=vent_logic,
+            switch_entity=str(vent_switch) if vent_switch else None,
+            debounce_sec=vent_debounce,
+            cooldown_min=vent_cooldown,
+        )
+        self._manual_override_min: int = int(
+            float(self._get_setting(CONF_MANUAL_OVERRIDE_MIN, DEFAULT_MANUAL_OVERRIDE_MIN))
+        )
+        self._max_run_min: int = int(
+            float(self._get_setting(CONF_MAX_RUN_MIN, DEFAULT_MAX_RUN_MIN))
+        )
+        self._safety_rest_min: int = int(
+            float(self._get_setting(CONF_SAFETY_REST_MIN, DEFAULT_SAFETY_REST_MIN))
+        )
+
     def _active_target_device_id(self) -> str:
         """Return the active target switch/slave device ID based on mode and configuration."""
         if self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
@@ -694,6 +754,9 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             "dispatched_mode": self._dispatched_mode,
             "off_temp_action": self._off_temp_action,
             "sync_slave_state": self._sync_slave_state,
+            "ventilation_state": self._vent_status.state.value,
+            "ventilation_cooldown_remaining_sec": self._vent_status.cooldown_remaining_sec,
+            "learning_blocked": self._vent_status.should_block_learning,
         }
 
         if self._control_mode == CONTROL_MODE_SWITCH_PWM:
@@ -726,6 +789,20 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
     # ---------------------------------------------------------
     # Lifecycle and Event Tracking
     # ---------------------------------------------------------
+    @property
+    def extra_restore_state_data(self) -> SmartPIDExtraStoredData:
+        """Return entity specific state data to be restored."""
+        return SmartPIDExtraStoredData(
+            last_switch_on_times={
+                k: v.isoformat() for k, v in self._last_switch_on_times.items()
+            },
+            last_switch_off_times={
+                k: v.isoformat() for k, v in self._last_switch_off_times.items()
+            },
+            active_section=self._active_section,
+            integral=self._integral,
+        )
+
     async def async_added_to_hass(self) -> None:
         """Restore state and set up event listeners."""
         await super().async_added_to_hass()
@@ -750,6 +827,33 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 except (ValueError, TypeError):
                     pass
 
+        raw_extra = await self.async_get_last_extra_data()
+        extra_data: SmartPIDExtraStoredData | None = None
+        if isinstance(raw_extra, SmartPIDExtraStoredData):
+            extra_data = raw_extra
+        elif raw_extra is not None and hasattr(raw_extra, "as_dict"):
+            extra_data = SmartPIDExtraStoredData.from_dict(raw_extra.as_dict())
+        elif isinstance(raw_extra, dict):
+            extra_data = SmartPIDExtraStoredData.from_dict(raw_extra)
+
+        if extra_data is not None:
+            for dev_id, ts_str in extra_data.last_switch_on_times.items():
+                parsed_dt = dt_util.parse_datetime(ts_str)
+                if parsed_dt is not None:
+                    self._last_switch_on_times[dev_id] = parsed_dt
+            for dev_id, ts_str in extra_data.last_switch_off_times.items():
+                parsed_dt = dt_util.parse_datetime(ts_str)
+                if parsed_dt is not None:
+                    self._last_switch_off_times[dev_id] = parsed_dt
+            if self._last_switch_on_times:
+                self._last_switch_on_time = max(self._last_switch_on_times.values())
+            if self._last_switch_off_times:
+                self._last_switch_off_time = max(self._last_switch_off_times.values())
+            if extra_data.active_section in (1, 2, 3, 4):
+                self._active_section = extra_data.active_section
+            if self._is_on:
+                self._integral = float(extra_data.integral)
+
         # Track sensor changes
         sensors_to_track = [self._indoor_sensor_id]
         if self._outdoor_sensor_id:
@@ -760,8 +864,9 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             sensors_to_track.append(self._target_device_dehumidity_id)
         if self._target_device_humidity_id:
             sensors_to_track.append(self._target_device_humidity_id)
+        sensors_to_track.extend(self._vent_guard.tracked_entities)
 
-        valid_sensors = [s for s in sensors_to_track if s]
+        valid_sensors = [s for s in dict.fromkeys(sensors_to_track) if s]
         if valid_sensors:
             self._unsub_sensor_track = async_track_state_change_event(
                 self.hass, valid_sensors, self._async_entity_changed
@@ -778,11 +883,17 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 self.hass, self._async_keep_alive_handler, timedelta(seconds=self._keep_alive)
             )
 
+        if self._runtime is not None:
+            self._unsub_runtime = self._runtime.subscribe(self.async_write_ha_state)
+
         self._update_sensor_values()
         await self._async_calculate_and_control(force=True)
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up timers and subscriptions."""
+        if self._unsub_runtime is not None:
+            self._unsub_runtime()
+            self._unsub_runtime = None
         if self._unsub_sensor_track:
             self._unsub_sensor_track()
             self._unsub_sensor_track = None
@@ -868,7 +979,20 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         if new_state is None:
             return
 
+        if entity_id in self._vent_guard.tracked_entities:
+            self._run_async(self._async_calculate_and_control())
+            return
+
         if entity_id in (self._target_device_id, self._target_device_humidity_id, self._target_device_dehumidity_id):
+            if (
+                not self._is_dispatching
+                and self._manual_override_min > 0
+                and event.context is not None
+                and event.context.user_id is not None
+            ):
+                self._manual_override_until = dt_util.utcnow() + timedelta(
+                    minutes=self._manual_override_min
+                )
             if self._sync_slave_state and not self._is_dispatching:
                 await self._async_sync_mode_from_slave()
             return
@@ -918,6 +1042,8 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._integral = 0.0
         self._prev_error = None
         self._prev_room_humidity = None
+        self._filtered_d = 0.0
+        self._last_d_calc_time = None
         self._pid_error = 0.0
         self._pid_p = 0.0
         self._pid_i = 0.0
@@ -1103,6 +1229,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     now = dt_util.utcnow()
 
                 self._update_sensor_values()
+                self._vent_status = self._vent_guard.evaluate(self.hass, now)
 
                 if self._last_calc_time is None or force:
                     dt = float(self._sample_period)
@@ -1140,7 +1267,11 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                         is_heating = True
                     elif self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
                         if self._current_mode == MODE_AUTO:
-                            is_heating = (self._indoor_humidity < self._target_humidity)
+                            half_db = DUAL_MIN_DEADBAND_HUMIDITY / 2.0
+                            if self._is_heating:
+                                is_heating = self._indoor_humidity < (self._target_humidity + half_db)
+                            else:
+                                is_heating = self._indoor_humidity < (self._target_humidity - half_db)
                         elif self._current_mode == MODE_HUMIDITY:
                             is_heating = True
                         else:
@@ -1156,16 +1287,25 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                         )
                         self._integral = 0.0
                         self._prev_error = None
+                        self._prev_room_humidity = None
+                        self._filtered_d = 0.0
+                        self._last_d_calc_time = None
                         if self._control_mode == CONTROL_MODE_SWITCH_PWM:
                             self._cancel_pwm_timers()
                             self._pwm_state = False
                     self._is_heating = is_heating
 
+                    eff_kp, eff_ki, eff_ke = self._kp, self._ki, self._ke
+                    if self._runtime is not None:
+                        eff_kp, eff_ki, eff_ke, _ = self._runtime.get_effective_pid_params(
+                            self._kp, self._ki, self._ke
+                        )
+
                     if is_heating:
                         # Humidifier demand: target - current
                         error = self._target_humidity - self._indoor_humidity
                         e_term = (
-                            self._ke * (self._target_humidity - self._outdoor_humidity)
+                            eff_ke * (self._target_humidity - self._outdoor_humidity)
                             if self._outdoor_sensor_id and self._outdoor_humidity is not None
                             else 0.0
                         )
@@ -1173,12 +1313,12 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                         # Dehumidifier demand: current - target
                         error = self._indoor_humidity - self._target_humidity
                         e_term = (
-                            self._ke * (self._outdoor_humidity - self._target_humidity)
+                            eff_ke * (self._outdoor_humidity - self._target_humidity)
                             if self._outdoor_sensor_id and self._outdoor_humidity is not None
                             else 0.0
                         )
 
-                    p_term = self._kp * error
+                    p_term = eff_kp * error
 
                     dt_norm = (
                         (dt / float(self._sample_period))
@@ -1188,37 +1328,58 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     if dt_norm < 0.05:
                         dt_norm = 0.05
 
-                    # D term on measurement to prevent derivative kick on target changes
-                    if getattr(self, "_prev_room_humidity", None) is not None:
-                        diff_humidity = self._indoor_humidity - self._prev_room_humidity
-                        if is_heating:
-                            # Humidifier: demand increases as humidity drops
-                            d_term = -self._kd * (diff_humidity / dt_norm)
-                        else:
-                            # Dehumidifier: demand increases as humidity rises
-                            d_term = self._kd * (diff_humidity / dt_norm)
+                    # D term on measurement with 1st-order LPF (tau_d=120s) and <10s spike guard
+                    d_dt = (
+                        (now - self._last_d_calc_time).total_seconds()
+                        if self._last_d_calc_time is not None
+                        else dt
+                    )
+                    if not force and self._last_d_calc_time is not None and d_dt < MIN_DERIVATIVE_EVENT_DT:
+                        d_term = self._filtered_d
                     else:
-                        d_term = 0.0
+                        effective_d_dt = max(MIN_DERIVATIVE_EVENT_DT, d_dt)
+                        d_dt_norm = (
+                            (effective_d_dt / float(self._sample_period))
+                            if self._sample_period > 0
+                            else 1.0
+                        )
+                        d_dt_norm = max(0.1, d_dt_norm)
+                        if getattr(self, "_prev_room_humidity", None) is not None:
+                            diff_humidity = self._indoor_humidity - self._prev_room_humidity
+                            if is_heating:
+                                raw_d = -self._kd * (diff_humidity / d_dt_norm)
+                            else:
+                                raw_d = self._kd * (diff_humidity / d_dt_norm)
+                            alpha = effective_d_dt / (DEFAULT_TAU_D + effective_d_dt)
+                            self._filtered_d = alpha * raw_d + (1.0 - alpha) * self._filtered_d
+                            d_term = self._filtered_d
+                        else:
+                            d_term = 0.0
+                        self._last_d_calc_time = now
+                        self._prev_room_humidity = self._indoor_humidity
 
                     self._prev_error = error
-                    self._prev_room_humidity = self._indoor_humidity
 
                     # Integral calculation with anti-windup and bidirectional Max I limit [-max_i, +max_i]
                     max_i_limit = max(0.0, float(self._max_i))
-                    tentative_output = p_term + (self._ki * self._integral) + d_term + e_term
-                    is_saturated_high = (tentative_output >= 100.0)
-                    is_saturated_low = (tentative_output <= 0.0)
-
-                    if not ((is_saturated_high and error > 0) or (is_saturated_low and error < 0)):
-                        self._integral += error * dt_norm
-
-                    raw_i_term = self._ki * self._integral
-                    i_term = max(-max_i_limit, min(max_i_limit, raw_i_term))
-                    if self._ki > 0:
-                        self._integral = i_term / self._ki
+                    if self._vent_status.should_pause_control:
+                        raw_i_term = eff_ki * self._integral
+                        i_term = max(-max_i_limit, min(max_i_limit, raw_i_term))
                     else:
-                        self._integral = 0.0
-                        i_term = 0.0
+                        tentative_output = p_term + (eff_ki * self._integral) + d_term + e_term
+                        is_saturated_high = (tentative_output >= 100.0)
+                        is_saturated_low = (tentative_output <= 0.0)
+
+                        if not ((is_saturated_high and error > 0) or (is_saturated_low and error < 0)):
+                            self._integral += error * dt_norm
+
+                        raw_i_term = eff_ki * self._integral
+                        i_term = max(-max_i_limit, min(max_i_limit, raw_i_term))
+                        if eff_ki > 0:
+                            self._integral = i_term / eff_ki
+                        else:
+                            self._integral = 0.0
+                            i_term = 0.0
                     raw_output = p_term + i_term + d_term + e_term
                     final_output = max(0.0, min(100.0, raw_output))
 
@@ -1228,6 +1389,59 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     self._pid_d = round(d_term, 2)
                     self._pid_e = round(e_term, 2)
                     self._pid_output = round(final_output, 2)
+
+                # Stage 5: Manual override, Watchdog, Coupled AC interlock & Early-stop
+                manual_override_active = (
+                    self._manual_override_until is not None
+                    and now < self._manual_override_until
+                )
+                if self._manual_override_until is not None and now >= self._manual_override_until:
+                    self._manual_override_until = None
+
+                watchdog_resting = (
+                    self._watchdog_rest_until is not None
+                    and now < self._watchdog_rest_until
+                )
+                if self._watchdog_rest_until is not None and now >= self._watchdog_rest_until:
+                    self._watchdog_rest_until = None
+                    self._continuous_run_start = None
+
+                coupled_ac_inhibit = (
+                    self._runtime is not None
+                    and not self._is_heating
+                    and self._runtime.is_coupled_ac_cooling()
+                )
+                early_stop_pred = (
+                    self._runtime.get_early_stop_prediction()
+                    if self._runtime is not None
+                    else 0.0
+                )
+                early_stop_triggered = (
+                    early_stop_pred > 0.0
+                    and self._pid_error is not None
+                    and self._pid_error <= early_stop_pred
+                )
+
+                is_running = (
+                    self._is_on
+                    and not self._vent_status.should_pause_control
+                    and not watchdog_resting
+                    and not coupled_ac_inhibit
+                    and self._pid_output > 0.0
+                )
+                if is_running:
+                    if self._continuous_run_start is None:
+                        self._continuous_run_start = now
+                    elif (
+                        self._max_run_min > 0
+                        and (now - self._continuous_run_start).total_seconds()
+                        >= self._max_run_min * 60.0
+                    ):
+                        self._watchdog_rest_until = now + timedelta(minutes=self._safety_rest_min)
+                        self._continuous_run_start = None
+                        watchdog_resting = True
+                else:
+                    self._continuous_run_start = None
 
                 # Map section
                 new_section = self._determine_active_section(self._pid_output)
@@ -1257,9 +1471,35 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 self._dispatched_action = action if apply_action else None
                 self._dispatched_mode = mode if apply_mode else None
 
-                # When OFF: ensure all switches or slave devices are off
-                if not self._is_on:
+                def _report_hum_obs(act: bool) -> None:
+                    if self._runtime is not None:
+                        self._runtime.update_observation(
+                            indoor_val=self._indoor_humidity,
+                            outdoor_val=self._outdoor_humidity,
+                            target_val=self._target_humidity,
+                            u_effort=(self._pid_output / 100.0) if act else 0.0,
+                            is_active=act,
+                            is_heating=self._is_heating,
+                            vent_status=self._vent_status,
+                            manual_override=manual_override_active,
+                        )
+
+                if manual_override_active:
+                    _report_hum_obs(self._is_on)
+                    return
+
+                # When OFF, VENTILATING, watchdog resting, coupled AC cooling, or early-stop: turn off
+                if (
+                    not self._is_on
+                    or self._vent_status.should_pause_control
+                    or watchdog_resting
+                    or coupled_ac_inhibit
+                    or early_stop_triggered
+                ):
+                    self._cancel_pwm_timers()
+                    self._pwm_state = False
                     await self._async_turn_off_all_devices()
+                    _report_hum_obs(False)
                     return
 
                 # When ON: dispatch control
@@ -1273,6 +1513,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     mode=mode,
                     force=force,
                 )
+                _report_hum_obs(True)
 
             except Exception as ex:
                 _LOGGER.exception("Unexpected error in humidifier calculate_and_control: %s", ex)

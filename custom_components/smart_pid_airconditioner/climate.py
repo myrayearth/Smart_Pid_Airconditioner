@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import logging
 import math
@@ -16,6 +17,7 @@ from homeassistant.components.climate import (
 )
 from homeassistant.components.climate.const import (
     ATTR_FAN_MODE,
+    ATTR_HUMIDITY,
     ATTR_HVAC_MODE,
     SERVICE_SET_FAN_MODE,
     SERVICE_SET_HVAC_MODE,
@@ -42,7 +44,7 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
 )
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 import homeassistant.util.dt as dt_util
 
 from .const import (
@@ -157,11 +159,13 @@ from .const import (
     DEFAULT_SLAVE_MAX_TEMP,
     DEFAULT_SLAVE_MIN_TEMP,
     DEFAULT_SYNC_SLAVE_STATE,
+    DEFAULT_TAU_D,
     DEFAULT_TEMP_STEP,
     DEFAULT_THERMOSTAT_TYPE,
     FAIL_SAFE_MULTIPLIER,
     FAIL_SAFE_OUTPUT,
     HYSTERESIS_BAND,
+    MIN_DERIVATIVE_EVENT_DT,
     OFF_ACTION_SYNC_ONLY,
     OFF_ACTION_TURN_ON,
     SUPPORTED_HVAC_MODES,
@@ -178,10 +182,43 @@ from .const import (
     MODE_DEHUMIDITY,
     MODE_FAN_ONLY,
     MODE_SILENT,
+    CONF_SEC0_ACTION,
+    CONF_SEC0_DELTA,
+    CONF_SEC0_THRESHOLD,
+    CONF_VENT_COOLDOWN_MIN,
+    CONF_VENT_DEBOUNCE_SEC,
+    CONF_VENT_LOGIC,
+    CONF_VENT_MODE,
+    CONF_VENT_SENSORS,
+    CONF_VENT_SWITCH,
+    DEFAULT_SEC0_ACTION,
+    DEFAULT_SEC0_DELTA_COOL,
+    DEFAULT_SEC0_DELTA_DEHUMIDIFY,
+    DEFAULT_SEC0_DELTA_HEAT,
+    DEFAULT_SEC0_DELTA_HUMIDIFY,
+    DEFAULT_SEC0_THRESHOLD,
+    DEFAULT_VENT_COOLDOWN_MIN,
+    DEFAULT_VENT_DEBOUNCE_SEC,
+    DEFAULT_VENT_LOGIC,
+    DEFAULT_VENT_MODE,
+    MIN_DWELL_ACTIVE,
+    MIN_DWELL_SEC0,
+    SEC0_ACTION_FAN_ONLY,
+    SEC0_ACTION_OFF,
+    SEC0_ACTION_SETBACK,
+    CONF_MANUAL_OVERRIDE_MIN,
+    CONF_MAX_RUN_MIN,
+    CONF_SAFETY_REST_MIN,
+    DEFAULT_MANUAL_OVERRIDE_MIN,
+    DEFAULT_MAX_RUN_MIN,
+    DEFAULT_SAFETY_REST_MIN,
+    DUAL_MIN_DEADBAND_HUMIDITY,
+    DUAL_MIN_DEADBAND_TEMP,
     is_humidity_type,
     is_dual_controller,
     duration_to_seconds,
 )
+from .ventilation import VentState, VentStatus, VentilationGuard
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -234,6 +271,52 @@ async def async_setup_entry(
     async_add_entities([SmartPIDThermostatEntity(hass, entry)], True)
 
 
+@dataclass
+class SmartPIDExtraStoredData(ExtraStoredData):
+    """Extra stored data for Smart PID Thermostat / Humidifier state restoration."""
+
+    last_switch_on_times: dict[str, str]
+    last_switch_off_times: dict[str, str]
+    active_section: int
+    integral: float
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a dict representation of the extra data."""
+        return {
+            "last_switch_on_times": dict(self.last_switch_on_times),
+            "last_switch_off_times": dict(self.last_switch_off_times),
+            "active_section": self.active_section,
+            "integral": self.integral,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> SmartPIDExtraStoredData | None:
+        """Initialize extra stored data from a dict."""
+        if not isinstance(data, dict):
+            return None
+        try:
+            on_times = {
+                str(k): str(v)
+                for k, v in (data.get("last_switch_on_times") or {}).items()
+                if v is not None
+            }
+            off_times = {
+                str(k): str(v)
+                for k, v in (data.get("last_switch_off_times") or {}).items()
+                if v is not None
+            }
+            active_sec = int(data.get("active_section", 1))
+            integral = float(data.get("integral", 0.0))
+            return cls(
+                last_switch_on_times=on_times,
+                last_switch_off_times=off_times,
+                active_section=active_sec,
+                integral=integral,
+            )
+        except (ValueError, TypeError):
+            return None
+
+
 class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
     """Smart PID Thermostat Climate Entity."""
 
@@ -267,8 +350,11 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
         # PID algorithm state
         self._last_calc_time: datetime | None = None
+        self._last_d_calc_time: datetime | None = None
         self._prev_room_temp: float | None = None
+        self._prev_room_humidity: float | None = None
         self._prev_error: float | None = None
+        self._filtered_d: float = 0.0
         self._integral: float = 0.0
         self._pid_error: float | None = None
         self._pid_p: float = 0.0
@@ -277,6 +363,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self._pid_e: float = 0.0
         self._pid_output: float = 0.0
         self._active_section: int = 1
+        self._section_entered_at: datetime | None = None
+        self._vent_status: VentStatus = VentStatus(VentState.NORMAL, False, False, 0, False)
         self._raw_target_temperature: float = self._target_temp
         self._dispatched_temperature: int | None = None
         self._dispatched_fan_mode: str | None = None
@@ -310,7 +398,12 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self._unsub_sensor_track: CALLBACK_TYPE | None = None
         self._unsub_interval_tick: CALLBACK_TYPE | None = None
 
-        # Guard flags
+        # Guard flags & Stage 4/5 runtime, manual override, watchdog
+        self._runtime: Any = getattr(entry, "runtime_data", None)
+        self._unsub_runtime: CALLBACK_TYPE | None = None
+        self._manual_override_until: datetime | None = None
+        self._continuous_run_start: datetime | None = None
+        self._watchdog_rest_until: datetime | None = None
         self._is_dispatching: bool = False
         self._is_dispatching_hvac_mode: bool = False
         self._last_mode_change_time: datetime | None = None
@@ -348,7 +441,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             return val
 
         # Check all sections in options
-        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_0", "section_1", "section_2", "section_3", "section_4", "ventilation"):
             sec_dict = self._entry.options.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -367,7 +460,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             return val
 
         # Check all sections in entry data
-        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
+        for sec in ("ki_group", "section_0", "section_1", "section_2", "section_3", "section_4", "ventilation"):
             sec_dict = self._entry.data.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
@@ -571,6 +664,59 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         )
         self._sec4_hvac_mode: str = str(
             self._get_setting(CONF_SEC4_HVAC_MODE, DEFAULT_SEC_HVAC_MODE)
+        )
+
+        # Section 0 (Standby / Early-Stop) settings
+        self._sec0_action: str = str(
+            self._get_setting(CONF_SEC0_ACTION, DEFAULT_SEC0_ACTION)
+        )
+        self._sec0_threshold: float = float(
+            self._get_setting(CONF_SEC0_THRESHOLD, DEFAULT_SEC0_THRESHOLD)
+        )
+        if self._thermostat_type == THERMOSTAT_TYPE_HEATER:
+            default_sec0_delta = DEFAULT_SEC0_DELTA_HEAT
+        elif self._thermostat_type == THERMOSTAT_TYPE_HUMIDIFIER:
+            default_sec0_delta = DEFAULT_SEC0_DELTA_HUMIDIFY
+        elif self._thermostat_type in (THERMOSTAT_TYPE_DEHUMIDIFIER, THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY):
+            default_sec0_delta = DEFAULT_SEC0_DELTA_DEHUMIDIFY
+        else:
+            default_sec0_delta = DEFAULT_SEC0_DELTA_COOL
+        self._sec0_delta: float = float(
+            self._get_setting(CONF_SEC0_DELTA, default_sec0_delta)
+        )
+
+        # Ventilation Guard settings
+        vent_mode = str(self._get_setting(CONF_VENT_MODE, DEFAULT_VENT_MODE))
+        vent_sensors = self._get_setting(CONF_VENT_SENSORS, []) or []
+        if isinstance(vent_sensors, str):
+            vent_sensors = [vent_sensors] if vent_sensors else []
+        vent_logic = str(self._get_setting(CONF_VENT_LOGIC, DEFAULT_VENT_LOGIC))
+        vent_switch = self._get_setting(CONF_VENT_SWITCH, None)
+        vent_debounce = duration_to_seconds(
+            self._get_setting(CONF_VENT_DEBOUNCE_SEC, DEFAULT_VENT_DEBOUNCE_SEC),
+            DEFAULT_VENT_DEBOUNCE_SEC,
+        )
+        vent_cooldown = int(
+            float(self._get_setting(CONF_VENT_COOLDOWN_MIN, DEFAULT_VENT_COOLDOWN_MIN))
+        )
+        self._vent_guard = VentilationGuard(
+            mode=vent_mode,
+            sensors=list(vent_sensors),
+            logic=vent_logic,
+            switch_entity=str(vent_switch) if vent_switch else None,
+            debounce_sec=vent_debounce,
+            cooldown_min=vent_cooldown,
+        )
+
+        # Stage 5: Manual override grace & safety watchdog
+        self._manual_override_min: int = int(
+            float(self._get_setting(CONF_MANUAL_OVERRIDE_MIN, DEFAULT_MANUAL_OVERRIDE_MIN))
+        )
+        self._max_run_min: int = int(
+            float(self._get_setting(CONF_MAX_RUN_MIN, DEFAULT_MAX_RUN_MIN))
+        )
+        self._safety_rest_min: int = int(
+            float(self._get_setting(CONF_SAFETY_REST_MIN, DEFAULT_SAFETY_REST_MIN))
         )
 
     @property
@@ -834,6 +980,9 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             "indoor_humidity": self._indoor_humidity,
             "outdoor_humidity": self._outdoor_humidity,
             "fail_safe_active": self._fail_safe_active,
+            "ventilation_state": self._vent_status.state.value,
+            "ventilation_cooldown_remaining_sec": self._vent_status.cooldown_remaining_sec,
+            "learning_blocked": self._vent_status.should_block_learning,
         }
 
         if self._control_mode == CONTROL_MODE_SWITCH_PWM:
@@ -904,6 +1053,20 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             )
         return attrs
 
+    @property
+    def extra_restore_state_data(self) -> SmartPIDExtraStoredData:
+        """Return entity specific state data to be restored."""
+        return SmartPIDExtraStoredData(
+            last_switch_on_times={
+                k: v.isoformat() for k, v in self._last_switch_on_times.items()
+            },
+            last_switch_off_times={
+                k: v.isoformat() for k, v in self._last_switch_off_times.items()
+            },
+            active_section=self._active_section,
+            integral=self._integral,
+        )
+
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to Home Assistant."""
         await super().async_added_to_hass()
@@ -935,6 +1098,34 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 except (ValueError, TypeError):
                     self._integral = 0.0
 
+        # Restore extra stored data (protection timers, active section, integral)
+        raw_extra = await self.async_get_last_extra_data()
+        extra_data: SmartPIDExtraStoredData | None = None
+        if isinstance(raw_extra, SmartPIDExtraStoredData):
+            extra_data = raw_extra
+        elif raw_extra is not None and hasattr(raw_extra, "as_dict"):
+            extra_data = SmartPIDExtraStoredData.from_dict(raw_extra.as_dict())
+        elif isinstance(raw_extra, dict):
+            extra_data = SmartPIDExtraStoredData.from_dict(raw_extra)
+
+        if extra_data is not None:
+            for dev_id, ts_str in extra_data.last_switch_on_times.items():
+                parsed_dt = dt_util.parse_datetime(ts_str)
+                if parsed_dt is not None:
+                    self._last_switch_on_times[dev_id] = parsed_dt
+            for dev_id, ts_str in extra_data.last_switch_off_times.items():
+                parsed_dt = dt_util.parse_datetime(ts_str)
+                if parsed_dt is not None:
+                    self._last_switch_off_times[dev_id] = parsed_dt
+            if self._last_switch_on_times:
+                self._last_switch_on_time = max(self._last_switch_on_times.values())
+            if self._last_switch_off_times:
+                self._last_switch_off_time = max(self._last_switch_off_times.values())
+            if extra_data.active_section in (0, 1, 2, 3, 4):
+                self._active_section = extra_data.active_section
+            if self._is_active_hvac_mode:
+                self._integral = float(extra_data.integral)
+
         # Read initial sensor values
         self._update_sensor_values()
 
@@ -950,6 +1141,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 self._target_device_heat_id,
                 self._target_device_dehumidity_id,
                 self._target_device_humidity_id,
+                *self._vent_guard.tracked_entities,
             ]
             if s
         ]
@@ -973,11 +1165,17 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 timedelta(seconds=self._keep_alive),
             )
 
+        if self._runtime is not None:
+            self._unsub_runtime = self._runtime.subscribe(self.async_write_ha_state)
+
         # Initial calculation to populate P, I, D and output diagnostics immediately
         await self._async_calculate_and_control(force=True)
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from Home Assistant."""
+        if self._unsub_runtime is not None:
+            self._unsub_runtime()
+            self._unsub_runtime = None
         if self._unsub_sensor_track:
             self._unsub_sensor_track()
             self._unsub_sensor_track = None
@@ -1125,7 +1323,6 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             if parsed is not None:
                 if is_hum:
                     self._indoor_humidity = parsed
-                    self._indoor_temp = parsed
                 else:
                     self._indoor_temp = parsed
                 self._last_indoor_update = now
@@ -1134,7 +1331,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 self._sensor_stale_count += 1
                 if is_hum:
                     self._indoor_humidity = None
-                self._indoor_temp = None
+                else:
+                    self._indoor_temp = None
                 _LOGGER.warning(
                     "Invalid indoor sensor value from %s: %s",
                     self._indoor_sensor_id,
@@ -1144,7 +1342,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             self._sensor_stale_count += 1
             if is_hum:
                 self._indoor_humidity = None
-            self._indoor_temp = None
+            else:
+                self._indoor_temp = None
 
         # Outdoor sensor (optional feedforward)
         if self._outdoor_sensor_id:
@@ -1157,7 +1356,6 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 if parsed_out is not None:
                     if is_hum:
                         self._outdoor_humidity = parsed_out
-                        self._outdoor_temp = parsed_out
                     else:
                         self._outdoor_temp = parsed_out
                     self._last_outdoor_update = now
@@ -1171,16 +1369,23 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             else:
                 if is_hum:
                     self._outdoor_humidity = None
-                self._outdoor_temp = None
+                else:
+                    self._outdoor_temp = None
         else:
             if is_hum:
                 self._outdoor_humidity = None
-            self._outdoor_temp = None
+            else:
+                self._outdoor_temp = None
 
     @callback
     def _async_entity_changed(self, event: Event) -> None:
         """Handle state change event for sensors or slave climate/switch."""
         entity_id = event.data.get(ATTR_ENTITY_ID)
+
+        # Immediate reaction to ventilation sensor / switch changes
+        if entity_id in self._vent_guard.tracked_entities:
+            self._run_async(self._async_calculate_and_control())
+            return
 
         # Handle slave switch / climate state changes
         if entity_id in (
@@ -1190,6 +1395,22 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             self._target_device_dehumidity_id,
             self._target_device_humidity_id,
         ):
+            if (
+                not self._is_dispatching
+                and not self._is_dispatching_hvac_mode
+                and self._manual_override_min > 0
+                and event.context is not None
+                and event.context.user_id is not None
+            ):
+                self._manual_override_until = dt_util.utcnow() + timedelta(
+                    minutes=self._manual_override_min
+                )
+                _LOGGER.info(
+                    "External manual override detected on %s; pausing auto control & learning for %d min",
+                    entity_id,
+                    self._manual_override_min,
+                )
+
             if self._control_mode == CONTROL_MODE_SWITCH_PWM:
                 if entity_id == self._active_target_device_id:
                     new_state = event.data.get("new_state")
@@ -1367,6 +1588,9 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self._pid_i = 0.0
         self._prev_error = None
         self._prev_room_temp = None
+        self._prev_room_humidity = None
+        self._filtered_d = 0.0
+        self._last_d_calc_time = None
         self._cancel_pwm_timers()
         self._pwm_state = False
         self._last_dispatched_temp = None
@@ -1644,7 +1868,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                         if HVACMode.AUTO in self.hvac_modes
                         else (
                             MODE_HUMIDITY
-                            if self._indoor_temp is not None and self._target_temp > self._indoor_temp and MODE_HUMIDITY in self.hvac_modes
+                            if self._indoor_humidity is not None and self._target_temp > self._indoor_humidity and MODE_HUMIDITY in self.hvac_modes
                             else (
                                 MODE_DEHUMIDITY
                                 if MODE_DEHUMIDITY in self.hvac_modes
@@ -1687,15 +1911,24 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         # Active operating modes (COOL, HEAT, AUTO):
         await self._async_calculate_and_control(force=True)
 
-    def _determine_active_section(self, output: float, current_sec: int) -> int:
-        """Determine active section using hysteresis state machine (±1.5% deadband)."""
+    def _determine_active_section(
+        self,
+        output: float,
+        current_sec: int,
+        now: datetime | None = None,
+        force_sec0: bool = False,
+    ) -> int:
+        """Determine active section using hysteresis state machine (±1.5% deadband) and Section 0 dwell."""
         s1 = self._sec1_max
         s2 = self._sec2_max
         s3 = self._sec3_max
         band = HYSTERESIS_BAND
 
+        if force_sec0:
+            return 0
+
         # Initial fallback if section not initialized
-        if current_sec not in (1, 2, 3, 4):
+        if current_sec not in (0, 1, 2, 3, 4):
             if output <= s1:
                 return 1
             if output <= s2:
@@ -1703,6 +1936,32 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             if output <= s3:
                 return 3
             return 4
+
+        if current_sec == 0:
+            if (
+                self._section_entered_at is not None
+                and now is not None
+                and (now - self._section_entered_at).total_seconds() < MIN_DWELL_SEC0
+            ):
+                return 0
+            if output <= self._sec0_threshold + band:
+                return 0
+            if output <= s1:
+                return 1
+            if output <= s2:
+                return 2
+            if output <= s3:
+                return 3
+            return 4
+
+        # Check transition from active (1..4) into Section 0 standby
+        if (
+            output <= self._sec0_threshold
+            and self._section_entered_at is not None
+            and now is not None
+            and (now - self._section_entered_at).total_seconds() >= MIN_DWELL_ACTIVE
+        ):
+            return 0
 
         # Hysteresis transitions
         if current_sec == 1:
@@ -1747,6 +2006,12 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self, section: int
     ) -> tuple[bool, float, str, str, bool, bool, bool]:
         """Return apply_temp, delta, fan mode, hvac mode, apply_delta, apply_fan, apply_hvac_mode."""
+        if section == 0:
+            if self._sec0_action == SEC0_ACTION_FAN_ONLY:
+                return (False, 0.0, "low", HVACMode.FAN_ONLY.value, False, False, True)
+            if self._sec0_action == SEC0_ACTION_OFF:
+                return (False, 0.0, "low", HVACMode.OFF.value, False, False, True)
+            return (True, self._sec0_delta, "low", "follow", True, False, False)
         if section == 1:
             return (
                 self._sec1_apply_temp,
@@ -1798,6 +2063,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
                 # Always read fresh sensor values on every evaluation
                 self._update_sensor_values()
+                self._vent_status = self._vent_guard.evaluate(self.hass, now)
 
                 # Calculate dt (time delta in seconds) with bounds
                 if self._last_calc_time is None or force:
@@ -1808,8 +2074,12 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     dt = max(1.0, min(float(self._sample_period) * 2.0, raw_dt))
                 self._last_calc_time = now
 
+                is_hum = is_humidity_type(self._thermostat_type)
+                indoor_val = self._indoor_humidity if is_hum else self._indoor_temp
+                outdoor_val = self._outdoor_humidity if is_hum else self._outdoor_temp
+
                 # Fail-Safe check: Indoor sensor unavailable, invalid, or stale (3 consecutive times)
-                if self._indoor_temp is None or self._sensor_stale_count >= 3:
+                if indoor_val is None or self._sensor_stale_count >= 3:
                     self._fail_safe_active = True
                     _LOGGER.warning(
                         "Fail-safe triggered: Indoor sensor (%s) unavailable, invalid, or stale (stale_count=%d)",
@@ -1858,7 +2128,11 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                         is_heating = True
                     elif self._thermostat_type == THERMOSTAT_TYPE_HEAT_COOL:
                         if str_mode == "auto":
-                            is_heating = (self._indoor_temp < self._target_temp)
+                            half_db = DUAL_MIN_DEADBAND_TEMP / 2.0
+                            if self._is_heating:
+                                is_heating = indoor_val < (self._target_temp + half_db)
+                            else:
+                                is_heating = indoor_val < (self._target_temp - half_db)
                         elif str_mode == "heat":
                             is_heating = True
                         else:
@@ -1869,7 +2143,11 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                         is_heating = True
                     elif self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
                         if str_mode == "auto":
-                            is_heating = (self._indoor_temp < self._target_temp)
+                            half_db = DUAL_MIN_DEADBAND_HUMIDITY / 2.0
+                            if self._is_heating:
+                                is_heating = indoor_val < (self._target_temp + half_db)
+                            else:
+                                is_heating = indoor_val < (self._target_temp - half_db)
                         elif str_mode == MODE_HUMIDITY:
                             is_heating = True
                         else:
@@ -1911,69 +2189,96 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                         self._integral = 0.0
                         self._prev_error = None
                         self._prev_room_temp = None
+                        self._prev_room_humidity = None
+                        self._filtered_d = 0.0
+                        self._last_d_calc_time = None
                     self._is_heating = is_heating
+
+                    eff_kp, eff_ki, eff_ke = self._kp, self._ki, self._ke
+                    if self._runtime is not None:
+                        eff_kp, eff_ki, eff_ke, _ = self._runtime.get_effective_pid_params(
+                            self._kp, self._ki, self._ke
+                        )
 
                     if is_heating:
                         # Heating error: e(t) = T_target(t) - T_room(t)
-                        error = self._target_temp - self._indoor_temp
+                        error = self._target_temp - indoor_val
                         # Outdoor feedforward Ke term for heating:
                         # When outdoor is colder than target, heat loss is higher -> increase heating demand
-                        if self._outdoor_sensor_id and self._outdoor_temp is not None:
-                            e_term = self._ke * (self._target_temp - self._outdoor_temp)
+                        if self._outdoor_sensor_id and outdoor_val is not None:
+                            e_term = eff_ke * (self._target_temp - outdoor_val)
                         else:
                             e_term = 0.0
                     else:
                         # Cooling error: e(t) = T_room(t) - T_target(t)
-                        error = self._indoor_temp - self._target_temp
+                        error = indoor_val - self._target_temp
                         # Outdoor feedforward Ke term for cooling:
                         # When outdoor is hotter than target, heat gain is higher -> increase cooling demand
-                        if self._outdoor_sensor_id and self._outdoor_temp is not None:
-                            e_term = self._ke * (self._outdoor_temp - self._target_temp)
+                        if self._outdoor_sensor_id and outdoor_val is not None:
+                            e_term = eff_ke * (outdoor_val - self._target_temp)
                         else:
                             e_term = 0.0
 
                     # (2) P term: P(t) = Kp * e(t)
-                    p_term = self._kp * error
+                    p_term = eff_kp * error
 
-                    # (3) D term using derivative on measurement with sample period normalization:
-                    # Prevents derivative kick on setpoint change
-                    # Bound dt_norm >= 0.05 to prevent artificial derivative spikes from sensor noise
-                    dt_norm = (
-                        (dt / float(self._sample_period))
-                        if self._sample_period > 0
-                        else 1.0
+                    # (3) D term using derivative on measurement with 1st-order LPF (tau_d=120s)
+                    # Block < 10s event-driven derivative spikes (which previously amplified noise 20x)
+                    prev_val = self._prev_room_humidity if is_hum else self._prev_room_temp
+                    d_dt = (
+                        (now - self._last_d_calc_time).total_seconds()
+                        if self._last_d_calc_time is not None
+                        else dt
                     )
-                    if dt_norm < 0.05:
-                        dt_norm = 0.05
+                    if not force and self._last_d_calc_time is not None and d_dt < MIN_DERIVATIVE_EVENT_DT:
+                        d_term = self._filtered_d
+                    else:
+                        effective_d_dt = max(MIN_DERIVATIVE_EVENT_DT, d_dt)
+                        dt_norm = (
+                            (effective_d_dt / float(self._sample_period))
+                            if self._sample_period > 0
+                            else 1.0
+                        )
+                        dt_norm = max(0.1, dt_norm)
 
-                    if self._prev_room_temp is not None:
-                        diff_temp = self._indoor_temp - self._prev_room_temp
-                        if is_heating:
-                            # Heating: demand increases as temperature drops
-                            d_term = -self._kd * (diff_temp / dt_norm)
+                        if prev_val is not None:
+                            diff_val = indoor_val - prev_val
+                            if is_heating:
+                                raw_d = -self._kd * (diff_val / dt_norm)
+                            else:
+                                raw_d = self._kd * (diff_val / dt_norm)
+                            alpha = effective_d_dt / (DEFAULT_TAU_D + effective_d_dt)
+                            self._filtered_d = alpha * raw_d + (1.0 - alpha) * self._filtered_d
+                            d_term = self._filtered_d
                         else:
-                            # Cooling: demand increases as temperature rises
-                            d_term = self._kd * (diff_temp / dt_norm)
-                    else:
-                        d_term = 0.0
+                            d_term = 0.0
+                        self._last_d_calc_time = now
+                        if is_hum:
+                            self._prev_room_humidity = indoor_val
+                        else:
+                            self._prev_room_temp = indoor_val
+
                     self._prev_error = error
-                    self._prev_room_temp = self._indoor_temp
 
-                    # (5) I term with anti-windup and bidirectional Max I limit [-max_i, +max_i]:
-                    # Always calculate integral across all modes; reset to 0 only on HVAC mode transitions
+                    # (5) I term normalized to per-minute dt (dt / 60.0) with anti-windup and [-max_i, +max_i]
+                    # Freeze integral during VENTILATING or Section 0 standby
                     max_i_limit = max(0.0, float(self._max_i))
-                    candidate_i = self._integral + (self._ki * error * dt)
-                    candidate_i = max(-max_i_limit, min(max_i_limit, candidate_i))
-                    candidate_raw = p_term + candidate_i + d_term + e_term
-
-                    # Anti-windup check:
-                    # When raw output saturates and error reinforces saturation, stop accumulation
-                    if candidate_raw >= 100.0 and error > 0:
-                        self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
-                    elif candidate_raw <= 0.0 and error < 0:
+                    if self._vent_status.should_pause_control or self._active_section == 0:
                         self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
                     else:
-                        self._integral = candidate_i
+                        dt_min = dt / 60.0
+                        candidate_i = self._integral + (eff_ki * error * dt_min)
+                        candidate_i = max(-max_i_limit, min(max_i_limit, candidate_i))
+                        candidate_raw = p_term + candidate_i + d_term + e_term
+
+                        # Anti-windup check:
+                        # When raw output saturates and error reinforces saturation, stop accumulation
+                        if candidate_raw >= 100.0 and error > 0:
+                            self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
+                        elif candidate_raw <= 0.0 and error < 0:
+                            self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
+                        else:
+                            self._integral = candidate_i
 
                     i_term = self._integral
 
@@ -1989,19 +2294,110 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     self._pid_e = round(e_term, 2)
                     self._pid_output = round(final_output, 2)
 
+                # Stage 5: Manual Override & Safety Watchdog evaluation
+                manual_override_active = (
+                    self._manual_override_until is not None
+                    and now < self._manual_override_until
+                )
+                if self._manual_override_until is not None and now >= self._manual_override_until:
+                    self._manual_override_until = None
+
+                watchdog_resting = (
+                    self._watchdog_rest_until is not None
+                    and now < self._watchdog_rest_until
+                )
+                if self._watchdog_rest_until is not None and now >= self._watchdog_rest_until:
+                    self._watchdog_rest_until = None
+                    self._continuous_run_start = None
+
+                is_currently_running = (
+                    self._is_active_hvac_mode
+                    and not self._vent_status.should_pause_control
+                    and not watchdog_resting
+                    and final_output > 0.0
+                    and self._active_section != 0
+                )
+                if is_currently_running:
+                    if self._continuous_run_start is None:
+                        self._continuous_run_start = now
+                    elif (
+                        self._max_run_min > 0
+                        and (now - self._continuous_run_start).total_seconds()
+                        >= self._max_run_min * 60.0
+                    ):
+                        _LOGGER.warning(
+                            "Safety watchdog triggered after %d min continuous run; resting for %d min",
+                            self._max_run_min,
+                            self._safety_rest_min,
+                        )
+                        self._watchdog_rest_until = now + timedelta(minutes=self._safety_rest_min)
+                        self._continuous_run_start = None
+                        watchdog_resting = True
+                else:
+                    self._continuous_run_start = None
+
+                early_stop_pred = (
+                    self._runtime.get_early_stop_prediction()
+                    if self._runtime is not None
+                    else 0.0
+                )
+                early_stop_triggered = (
+                    early_stop_pred > 0.0
+                    and self._pid_error is not None
+                    and self._pid_error <= early_stop_pred
+                )
+
+                def _report_obs(is_act: bool, u_eff: float) -> None:
+                    if self._runtime is not None:
+                        self._runtime.update_observation(
+                            indoor_val=indoor_val,
+                            outdoor_val=outdoor_val,
+                            target_val=self._target_temp,
+                            u_effort=u_eff,
+                            is_active=is_act,
+                            is_heating=self._is_heating,
+                            vent_status=self._vent_status,
+                            manual_override=manual_override_active,
+                        )
+
                 # Branch for switch PWM mode (no climate sections / delta / fan)
                 if self._control_mode == CONTROL_MODE_SWITCH_PWM:
-                    if self._is_active_hvac_mode:
+                    if manual_override_active:
+                        _report_obs(self._pwm_state, self._pid_output / 100.0)
+                        self.async_write_ha_state()
+                        return
+                    if (
+                        self._is_active_hvac_mode
+                        and not self._vent_status.should_pause_control
+                        and not watchdog_resting
+                        and not early_stop_triggered
+                    ):
                         await self._async_start_pwm_cycle(force=force)
                     else:
                         await self._async_stop_pwm()
+                    _report_obs(self._pwm_state, self._pid_output / 100.0 if self._pwm_state else 0.0)
                     self.async_write_ha_state()
                     return
 
-                # Section and Hysteresis mapping
-                new_section = self._determine_active_section(
-                    final_output, self._active_section
+                # Section and Hysteresis mapping (including Section 0 standby, ventilation pause, watchdog & early-stop)
+                prev_section = self._active_section
+                force_sec0 = (
+                    self._vent_status.should_pause_control
+                    or watchdog_resting
+                    or (
+                        early_stop_triggered
+                        and self._section_entered_at is not None
+                        and (now - self._section_entered_at).total_seconds() >= MIN_DWELL_ACTIVE
+                    )
                 )
+                new_section = self._determine_active_section(
+                    final_output,
+                    self._active_section,
+                    now=now,
+                    force_sec0=force_sec0,
+                )
+                if new_section != prev_section or self._section_entered_at is None:
+                    self._section_entered_at = now
                 section_changed = (self._last_dispatched_section != new_section)
                 self._active_section = new_section
                 (
@@ -2044,7 +2440,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     self._dispatched_fan_mode = matched_fan
 
                 # Dispatch control commands to slave climate entity
-                if self._is_active_hvac_mode:
+                if self._is_active_hvac_mode and not manual_override_active:
                     # Active PID control: dispatch according to section parameters
                     _LOGGER.info(
                         "PID active: section %d (output=%.1f%%). Dispatched temp: %s °C (target: %.1f °C, delta: %.1f °C, apply_temp: %s), Dispatched fan: %s (apply_fan: %s)",
@@ -2080,6 +2476,11 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                         self._dispatched_fan_mode,
                         apply_fan,
                     )
+
+                _report_obs(
+                    self._is_active_hvac_mode and new_section != 0 and not self._vent_status.should_pause_control,
+                    final_output / 100.0 if (self._is_active_hvac_mode and new_section != 0) else 0.0,
+                )
 
             except Exception as err:
                 _LOGGER.exception("Unexpected error in calculation and control: %s", err)

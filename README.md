@@ -71,3 +71,33 @@ custom_components/smart_pid_airconditioner/
 2. 저장소 URL: `https://github.com/myrayearth/Smart_Pid_Airconditioner`
 3. 범주: **통합구성요소 (Integration)**
 4. 다운로드 후 Home Assistant를 재시작합니다.
+
+---
+
+## 🧠 자가학습 (`shadow_learn` → `adaptive_auto`) 전환 가이드
+
+1. **초기 관찰 단계 (`shadow_learn`, 기본값)**:
+   - 기존 수동 PID 설정과 **100% 동일한 제어 명령**을 유지하면서 백그라운드에서 Huber-RLS 열·수분 모델과 동적 코스팅(잔열/잔냉)을 학습합니다.
+   - 5종 진단 센서(`학습 신뢰도`, `사이클 단계`, `예측 코스팅량`, `자동 추천 제어 파라미터`, `환기 상태`)로 학습 진행 상황을 확인할 수 있습니다.
+2. **자동 제어 전환 (`adaptive_auto`)**:
+   - `학습 신뢰도` 센서의 `stage` 속성이 `tuned` 이상(유효 사이클 5회 이상 및 충분한 RLS 샘플 확보)에 도달하면 옵션에서 **튜닝 모드**를 `adaptive_auto`로 변경하세요.
+   - `switch_pwm` 및 `climate_delta` (Section 0) 조기 종료, SIMC 자동 PI/Ke 제어, 5사이클 사후 검증(30% 초과 악화 시 자동 롤백)이 활성화됩니다.
+3. **학습 초기화 (`smart_pid_airconditioner.reset_learning` 서비스)**:
+   - 기기 교체나 공간 구조 변경 시 서비스를 호출해 학습 모델과 저장소를 안전하게 초기화할 수 있습니다.
+
+## 🪟 환기 감지 및 보호 설정
+
+- **환기 감지 모드 (`vent_mode`)**: `disabled`, `sensors`(다중 `binary_sensor`, `all`/`any` 논리), `switch`(`switch`/`input_boolean`), `combined` 지원.
+- **4상태 보호**: `normal` → `open_debounce`(기본 45초, 짧은 출입 오감지 방지) → `ventilating`(제어 일시정지 및 적분항 동결) → `post_close_cooldown`(기본 20분, 제어 즉시 재개 및 벽체 반등 학습 차단).
+- **수동 조작 유예 & 워치독**: 외부 리모컨/대시보드 조작 시 기본 30분간 자동 개입 보류, 연속 가동 120분 초과 시 15분 강제 휴지.
+
+## 📊 진단 센서 해석
+
+| 센서 | 상태(State) | 주요 속성(Attributes) |
+| :--- | :--- | :--- |
+| **학습 신뢰도** | `0 ~ 100%` | `stage` (`collecting` / `stable` / `tuned` / `optimized`), `rls_samples`, `rejected_outliers` |
+| **사이클 단계** | `idle` / `active` / `post_stop_coast` / `passive_drift` | `accepted_count`, `rejected_counts`, `last_quality_reason`, `inertia_profile` |
+| **예측 코스팅량** | `°C` 또는 `g/m³` / `%` | 정지 후 예상 추가 변동량 |
+| **자동 추천 제어 파라미터** | 추천 `Kp` | `recommended_ki`, `recommended_ke`, `learned_rate`, `learned_loss`, `fallback_reason` |
+| **환기 상태** | `normal` / `open_debounce` / `ventilating` / `post_close_cooldown` | `cooldown_remaining_seconds`, `should_pause_control`, `should_block_learning`, `degraded` |
+

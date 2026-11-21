@@ -1,0 +1,177 @@
+"""Diagnostic sensor platform for Smart PID Air Conditioner."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory, PERCENTAGE, UnitOfTemperature
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import DOMAIN
+from .runtime import SmartPIDRuntime
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up diagnostic sensors for Smart PID Air Conditioner."""
+    runtime: SmartPIDRuntime = entry.runtime_data
+    async_add_entities(
+        [
+            SmartPIDConfidenceSensor(entry, runtime),
+            SmartPIDCyclePhaseSensor(entry, runtime),
+            SmartPIDPredictedCoastSensor(entry, runtime),
+            SmartPIDRecommendedTuningSensor(entry, runtime),
+            SmartPIDVentilationStateSensor(entry, runtime),
+        ],
+        True,
+    )
+
+
+class _BaseSmartPIDDiagnosticSensor(SensorEntity):
+    """Base diagnostic sensor subscribed to SmartPIDRuntime."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime, key: str, name: str) -> None:
+        self._entry = entry
+        self._runtime = runtime
+        self._attr_unique_id = f"{entry.entry_id}_{key}"
+        self._attr_name = name
+        self._attr_translation_key = key
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=entry.title,
+            manufacturer="Smart PID",
+            model="Smart PID Controller",
+        )
+        self._unsub: Any = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._unsub = self._runtime.subscribe(self._on_runtime_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub is not None:
+            self._unsub()
+            self._unsub = None
+
+    @callback
+    def _on_runtime_update(self) -> None:
+        self.async_write_ha_state()
+
+
+class SmartPIDConfidenceSensor(_BaseSmartPIDDiagnosticSensor):
+    """Learning confidence (%) and stage diagnostic sensor."""
+
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
+        super().__init__(entry, runtime, "learning_confidence", "Learning Confidence")
+
+    @property
+    def native_value(self) -> float:
+        _, pct = self._runtime.get_confidence()
+        return pct
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        stage, _ = self._runtime.get_confidence()
+        return {
+            "stage": stage.value,
+            "rls_samples": self._runtime._active_rls().sample_count,
+            "rejected_outliers": self._runtime._active_rls().rejected_outliers,
+            "tuning_mode": self._runtime.tuning_mode,
+        }
+
+
+class SmartPIDCyclePhaseSensor(_BaseSmartPIDDiagnosticSensor):
+    """Cycle phase diagnostic sensor (idle/active/post_stop_coast/passive_drift)."""
+
+    def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
+        super().__init__(entry, runtime, "cycle_phase", "Cycle Phase")
+
+    @property
+    def native_value(self) -> str:
+        return self._runtime.snapshot.coasting.phase.value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        c = self._runtime.snapshot.coasting
+        return {
+            "accepted_count": c.accepted_count,
+            "rejected_counts": dict(c.rejected_counts),
+            "last_quality_reason": c.last_quality_reason,
+            "inertia_profile": c.inertia_profile,
+        }
+
+
+class SmartPIDPredictedCoastSensor(_BaseSmartPIDDiagnosticSensor):
+    """Predicted coasting excursion diagnostic sensor."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
+        super().__init__(entry, runtime, "predicted_coast", "Predicted Coast")
+        if runtime.is_humidity:
+            self._attr_native_unit_of_measurement = "g/m³" if runtime.aux_temp_sensor else PERCENTAGE
+        else:
+            self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+
+    @property
+    def native_value(self) -> float:
+        return round(self._runtime.snapshot.coasting.predict_coast(), 3)
+
+
+class SmartPIDRecommendedTuningSensor(_BaseSmartPIDDiagnosticSensor):
+    """Recommended Kp (state) and Ki/Ke/learned model attributes."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
+        super().__init__(entry, runtime, "recommended_tuning", "Recommended Tuning")
+
+    @property
+    def native_value(self) -> float:
+        return round(self._runtime.recommended.kp, 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        rec = self._runtime.recommended
+        return {
+            "recommended_kp": rec.kp,
+            "recommended_ki": rec.ki,
+            "recommended_ke": rec.ke,
+            "learned_rate": rec.learned_rate,
+            "learned_loss": rec.learned_loss,
+            "fallback_reason": self._runtime.fallback_reason,
+        }
+
+
+class SmartPIDVentilationStateSensor(_BaseSmartPIDDiagnosticSensor):
+    """Ventilation state diagnostic sensor."""
+
+    def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
+        super().__init__(entry, runtime, "ventilation_state", "Ventilation State")
+
+    @property
+    def native_value(self) -> str:
+        return self._runtime._obs_vent_status.state.value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        st = self._runtime._obs_vent_status
+        return {
+            "cooldown_remaining_seconds": st.cooldown_remaining_sec,
+            "should_pause_control": st.should_pause_control,
+            "should_block_learning": st.should_block_learning,
+            "degraded": st.degraded,
+        }

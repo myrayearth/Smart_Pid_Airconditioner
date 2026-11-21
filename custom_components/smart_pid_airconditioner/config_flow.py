@@ -380,15 +380,138 @@ def _flatten_sections_input(data: dict[str, Any] | None) -> dict[str, Any]:
     return flat
 
 
+def _build_ventilation_section(get_val: Any) -> dict[Any, Any]:
+    """Build collapsible ventilation section schema."""
+    vent_schema = {
+        vol.Optional(
+            CONF_VENT_MODE, default=get_val(CONF_VENT_MODE, DEFAULT_VENT_MODE)
+        ): SelectSelector(
+            SelectSelectorConfig(options=VENT_MODES, mode=SelectSelectorMode.DROPDOWN)
+        ),
+        vol.Optional(
+            CONF_VENT_SENSORS, default=get_val(CONF_VENT_SENSORS, []) or []
+        ): EntitySelector(
+            EntitySelectorConfig(domain="binary_sensor", multiple=True)
+        ),
+        vol.Optional(
+            CONF_VENT_LOGIC, default=get_val(CONF_VENT_LOGIC, DEFAULT_VENT_LOGIC)
+        ): SelectSelector(
+            SelectSelectorConfig(options=VENT_LOGICS, mode=SelectSelectorMode.DROPDOWN)
+        ),
+        vol.Optional(
+            CONF_VENT_SWITCH,
+            description={"suggested_value": get_val(CONF_VENT_SWITCH, None)},
+        ): EntitySelector(
+            EntitySelectorConfig(domain=["switch", "input_boolean"], multiple=False)
+        ),
+        vol.Optional(
+            CONF_VENT_DEBOUNCE_SEC,
+            default=seconds_to_duration_dict(
+                get_val(CONF_VENT_DEBOUNCE_SEC, DEFAULT_VENT_DEBOUNCE_SEC)
+            ),
+        ): DurationSelector(DurationSelectorConfig(enable_day=False)),
+        vol.Optional(
+            CONF_VENT_COOLDOWN_MIN,
+            default=get_val(CONF_VENT_COOLDOWN_MIN, DEFAULT_VENT_COOLDOWN_MIN),
+        ): NumberSelector(
+            NumberSelectorConfig(min=0, max=120, step=1, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
+        ),
+    }
+    if section is not None:
+        return {"ventilation": section(vol.Schema(vent_schema), {"collapsed": True})}
+    return vent_schema
+
+
+def _build_adaptive_learning_section(is_hum: bool, get_val: Any) -> dict[Any, Any]:
+    """Build collapsible adaptive_learning section schema."""
+    al_schema: dict[Any, Any] = {
+        vol.Optional(
+            CONF_TUNING_MODE, default=get_val(CONF_TUNING_MODE, DEFAULT_TUNING_MODE)
+        ): SelectSelector(
+            SelectSelectorConfig(options=TUNING_MODES, mode=SelectSelectorMode.DROPDOWN)
+        ),
+        vol.Optional(
+            CONF_PREDICTION_MODE,
+            default=get_val(CONF_PREDICTION_MODE, DEFAULT_PREDICTION_MODE),
+        ): SelectSelector(
+            SelectSelectorConfig(options=list(PREDICTION_MODES), mode=SelectSelectorMode.DROPDOWN)
+        ),
+        vol.Optional(
+            CONF_INERTIA_PROFILE,
+            default=get_val(CONF_INERTIA_PROFILE, DEFAULT_INERTIA_PROFILE),
+        ): SelectSelector(
+            SelectSelectorConfig(options=list(INERTIA_PROFILES), mode=SelectSelectorMode.DROPDOWN)
+        ),
+    }
+    if is_hum:
+        al_schema[
+            vol.Optional(
+                CONF_AUX_TEMP_SENSOR,
+                description={"suggested_value": get_val(CONF_AUX_TEMP_SENSOR, None)},
+            )
+        ] = EntitySelector(
+            EntitySelectorConfig(domain="sensor", device_class="temperature")
+        )
+        al_schema[
+            vol.Optional(
+                CONF_COUPLED_AC,
+                description={"suggested_value": get_val(CONF_COUPLED_AC, None)},
+            )
+        ] = EntitySelector(EntitySelectorConfig(domain="climate"))
+    else:
+        al_schema[
+            vol.Optional(
+                CONF_COUPLED_DEHUMIDIFIER,
+                description={"suggested_value": get_val(CONF_COUPLED_DEHUMIDIFIER, None)},
+            )
+        ] = EntitySelector(EntitySelectorConfig(domain=["humidifier", "switch"]))
+
+    al_schema.update(
+        {
+            vol.Optional(
+                CONF_MANUAL_OVERRIDE_MIN,
+                default=get_val(CONF_MANUAL_OVERRIDE_MIN, DEFAULT_MANUAL_OVERRIDE_MIN),
+            ): NumberSelector(
+                NumberSelectorConfig(min=0, max=180, step=5, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
+            ),
+            vol.Optional(
+                CONF_MAX_RUN_MIN,
+                default=get_val(CONF_MAX_RUN_MIN, DEFAULT_MAX_RUN_MIN),
+            ): NumberSelector(
+                NumberSelectorConfig(min=0, max=480, step=10, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
+            ),
+            vol.Optional(
+                CONF_SAFETY_REST_MIN,
+                default=get_val(CONF_SAFETY_REST_MIN, DEFAULT_SAFETY_REST_MIN),
+            ): NumberSelector(
+                NumberSelectorConfig(min=5, max=120, step=5, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
+            ),
+            vol.Optional(
+                CONF_RECORDER_BOOTSTRAP,
+                default=get_val(CONF_RECORDER_BOOTSTRAP, DEFAULT_RECORDER_BOOTSTRAP),
+            ): BooleanSelector(),
+        }
+    )
+    if section is not None:
+        return {"adaptive_learning": section(vol.Schema(al_schema), {"collapsed": True})}
+    return al_schema
+
+
 def _build_sections_schema(
     sec1_dict: dict[Any, Any],
     sec2_dict: dict[Any, Any],
     sec3_dict: dict[Any, Any],
     sec4_dict: dict[Any, Any],
+    sec0_dict: dict[Any, Any] | None = None,
 ) -> vol.Schema:
     """Build section schema using native section cards if supported, or flat fallback."""
     if section is not None:
-        return vol.Schema(
+        schema_map: dict[Any, Any] = {}
+        if sec0_dict:
+            schema_map["section_0"] = section(
+                vol.Schema(sec0_dict), {"collapsed": True}
+            )
+        schema_map.update(
             {
                 "section_1": section(
                     vol.Schema(sec1_dict), {"collapsed": False}
@@ -404,7 +527,10 @@ def _build_sections_schema(
                 ),
             }
         )
+        return vol.Schema(schema_map)
     combined = {}
+    if sec0_dict:
+        combined.update(sec0_dict)
     combined.update(sec1_dict)
     combined.update(sec2_dict)
     combined.update(sec3_dict)
@@ -415,7 +541,7 @@ def _build_sections_schema(
 class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Smart PID Thermostat."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         """Initialize config flow."""
@@ -827,6 +953,8 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ),
             }
         )
+        schema_dict.update(_build_ventilation_section(lambda k, d=None: self._data.get(k, d)))
+        schema_dict.update(_build_adaptive_learning_section(is_hum, lambda k, d=None: self._data.get(k, d)))
 
         schema = vol.Schema(schema_dict)
         if errors and user_input is not None:
@@ -1309,33 +1437,32 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Get options flow for this handler."""
-        return SmartPIDThermostatOptionsFlow(config_entry)
+        return SmartPIDThermostatOptionsFlow()
 
 
-class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlow):
+class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlowWithReload):
     """Handle options flow for Smart PID Thermostat."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    def __init__(self) -> None:
         """Initialize options flow."""
-        self._config_entry = config_entry
         self._options_data: dict[str, Any] = {}
 
     def _get_val(self, key: str, default: Any = None) -> Any:
         """Get configuration value from options or data, searching top-level and nested sections."""
-        val = self._config_entry.options.get(key)
+        val = self.config_entry.options.get(key)
         if val is not None:
             return val
-        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
-            sec_dict = self._config_entry.options.get(sec)
+        for sec in ("ki_group", "section_0", "section_1", "section_2", "section_3", "section_4", "ventilation", "adaptive_learning"):
+            sec_dict = self.config_entry.options.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
                 if sec_val is not None:
                     return sec_val
-        val = self._config_entry.data.get(key)
+        val = self.config_entry.data.get(key)
         if val is not None:
             return val
-        for sec in ("ki_group", "section_1", "section_2", "section_3", "section_4"):
-            sec_dict = self._config_entry.data.get(sec)
+        for sec in ("ki_group", "section_0", "section_1", "section_2", "section_3", "section_4", "ventilation", "adaptive_learning"):
+            sec_dict = self.config_entry.data.get(sec)
             if isinstance(sec_dict, dict):
                 sec_val = sec_dict.get(key)
                 if sec_val is not None:
@@ -1793,6 +1920,8 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlow):
                 ),
             }
         )
+        schema_dict.update(_build_ventilation_section(self._get_val))
+        schema_dict.update(_build_adaptive_learning_section(is_hum, self._get_val))
 
         schema = vol.Schema(schema_dict)
         if errors and user_input is not None:
@@ -1836,7 +1965,7 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlow):
                     CONF_OUTPUT_SAFETY: output_safety,
                 }
                 new_options = {
-                    **self._config_entry.options,
+                    **self.config_entry.options,
                     **self._options_data,
                     **processed_input,
                 }
@@ -1925,7 +2054,7 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlow):
                     )
                     flat_input[f"sec{i}_apply_delta"] = apply_temp_val
                 new_options = {
-                    **self._config_entry.options,
+                    **self.config_entry.options,
                     **self._options_data,
                     **flat_input,
                 }
