@@ -312,6 +312,9 @@ def _install_ha_stubs() -> None:
         def async_create_entry(self, **kwargs: Any) -> dict[str, Any]:
             return {"type": "create_entry", **kwargs}
 
+        def add_suggested_values_to_schema(self, data_schema: Any, suggested_values: Any) -> Any:
+            return data_schema
+
     class OptionsFlow:
         def __init__(self) -> None:
             self._config_entry_internal: ConfigEntry | None = None
@@ -335,6 +338,9 @@ def _install_ha_stubs() -> None:
 
         def async_create_entry(self, **kwargs: Any) -> dict[str, Any]:
             return {"type": "create_entry", **kwargs}
+
+        def add_suggested_values_to_schema(self, data_schema: Any, suggested_values: Any) -> Any:
+            return data_schema
 
     class OptionsFlowWithReload(OptionsFlow):
         pass
@@ -438,6 +444,7 @@ def _install_ha_stubs() -> None:
     sens_mod = _ensure_module("homeassistant.components.sensor")
 
     class SensorDeviceClass(str, Enum):
+        ENUM = "enum"
         TEMPERATURE = "temperature"
         HUMIDITY = "humidity"
 

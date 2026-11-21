@@ -425,7 +425,11 @@ def _build_ventilation_section(get_val: Any) -> dict[Any, Any]:
         vol.Optional(
             CONF_VENT_MODE, default=get_val(CONF_VENT_MODE, DEFAULT_VENT_MODE)
         ): SelectSelector(
-            SelectSelectorConfig(options=VENT_MODES, mode=SelectSelectorMode.DROPDOWN)
+            SelectSelectorConfig(
+                options=VENT_MODES,
+                translation_key="ventilation_mode",
+                mode=SelectSelectorMode.DROPDOWN,
+            )
         ),
         vol.Optional(
             CONF_VENT_SENSORS, default=get_val(CONF_VENT_SENSORS, []) or []
@@ -435,7 +439,11 @@ def _build_ventilation_section(get_val: Any) -> dict[Any, Any]:
         vol.Optional(
             CONF_VENT_LOGIC, default=get_val(CONF_VENT_LOGIC, DEFAULT_VENT_LOGIC)
         ): SelectSelector(
-            SelectSelectorConfig(options=VENT_LOGICS, mode=SelectSelectorMode.DROPDOWN)
+            SelectSelectorConfig(
+                options=VENT_LOGICS,
+                translation_key="ventilation_logic",
+                mode=SelectSelectorMode.DROPDOWN,
+            )
         ),
         vol.Optional(
             CONF_VENT_SWITCH,
@@ -467,19 +475,31 @@ def _build_adaptive_learning_section(is_hum: bool, get_val: Any) -> dict[Any, An
         vol.Optional(
             CONF_TUNING_MODE, default=get_val(CONF_TUNING_MODE, DEFAULT_TUNING_MODE)
         ): SelectSelector(
-            SelectSelectorConfig(options=TUNING_MODES, mode=SelectSelectorMode.DROPDOWN)
+            SelectSelectorConfig(
+                options=TUNING_MODES,
+                translation_key="tuning_mode",
+                mode=SelectSelectorMode.DROPDOWN,
+            )
         ),
         vol.Optional(
             CONF_PREDICTION_MODE,
             default=get_val(CONF_PREDICTION_MODE, DEFAULT_PREDICTION_MODE),
         ): SelectSelector(
-            SelectSelectorConfig(options=list(PREDICTION_MODES), mode=SelectSelectorMode.DROPDOWN)
+            SelectSelectorConfig(
+                options=list(PREDICTION_MODES),
+                translation_key="prediction_mode",
+                mode=SelectSelectorMode.DROPDOWN,
+            )
         ),
         vol.Optional(
             CONF_INERTIA_PROFILE,
             default=get_val(CONF_INERTIA_PROFILE, DEFAULT_INERTIA_PROFILE),
         ): SelectSelector(
-            SelectSelectorConfig(options=list(INERTIA_PROFILES), mode=SelectSelectorMode.DROPDOWN)
+            SelectSelectorConfig(
+                options=list(INERTIA_PROFILES),
+                translation_key="inertia_profile",
+                mode=SelectSelectorMode.DROPDOWN,
+            )
         ),
     }
     if is_hum:
@@ -534,6 +554,46 @@ def _build_adaptive_learning_section(is_hum: bool, get_val: Any) -> dict[Any, An
     if section is not None:
         return {"adaptive_learning": section(vol.Schema(al_schema), {"collapsed": True})}
     return al_schema
+
+
+def _default_sec0_delta(thermostat_type: str, is_hum: bool) -> float:
+    """Return the default Section 0 setback delta for the thermostat type."""
+    if thermostat_type == THERMOSTAT_TYPE_HEATER:
+        return DEFAULT_SEC0_DELTA_HEAT
+    if thermostat_type == THERMOSTAT_TYPE_HUMIDIFIER:
+        return DEFAULT_SEC0_DELTA_HUMIDIFY
+    if is_hum:
+        return DEFAULT_SEC0_DELTA_DEHUMIDIFY
+    return DEFAULT_SEC0_DELTA_COOL
+
+
+def _build_sec0_dict(thermostat_type: str, is_hum: bool, get_val: Any) -> dict[Any, Any]:
+    """Build Section 0 standby/early-stop fields schema dict."""
+    default_delta = _default_sec0_delta(thermostat_type, is_hum)
+    return {
+        vol.Optional(
+            CONF_SEC0_ACTION,
+            default=get_val(CONF_SEC0_ACTION, DEFAULT_SEC0_ACTION),
+        ): SelectSelector(
+            SelectSelectorConfig(
+                options=SEC0_ACTIONS,
+                translation_key="sec0_action",
+                mode=SelectSelectorMode.DROPDOWN,
+            )
+        ),
+        vol.Optional(
+            CONF_SEC0_DELTA,
+            default=get_val(CONF_SEC0_DELTA, default_delta),
+        ): NumberSelector(
+            NumberSelectorConfig(
+                min=-15.0 if is_hum else -10.0,
+                max=15.0 if is_hum else 10.0,
+                step=1.0 if is_hum else 0.5,
+                unit_of_measurement="%" if is_hum else "°C",
+                mode=NumberSelectorMode.BOX,
+            )
+        ),
+    }
 
 
 def _build_sections_schema(
@@ -1459,7 +1519,12 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
             )
 
-        schema = _build_sections_schema(sec1_dict, sec2_dict, sec3_dict, sec4_dict)
+        sec0_dict = _build_sec0_dict(
+            thermostat_type, is_hum, lambda k, d=None: self._data.get(k, d)
+        )
+        schema = _build_sections_schema(
+            sec1_dict, sec2_dict, sec3_dict, sec4_dict, sec0_dict=sec0_dict
+        )
 
         if errors and user_input is not None:
             schema = self.add_suggested_values_to_schema(schema, user_input)
@@ -2601,12 +2666,21 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlowWithReload):
                 )
             )
 
-        schema = _build_sections_schema(sec1_dict, sec2_dict, sec3_dict, sec4_dict)
+        sec0_dict = _build_sec0_dict(thermostat_type, is_hum, self._get_val)
+        schema = _build_sections_schema(
+            sec1_dict, sec2_dict, sec3_dict, sec4_dict, sec0_dict=sec0_dict
+        )
 
         if errors and user_input is not None:
             schema = self.add_suggested_values_to_schema(schema, user_input)
         else:
-            nested_suggested: dict[str, Any] = {}
+            default_sec0_delta = _default_sec0_delta(thermostat_type, is_hum)
+            nested_suggested: dict[str, Any] = {
+                "section_0": {
+                    CONF_SEC0_ACTION: self._get_val(CONF_SEC0_ACTION, DEFAULT_SEC0_ACTION),
+                    CONF_SEC0_DELTA: self._get_val(CONF_SEC0_DELTA, default_sec0_delta),
+                }
+            }
             valid_fans = [default_fan1, default_fan2, default_fan3, default_fan4]
             valid_hvacs = [default_hvac1, default_hvac2, default_hvac3, default_hvac4]
             valid_modes = [default_mode1, default_mode2, default_mode3, default_mode4]

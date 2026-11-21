@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
@@ -12,7 +16,9 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
+from .learner import CyclePhase
 from .runtime import SmartPIDRuntime
+from .ventilation import VentState
 
 
 async def async_setup_entry(
@@ -40,11 +46,10 @@ class _BaseSmartPIDDiagnosticSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
-    def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime, key: str, name: str) -> None:
+    def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime, key: str) -> None:
         self._entry = entry
         self._runtime = runtime
         self._attr_unique_id = f"{entry.entry_id}_{key}"
-        self._attr_name = name
         self._attr_translation_key = key
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
@@ -75,7 +80,7 @@ class SmartPIDConfidenceSensor(_BaseSmartPIDDiagnosticSensor):
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
-        super().__init__(entry, runtime, "learning_confidence", "Learning Confidence")
+        super().__init__(entry, runtime, "learning_confidence")
 
     @property
     def native_value(self) -> float:
@@ -96,8 +101,11 @@ class SmartPIDConfidenceSensor(_BaseSmartPIDDiagnosticSensor):
 class SmartPIDCyclePhaseSensor(_BaseSmartPIDDiagnosticSensor):
     """Cycle phase diagnostic sensor (idle/active/post_stop_coast/passive_drift)."""
 
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = [phase.value for phase in CyclePhase]
+
     def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
-        super().__init__(entry, runtime, "cycle_phase", "Cycle Phase")
+        super().__init__(entry, runtime, "cycle_phase")
 
     @property
     def native_value(self) -> str:
@@ -120,7 +128,7 @@ class SmartPIDPredictedCoastSensor(_BaseSmartPIDDiagnosticSensor):
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
-        super().__init__(entry, runtime, "predicted_coast", "Predicted Coast")
+        super().__init__(entry, runtime, "predicted_coast")
         if runtime.is_humidity:
             self._attr_native_unit_of_measurement = "g/m³" if runtime.aux_temp_sensor else PERCENTAGE
         else:
@@ -137,7 +145,7 @@ class SmartPIDRecommendedTuningSensor(_BaseSmartPIDDiagnosticSensor):
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
-        super().__init__(entry, runtime, "recommended_tuning", "Recommended Tuning")
+        super().__init__(entry, runtime, "recommended_tuning")
 
     @property
     def native_value(self) -> float:
@@ -159,8 +167,11 @@ class SmartPIDRecommendedTuningSensor(_BaseSmartPIDDiagnosticSensor):
 class SmartPIDVentilationStateSensor(_BaseSmartPIDDiagnosticSensor):
     """Ventilation state diagnostic sensor."""
 
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = [state.value for state in VentState]
+
     def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
-        super().__init__(entry, runtime, "ventilation_state", "Ventilation State")
+        super().__init__(entry, runtime, "ventilation_state")
 
     @property
     def native_value(self) -> str:

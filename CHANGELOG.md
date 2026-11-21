@@ -7,6 +7,23 @@
 
 ---
 
+## [0.2.4] - 2026-11-21
+
+### 개선 및 수정 (Changed & Fixed)
+- **ConfigFlow / OptionsFlow 드롭다운 한글화 (`config_flow.py`)**:
+  - `vent_mode`(`ventilation_mode`), `vent_logic`(`ventilation_logic`), `tuning_mode`(`tuning_mode`), `prediction_mode`(`prediction_mode`), `inertia_profile`(`inertia_profile`), `sec0_action`(`sec0_action`) `SelectSelectorConfig`에 `translation_key` 적용
+  - 구간 설정 단계(`async_step_sections_climate`)에 **구간 0 (`section_0`)** 대기/조기 종료 동작 및 셋백 보정값 UI 연결
+- **진단 센서 상태값·이름 한글화 (`sensor.py`)**:
+  - `_BaseSmartPIDDiagnosticSensor`의 하드코딩된 `_attr_name` 제거로 `entity.sensor.<key>.name` 번역 적용
+  - `SmartPIDCyclePhaseSensor` 및 `SmartPIDVentilationStateSensor`에 `SensorDeviceClass.ENUM` 및 `_attr_options` 지정
+- **번역 리소스 일괄 동기화 (`strings.json`, `translations/ko.json`, `translations/en.json`)**:
+  - 최상위 `selector` 블록(6종 드롭다운), `section_0`, `data_description`, 진단 센서 상태값·속성 번역 추가 및 `strings.json` 내 영문 잔재 한국어 통일
+- **문서 및 회귀 테스트 보강 (`README.md`, `tests/`)**:
+  - `README.md`에 전체 동작 구조, 자가학습 원리(4단계 코스팅·Huber-RLS·SIMC), 학습 이후 동작 변화, 5단계 실전 사용 가이드 및 진단 센서 해석표 정리
+  - 셀렉터 `translation_key`·번역 누락 및 진단 센서 `ENUM` 매핑 회귀 테스트 추가
+
+---
+
 ## [0.2.3] - 2026-11-21
 
 ### 수정 (Fixed)

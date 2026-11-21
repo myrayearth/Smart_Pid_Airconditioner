@@ -200,3 +200,60 @@ async def test_humidity_aux_temp_fallback_and_vent_block(hass) -> None:
     assert rt._active_rls().sample_count == 0
 
     await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_sensors_enum_and_translations(hass) -> None:
+    """Verify diagnostic sensors use translation_key without hardcoded _attr_name and expose ENUM translations."""
+    import json
+    from pathlib import Path
+    from homeassistant.components.sensor import SensorDeviceClass
+    from custom_components.smart_pid_airconditioner.learner import ConfidenceStage, CyclePhase
+    from custom_components.smart_pid_airconditioner.ventilation import VentState
+
+    entry = ConfigEntry(
+        entry_id="diag_tr",
+        title="Diag Tr",
+        data={
+            CONF_CONTROL_MODE: CONTROL_MODE_CLIMATE_DELTA,
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_COOLER,
+            CONF_INDOOR_SENSOR: "sensor.room_temp",
+            CONF_TARGET_CLIMATE: "climate.ac_slave",
+        },
+        version=2,
+    )
+    await async_setup_entry(hass, entry)
+    rt: SmartPIDRuntime = entry.runtime_data
+
+    sensors = [
+        SmartPIDConfidenceSensor(entry, rt),
+        SmartPIDCyclePhaseSensor(entry, rt),
+        SmartPIDPredictedCoastSensor(entry, rt),
+        SmartPIDRecommendedTuningSensor(entry, rt),
+        SmartPIDVentilationStateSensor(entry, rt),
+    ]
+    for s in sensors:
+        assert getattr(s, "_attr_name", None) is None
+        assert getattr(s, "_attr_translation_key", None)
+
+    s_phase = sensors[1]
+    s_vent = sensors[4]
+    assert s_phase._attr_device_class == SensorDeviceClass.ENUM
+    assert set(s_phase._attr_options) == {p.value for p in CyclePhase}
+    assert s_vent._attr_device_class == SensorDeviceClass.ENUM
+    assert set(s_vent._attr_options) == {v.value for v in VentState}
+
+    base = Path(__file__).resolve().parent.parent / "custom_components" / "smart_pid_airconditioner"
+    for fname in ("strings.json", "translations/ko.json", "translations/en.json"):
+        doc = json.loads((base / fname).read_text(encoding="utf-8"))
+        ent_sens = doc["entity"]["sensor"]
+        for s in sensors:
+            assert ent_sens[s._attr_translation_key]["name"], f"{fname} missing sensor name {s._attr_translation_key}"
+        for p in CyclePhase:
+            assert p.value in ent_sens["cycle_phase"]["state"]
+        for v in VentState:
+            assert v.value in ent_sens["ventilation_state"]["state"]
+        for st in ConfidenceStage:
+            assert st.value in ent_sens["learning_confidence"]["state_attributes"]["stage"]["state"]
+
+    await async_unload_entry(hass, entry)

@@ -280,3 +280,84 @@ async def test_climate_entity_uses_native_temperature_properties(hass) -> None:
     assert entity.native_target_temperature == 24.0
     assert entity.native_current_temperature == 26.5
 
+
+@pytest.mark.asyncio
+async def test_config_flow_selector_translation_keys_and_section0(hass) -> None:
+    """Verify new SelectSelectors set translation_key matching all translation files & section_0 renders."""
+    import json
+    from pathlib import Path
+    from custom_components.smart_pid_airconditioner.config_flow import (
+        _build_adaptive_learning_section,
+        _build_sec0_dict,
+        _build_ventilation_section,
+    )
+
+    def _unwrap_schema_dict(schema_map: dict) -> dict[str, object]:
+        out = {}
+        for k, v in schema_map.items():
+            key_name = getattr(k, "schema", k)
+            if isinstance(key_name, str) and key_name in ("ventilation", "adaptive_learning"):
+                inner = getattr(v, "schema", v)
+                inner_map = getattr(inner, "schema", inner)
+                if isinstance(inner_map, dict):
+                    out.update(_unwrap_schema_dict(inner_map))
+                    continue
+            out[str(key_name)] = v
+        return out
+
+    vent_fields = _unwrap_schema_dict(_build_ventilation_section(lambda k, d=None: d))
+    al_fields = _unwrap_schema_dict(_build_adaptive_learning_section(False, lambda k, d=None: d))
+    sec0_fields = _unwrap_schema_dict(_build_sec0_dict(THERMOSTAT_TYPE_COOLER, False, lambda k, d=None: d))
+
+    all_fields = {**vent_fields, **al_fields, **sec0_fields}
+    expected_selectors = {
+        "vent_mode": "ventilation_mode",
+        "vent_logic": "ventilation_logic",
+        "tuning_mode": "tuning_mode",
+        "prediction_mode": "prediction_mode",
+        "inertia_profile": "inertia_profile",
+        "sec0_action": "sec0_action",
+    }
+
+    base = Path(__file__).resolve().parent.parent / "custom_components" / "smart_pid_airconditioner"
+    trans_docs = {
+        "strings.json": json.loads((base / "strings.json").read_text(encoding="utf-8")),
+        "translations/ko.json": json.loads((base / "translations/ko.json").read_text(encoding="utf-8")),
+        "translations/en.json": json.loads((base / "translations/en.json").read_text(encoding="utf-8")),
+    }
+
+    for field_key, t_key in expected_selectors.items():
+        selector_obj = all_fields[field_key]
+        cfg = selector_obj.config
+        assert cfg.get("translation_key") == t_key, f"{field_key} missing translation_key={t_key}"
+        opts = [opt["value"] if isinstance(opt, dict) else str(opt) for opt in cfg["options"]]
+        for fname, doc in trans_docs.items():
+            sel_trans = doc["selector"].get(t_key, {}).get("options", {})
+            for opt in opts:
+                assert opt in sel_trans and sel_trans[opt], f"{fname} missing selector.{t_key}.options.{opt}"
+
+    # Verify ConfigFlow and OptionsFlow sections_climate render without error (with section_0 wired)
+    hass.states.async_set(
+        "climate.ac_slave",
+        "cool",
+        {"hvac_modes": ["off", "cool", "fan_only"], "fan_modes": ["low", "high"]},
+    )
+    cf = SmartPIDThermostatConfigFlow()
+    cf.hass = hass
+    cf._data = {
+        CONF_CONTROL_MODE: CONTROL_MODE_CLIMATE_DELTA,
+        CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_COOLER,
+        CONF_TARGET_CLIMATE: "climate.ac_slave",
+    }
+    res_cf = await cf.async_step_sections_climate()
+    assert res_cf["type"] == "form"
+    assert res_cf["step_id"] == "sections_climate"
+
+    entry = _make_climate_entry()
+    of = SmartPIDThermostatConfigFlow.async_get_options_flow(entry)
+    of.hass = hass
+    of._config_entry_internal = entry
+    res_of = await of.async_step_sections_climate()
+    assert res_of["type"] == "form"
+    assert res_of["step_id"] == "sections_climate"
+

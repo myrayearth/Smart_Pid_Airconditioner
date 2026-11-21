@@ -65,6 +65,12 @@
               "vent_switch": "Ventilation Switch",
               "vent_debounce_sec": "Open Debounce Duration",
               "vent_cooldown_min": "Post-Close Learning Cooldown (min)"
+            },
+            "data_description": {
+              "vent_mode": "Choose how ventilation is detected via window/door sensors or a ventilation switch.",
+              "vent_logic": "When using multiple sensors, choose whether all (AND) or any (OR) sensor triggers ventilation.",
+              "vent_debounce_sec": "Wait duration before confirming open state to avoid brief door/window false triggers (recommended 45s).",
+              "vent_cooldown_min": "Duration after closing to block learning contamination while indoor walls/air stabilize (control resumes immediately)."
             }
           },
           "adaptive_learning": {
@@ -81,6 +87,18 @@
               "max_run_min": "Max Continuous Run Watchdog (min, 0=disabled)",
               "safety_rest_min": "Watchdog Forced Rest Duration (min)",
               "recorder_bootstrap": "Bootstrap from Recorder History on First Install"
+            },
+            "data_description": {
+              "tuning_mode": "Shadow Learn keeps manual PID control identical while learning in the background. Switch to Adaptive Auto once confidence reaches Tuned.",
+              "prediction_mode": "Selects SIMC auto-tuner responsiveness and switching aggressiveness when Adaptive Auto is active.",
+              "inertia_profile": "Select the thermal/moisture coasting profile matching your HVAC or heating emitter.",
+              "aux_temp_sensor": "Optional indoor temperature sensor to convert RH% into absolute humidity (g/m³) for temperature-invariant moisture learning.",
+              "coupled_dehumidifier": "Link a co-located dehumidifier so its compressor heat is accounted for in the room thermal model.",
+              "coupled_ac": "Link a co-located air conditioner to interlock dehumidifier operation while AC cooling is active.",
+              "manual_override_min": "Grace period in minutes to pause automatic dispatch after a manual external user change.",
+              "max_run_min": "Safety watchdog maximum continuous run duration before forcing a rest break (0 disables).",
+              "safety_rest_min": "Forced rest duration when the continuous run watchdog triggers.",
+              "recorder_bootstrap": "Seed initial thermal/moisture model estimates from recent 7-day Recorder history on first setup."
             }
           }
         }
@@ -89,6 +107,18 @@
         "title": "출력 구간별 상세 설정 (2/2)",
         "description": "PID 출력(%) 구간에 따른 동작방식, 목표값 보정값(Delta)과 팬 속도를 지정합니다. 체크된 항목만 기기에 반영되며, 체크 해제된 항목은 현재 상태를 그대로 유지합니다.",
         "sections": {
+          "section_0": {
+            "name": "━━━ Section 0 Standby / Early-Stop Settings (Optional) ━━━",
+            "description": "Configure standby behavior used during adaptive early-stop coasting, low PID output, or ventilation pause.",
+            "data": {
+              "sec0_action": "[Section 0] Standby / Early-Stop Action",
+              "sec0_delta": "[Section 0] Setback Delta Offset"
+            },
+            "data_description": {
+              "sec0_action": "Choose between setpoint setback standby, fan-only mode, or turning off the device.",
+              "sec0_delta": "Target offset applied during setback standby (e.g., +2°C cooling, -2°C heating)."
+            }
+          },
           "section_1": {
             "name": "━━━ 구간 1 설정 (0% ~ 구간 1 최대) ━━━",
             "description": "0% ~ 구간 1 최대 출력 시의 목표값, 팬 속도, 운전 모드를 설정합니다.",
@@ -158,6 +188,8 @@
           }
         },
         "data": {
+          "sec0_action": "[Section 0] Standby / Early-Stop Action",
+          "sec0_delta": "[Section 0] Setback Delta Offset",
           "sec1_max": "[구간 1] 최대 출력 (%)",
           "sec1_apply_temp": "[구간 1] 설정값 변경",
           "sec1_delta": "[구간 1] 보정값 (Delta)",
@@ -207,6 +239,18 @@
         "title": "구간별 동작 및 모드 설정 (3/3)",
         "description": "PID 출력(%) 구간에 따른 목표값 보정값(Delta)과 동작 모드 / 팬 속도를 지정합니다.",
         "sections": {
+          "section_0": {
+            "name": "━━━ Section 0 Standby / Early-Stop Settings (Optional) ━━━",
+            "description": "Configure standby behavior used during adaptive early-stop coasting, low PID output, or ventilation pause.",
+            "data": {
+              "sec0_action": "[Section 0] Standby / Early-Stop Action",
+              "sec0_delta": "[Section 0] Setback Delta Offset"
+            },
+            "data_description": {
+              "sec0_action": "Choose between setpoint setback standby, fan-only mode, or turning off the device.",
+              "sec0_delta": "Target offset applied during setback standby (e.g., +2°C cooling, -2°C heating)."
+            }
+          },
           "section_1": {
             "name": "━━━ 구간 1 설정 (0% ~ 구간 1 최대) ━━━",
             "description": "0% ~ 구간 1 최대 출력 시의 목표값, 팬 속도, 운전 모드를 설정합니다.",
@@ -276,6 +320,8 @@
           }
         },
         "data": {
+          "sec0_action": "[Section 0] Standby / Early-Stop Action",
+          "sec0_delta": "[Section 0] Setback Delta Offset",
           "sec1_max": "[구간 1] 최대 출력 (%)",
           "sec1_apply_temp": "[구간 1] 설정값 변경",
           "sec1_delta": "[구간 1] 보정값 (Delta)",
@@ -392,6 +438,12 @@
               "vent_switch": "Ventilation Switch",
               "vent_debounce_sec": "Open Debounce Duration",
               "vent_cooldown_min": "Post-Close Learning Cooldown (min)"
+            },
+            "data_description": {
+              "vent_mode": "Choose how ventilation is detected via window/door sensors or a ventilation switch.",
+              "vent_logic": "When using multiple sensors, choose whether all (AND) or any (OR) sensor triggers ventilation.",
+              "vent_debounce_sec": "Wait duration before confirming open state to avoid brief door/window false triggers (recommended 45s).",
+              "vent_cooldown_min": "Duration after closing to block learning contamination while indoor walls/air stabilize (control resumes immediately)."
             }
           },
           "adaptive_learning": {
@@ -408,6 +460,18 @@
               "max_run_min": "Max Continuous Run Watchdog (min, 0=disabled)",
               "safety_rest_min": "Watchdog Forced Rest Duration (min)",
               "recorder_bootstrap": "Bootstrap from Recorder History on First Install"
+            },
+            "data_description": {
+              "tuning_mode": "Shadow Learn keeps manual PID control identical while learning in the background. Switch to Adaptive Auto once confidence reaches Tuned.",
+              "prediction_mode": "Selects SIMC auto-tuner responsiveness and switching aggressiveness when Adaptive Auto is active.",
+              "inertia_profile": "Select the thermal/moisture coasting profile matching your HVAC or heating emitter.",
+              "aux_temp_sensor": "Optional indoor temperature sensor to convert RH% into absolute humidity (g/m³) for temperature-invariant moisture learning.",
+              "coupled_dehumidifier": "Link a co-located dehumidifier so its compressor heat is accounted for in the room thermal model.",
+              "coupled_ac": "Link a co-located air conditioner to interlock dehumidifier operation while AC cooling is active.",
+              "manual_override_min": "Grace period in minutes to pause automatic dispatch after a manual external user change.",
+              "max_run_min": "Safety watchdog maximum continuous run duration before forcing a rest break (0 disables).",
+              "safety_rest_min": "Forced rest duration when the continuous run watchdog triggers.",
+              "recorder_bootstrap": "Seed initial thermal/moisture model estimates from recent 7-day Recorder history on first setup."
             }
           }
         }
@@ -416,6 +480,18 @@
         "title": "출력 구간별 상세 설정 수정",
         "description": "PID 출력 구간별 동작방식, 목표값 보정값(Delta) 및 팬 속도를 수정합니다. 체크된 항목만 반영되며, 체크 해제된 항목은 현재 상태를 유지합니다.",
         "sections": {
+          "section_0": {
+            "name": "━━━ Section 0 Standby / Early-Stop Settings (Optional) ━━━",
+            "description": "Configure standby behavior used during adaptive early-stop coasting, low PID output, or ventilation pause.",
+            "data": {
+              "sec0_action": "[Section 0] Standby / Early-Stop Action",
+              "sec0_delta": "[Section 0] Setback Delta Offset"
+            },
+            "data_description": {
+              "sec0_action": "Choose between setpoint setback standby, fan-only mode, or turning off the device.",
+              "sec0_delta": "Target offset applied during setback standby (e.g., +2°C cooling, -2°C heating)."
+            }
+          },
           "section_1": {
             "name": "━━━ 구간 1 설정 (0% ~ 구간 1 최대) ━━━",
             "description": "0% ~ 구간 1 최대 출력 시의 목표값, 팬 속도, 운전 모드를 설정합니다.",
@@ -485,6 +561,8 @@
           }
         },
         "data": {
+          "sec0_action": "[Section 0] Standby / Early-Stop Action",
+          "sec0_delta": "[Section 0] Setback Delta Offset",
           "sec1_max": "[구간 1] 최대 출력 (%)",
           "sec1_apply_temp": "[구간 1] 설정값 변경",
           "sec1_delta": "[구간 1] 보정값 (Delta)",
@@ -534,6 +612,18 @@
         "title": "Air conditioner 출력 구간 및 팬 설정 수정",
         "description": "PID 출력 구간별 동작방식, 목표값 보정값(Delta) 및 팬 속도를 수정합니다.",
         "sections": {
+          "section_0": {
+            "name": "━━━ Section 0 Standby / Early-Stop Settings (Optional) ━━━",
+            "description": "Configure standby behavior used during adaptive early-stop coasting, low PID output, or ventilation pause.",
+            "data": {
+              "sec0_action": "[Section 0] Standby / Early-Stop Action",
+              "sec0_delta": "[Section 0] Setback Delta Offset"
+            },
+            "data_description": {
+              "sec0_action": "Choose between setpoint setback standby, fan-only mode, or turning off the device.",
+              "sec0_delta": "Target offset applied during setback standby (e.g., +2°C cooling, -2°C heating)."
+            }
+          },
           "section_1": {
             "name": "━━━ 구간 1 설정 (0% ~ 구간 1 최대) ━━━",
             "description": "0% ~ 구간 1 최대 출력 시의 목표값, 팬 속도, 운전 모드를 설정합니다.",
@@ -603,6 +693,8 @@
           }
         },
         "data": {
+          "sec0_action": "[Section 0] Standby / Early-Stop Action",
+          "sec0_delta": "[Section 0] Setback Delta Offset",
           "sec1_max": "[구간 1] 최대 출력 (%)",
           "sec1_apply_temp": "[구간 1] 설정값 변경",
           "sec1_delta": "[구간 1] 보정값 (Delta)",
@@ -830,15 +922,90 @@
         "dehumidity": "제습 (Dehumidifier)",
         "fan_only": "송풍 (Fan Only)"
       }
+    },
+    "tuning_mode": {
+      "options": {
+        "manual_pid": "Manual PID (Classic)",
+        "shadow_learn": "Shadow Learn (Keep Manual Control + Background Learning)",
+        "adaptive_auto": "Adaptive Auto (Early Stop + Auto Tuning)"
+      }
+    },
+    "prediction_mode": {
+      "options": {
+        "eco": "Eco (Minimal Switching, Gentle Response)",
+        "balanced": "Balanced (Recommended)",
+        "comfort": "Comfort (Fast Setpoint Tracking)"
+      }
+    },
+    "inertia_profile": {
+      "options": {
+        "fast_air": "Fast Air Circulation (AC / Fan Heater / Humidifier / Dehumidifier)",
+        "high_inertia": "High Thermal Inertia (Radiant Floor / Radiator)"
+      }
+    },
+    "ventilation_mode": {
+      "options": {
+        "disabled": "Disabled",
+        "sensors": "Multiple Window/Door Sensors",
+        "switch": "Switch / Input Boolean",
+        "combined": "Sensors + Switch Combined (Either Active)"
+      }
+    },
+    "ventilation_logic": {
+      "options": {
+        "all": "All Open (AND)",
+        "any": "Any Open (OR)"
+      }
+    },
+    "sec0_action": {
+      "options": {
+        "setback": "Setpoint Setback Standby (Keep Inverter Running)",
+        "fan_only": "Switch to Fan Only",
+        "off": "Turn Off Device"
+      }
     }
   },
   "entity": {
     "sensor": {
       "learning_confidence": {
-        "name": "Learning Confidence"
+        "name": "Learning Confidence",
+        "state_attributes": {
+          "stage": {
+            "name": "Learning stage",
+            "state": {
+              "collecting": "Collecting",
+              "stable": "Stable",
+              "tuned": "Tuned",
+              "optimized": "Optimized"
+            }
+          },
+          "tuning_mode": {
+            "name": "Tuning mode",
+            "state": {
+              "manual_pid": "Manual PID",
+              "shadow_learn": "Shadow learn",
+              "adaptive_auto": "Adaptive auto"
+            }
+          }
+        }
       },
       "cycle_phase": {
-        "name": "Cycle Phase"
+        "name": "Cycle Phase",
+        "state": {
+          "idle": "Idle",
+          "active": "Active",
+          "post_stop_coast": "Post-stop coasting",
+          "passive_drift": "Passive drift"
+        },
+        "state_attributes": {
+          "inertia_profile": {
+            "name": "Thermal inertia profile",
+            "state": {
+              "fast_air": "Fast air",
+              "high_inertia": "High inertia"
+            }
+          }
+        }
       },
       "predicted_coast": {
         "name": "Predicted Coast"
@@ -847,7 +1014,13 @@
         "name": "Recommended Tuning"
       },
       "ventilation_state": {
-        "name": "Ventilation State"
+        "name": "Ventilation State",
+        "state": {
+          "normal": "Normal",
+          "open_debounce": "Open debounce",
+          "ventilating": "Ventilating (control paused)",
+          "post_close_cooldown": "Post-close cooldown"
+        }
       }
     }
   },
