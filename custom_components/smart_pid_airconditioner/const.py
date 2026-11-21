@@ -346,6 +346,21 @@ DUAL_MIN_DEADBAND_HUMIDITY = 5.0
 
 
 
+def resolve_thermostat_type(entry: Any) -> str:
+    """Resolve thermostat_type checking options (top & nested sections), then data, then default."""
+    for source in (getattr(entry, "options", None), getattr(entry, "data", None)):
+        if not isinstance(source, dict):
+            continue
+        val = source.get(CONF_THERMOSTAT_TYPE)
+        if val is not None:
+            return str(val)
+        for sec in ("adaptive_learning", "ki_group", "ventilation", "section_0"):
+            sec_dict = source.get(sec)
+            if isinstance(sec_dict, dict) and sec_dict.get(CONF_THERMOSTAT_TYPE) is not None:
+                return str(sec_dict[CONF_THERMOSTAT_TYPE])
+    return DEFAULT_THERMOSTAT_TYPE
+
+
 def is_humidity_type(controller_type: str | None) -> bool:
     """Return True if controller type is humidity, dehumidity, or dual."""
     return controller_type in (

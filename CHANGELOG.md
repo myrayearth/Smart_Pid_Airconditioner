@@ -7,6 +7,18 @@
 
 ---
 
+## [0.2.5] - 2026-11-21
+
+### 수정 (Fixed)
+- **제어기 엔티티(`climate.*` / `humidifier.*`) 기기(Device) 통합 연결 (`climate.py`, `humidifier.py`)**:
+  - `SmartPIDThermostatEntity`와 `SmartPIDHumidifierEntity`에 진단 센서(`sensor.py`)와 동일한 `DeviceInfo(identifiers={(DOMAIN, entry.entry_id)})`를 부여하고 `_attr_name = None`으로 설정해, 통합구성요소 기기 화면 내에 제어기 엔티티와 5종 진단 센서가 함께 표시되도록 수정
+- **`async_setup_entry` 내 `thermostat_type` 조회 우선순위 수정 (`const.py`, `climate.py`, `humidifier.py`)**:
+  - `resolve_thermostat_type(entry)` 헬퍼를 추가해 `entry.options` 최상위·중첩 섹션 → `entry.data` 최상위·중첩 섹션 → `DEFAULT_THERMOSTAT_TYPE` 순으로 조회하도록 개선
+- **엔티티 등록 회귀 테스트 추가 (`tests/test_stage1_pid_and_restore.py`)**:
+  - `climate_delta` / `switch_pwm` 셋업, `DeviceInfo` 기기 연결, `options` 우선순위 및 주요 속성 조회 예외 없음 검증 추가
+
+---
+
 ## [0.2.4] - 2026-11-21
 
 ### 개선 및 수정 (Changed & Fixed)

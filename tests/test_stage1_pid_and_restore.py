@@ -361,3 +361,128 @@ async def test_config_flow_selector_translation_keys_and_section0(hass) -> None:
     assert res_of["type"] == "form"
     assert res_of["step_id"] == "sections_climate"
 
+
+@pytest.mark.asyncio
+async def test_climate_and_humidifier_setup_entry_device_linkage_and_options_priority(hass) -> None:
+    """Verify climate/humidifier async_setup_entry creates entities linked to DeviceInfo and prioritizes options."""
+    from custom_components.smart_pid_airconditioner import async_unload_entry
+    from custom_components.smart_pid_airconditioner.climate import async_setup_entry as async_setup_climate
+    from custom_components.smart_pid_airconditioner.const import DOMAIN, THERMOSTAT_TYPE_HEATER
+    from custom_components.smart_pid_airconditioner.humidifier import async_setup_entry as async_setup_humidifier
+
+    hass.states.async_set("sensor.room_temp", "25.0")
+    hass.states.async_set("sensor.out_temp", "30.0")
+    hass.states.async_set(
+        "climate.ac_slave",
+        "cool",
+        {"hvac_modes": ["off", "cool", "heat"], "fan_modes": ["low", "high"], "min_temp": 18, "max_temp": 30},
+    )
+    hass.states.async_set("switch.heater_plug", "off")
+
+    # 1. cooler + climate_delta
+    cooler_entry = _make_climate_entry(
+        control_mode=CONTROL_MODE_CLIMATE_DELTA,
+        thermostat_type=THERMOSTAT_TYPE_COOLER,
+    )
+    assert await async_setup_entry(hass, cooler_entry) is True
+    added_cooler: list = []
+    await async_setup_climate(hass, cooler_entry, lambda ents, update=False: added_cooler.extend(ents))
+    assert len(added_cooler) == 1
+    c_ent = added_cooler[0]
+    assert isinstance(c_ent, SmartPIDThermostatEntity)
+    assert c_ent._attr_unique_id == f"{cooler_entry.entry_id}_thermostat"
+    assert c_ent._attr_name is None
+    assert c_ent.device_info is not None
+    assert (DOMAIN, cooler_entry.entry_id) in c_ent.device_info.identifiers
+
+    c_ent.hass = hass
+    await c_ent.async_added_to_hass()
+    assert c_ent.hvac_mode is not None
+    assert len(c_ent.hvac_modes) >= 1
+    assert c_ent.supported_features
+    assert c_ent.native_current_temperature == 25.0
+    assert c_ent.native_target_temperature == 24.0
+    assert isinstance(c_ent.extra_state_attributes, dict)
+    await async_unload_entry(hass, cooler_entry)
+
+    # 2. heater + switch_pwm
+    pwm_entry = ConfigEntry(
+        entry_id="entry_pwm_heat",
+        title="PWM Heater",
+        data={
+            CONF_CONTROL_MODE: CONTROL_MODE_SWITCH_PWM,
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_HEATER,
+            CONF_INDOOR_SENSOR: "sensor.room_temp",
+            CONF_OUTDOOR_SENSOR: "sensor.out_temp",
+            CONF_TARGET_DEVICE: "switch.heater_plug",
+            CONF_INITIAL_TARGET_TEMP: 22.0,
+            CONF_KP: 20.0,
+            CONF_KI: 0.6,
+            CONF_MAX_I: 20.0,
+            CONF_KD: 5.0,
+            CONF_KE: 0.5,
+            CONF_SAMPLE_PERIOD: 60,
+        },
+        version=2,
+    )
+    assert await async_setup_entry(hass, pwm_entry) is True
+    added_pwm: list = []
+    await async_setup_climate(hass, pwm_entry, lambda ents, update=False: added_pwm.extend(ents))
+    assert len(added_pwm) == 1
+    p_ent = added_pwm[0]
+    assert isinstance(p_ent, SmartPIDThermostatEntity)
+    assert p_ent._attr_unique_id == f"{pwm_entry.entry_id}_thermostat"
+    assert (DOMAIN, pwm_entry.entry_id) in p_ent.device_info.identifiers
+    p_ent.hass = hass
+    await p_ent.async_added_to_hass()
+    assert p_ent.hvac_mode is not None
+    assert p_ent.native_target_temperature == 22.0
+    assert isinstance(p_ent.extra_state_attributes, dict)
+    await async_unload_entry(hass, pwm_entry)
+
+    # 3. options priority over data (dehumidifier in data -> cooler in options => creates climate entity)
+    opt_cool_entry = ConfigEntry(
+        entry_id="entry_opt_cool",
+        title="Opt Override Cooler",
+        data={
+            CONF_CONTROL_MODE: CONTROL_MODE_CLIMATE_DELTA,
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_DEHUMIDIFIER,
+            CONF_INDOOR_SENSOR: "sensor.room_temp",
+            CONF_TARGET_CLIMATE: "climate.ac_slave",
+        },
+        options={CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_COOLER},
+        version=2,
+    )
+    added_opt_cool: list = []
+    await async_setup_climate(hass, opt_cool_entry, lambda ents, update=False: added_opt_cool.extend(ents))
+    assert len(added_opt_cool) == 1
+    assert isinstance(added_opt_cool[0], SmartPIDThermostatEntity)
+
+    # 4. Inverse: cooler in data -> dehumidifier in options => skips climate, creates humidifier entity with DeviceInfo
+    hass.states.async_set("sensor.room_hum", "55.0")
+    opt_hum_entry = ConfigEntry(
+        entry_id="entry_opt_hum",
+        title="Opt Override Dehumidifier",
+        data={
+            CONF_CONTROL_MODE: CONTROL_MODE_CLIMATE_DELTA,
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_COOLER,
+            CONF_INDOOR_SENSOR: "sensor.room_hum",
+            CONF_TARGET_CLIMATE: "humidifier.test",
+        },
+        options={CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_DEHUMIDIFIER},
+        version=2,
+    )
+    added_skip_clim: list = []
+    await async_setup_climate(hass, opt_hum_entry, lambda ents, update=False: added_skip_clim.extend(ents))
+    assert len(added_skip_clim) == 0
+
+    added_hum: list = []
+    await async_setup_humidifier(hass, opt_hum_entry, lambda ents, update=False: added_hum.extend(ents))
+    assert len(added_hum) == 1
+    h_ent = added_hum[0]
+    assert isinstance(h_ent, SmartPIDHumidifierEntity)
+    assert h_ent._attr_unique_id == f"{opt_hum_entry.entry_id}_humidifier"
+    assert h_ent._attr_name is None
+    assert h_ent.device_info is not None
+    assert (DOMAIN, opt_hum_entry.entry_id) in h_ent.device_info.identifiers
+

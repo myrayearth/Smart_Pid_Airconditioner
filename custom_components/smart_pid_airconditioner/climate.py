@@ -38,6 +38,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_call_later,
@@ -217,6 +218,7 @@ from .const import (
     is_humidity_type,
     is_dual_controller,
     duration_to_seconds,
+    resolve_thermostat_type,
 )
 from .ventilation import VentState, VentStatus, VentilationGuard
 
@@ -256,7 +258,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Smart PID Thermostat climate entity from a config entry."""
-    thermostat_type = entry.data.get(CONF_THERMOSTAT_TYPE, entry.options.get(CONF_THERMOSTAT_TYPE))
+    thermostat_type = resolve_thermostat_type(entry)
 
     # If this entry is for humidifier/dehumidifier, remove any stale climate entity and exit
     if is_humidity_type(thermostat_type):
@@ -328,7 +330,13 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self.hass = hass
         self._entry = entry
         self._attr_unique_id = f"{entry.entry_id}_thermostat"
-        self._attr_name = entry.title
+        self._attr_name = None
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=entry.title,
+            manufacturer="Smart PID",
+            model="Smart PID Controller",
+        )
 
         # Lock to prevent concurrent calculation loops and race conditions
         self._calc_lock = asyncio.Lock()

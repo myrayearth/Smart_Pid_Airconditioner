@@ -393,6 +393,14 @@ def _install_ha_stubs() -> None:
         _attr_extra_state_attributes: dict[str, Any] = {}
         _attr_device_info: Any = None
 
+        @property
+        def hvac_mode(self) -> HVACMode | str:
+            return self._attr_hvac_mode
+
+        @property
+        def device_info(self) -> Any:
+            return self._attr_device_info
+
         def async_write_ha_state(self) -> None:
             pass
 
@@ -427,6 +435,10 @@ def _install_ha_stubs() -> None:
     class HumidifierEntity:
         hass: HomeAssistant
         _attr_device_info: Any = None
+
+        @property
+        def device_info(self) -> Any:
+            return self._attr_device_info
 
         def async_write_ha_state(self) -> None:
             pass
