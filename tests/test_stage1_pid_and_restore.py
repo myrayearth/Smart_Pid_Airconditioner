@@ -235,3 +235,25 @@ async def test_extra_stored_data_restore_climate_and_humidifier(hass) -> None:
     assert "switch.heater_plug" in h_entity._last_switch_off_times
     assert h_entity._active_section == 3
     assert h_entity.extra_restore_state_data.active_section == 3
+
+
+@pytest.mark.asyncio
+async def test_config_flow_and_options_flow_render(hass) -> None:
+    """Verify ConfigFlow and OptionsFlow steps render without NameError or missing imports."""
+    cf = SmartPIDThermostatConfigFlow()
+    cf.hass = hass
+    res1 = await cf.async_step_user({"control_mode": CONTROL_MODE_CLIMATE_DELTA, "thermostat_type": THERMOSTAT_TYPE_COOLER})
+    assert res1["type"] == "form"
+    assert res1["step_id"] == "device_sensor"
+    res2 = await cf.async_step_device_sensor()
+    assert res2["type"] == "form"
+    assert res2["step_id"] == "device_sensor"
+
+    entry = _make_climate_entry()
+    of = SmartPIDThermostatConfigFlow.async_get_options_flow(entry)
+    of.hass = hass
+    of._config_entry_internal = entry
+    res3 = await of.async_step_init()
+    assert res3["type"] == "form"
+    assert res3["step_id"] == "init"
+

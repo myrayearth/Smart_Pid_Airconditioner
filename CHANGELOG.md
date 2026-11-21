@@ -7,6 +7,14 @@
 
 ---
 
+## [0.2.2] - 2026-11-20
+
+### 수정 (Fixed)
+- `config_flow.py` 내 환기/자가학습 섹션(`CONF_VENT_MODE` 등) 상수 임포트 누락으로 초기 설정 화면 진입 시 발생하던 `NameError` 수정
+- ConfigFlow / OptionsFlow 폼 렌더링 회귀 테스트 추가
+
+---
+
 ## [0.2.1] - 2026-11-20
 
 ### 수정 (Fixed)
