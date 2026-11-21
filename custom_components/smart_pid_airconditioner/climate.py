@@ -322,7 +322,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
     _attr_has_entity_name = True
     _attr_translation_key = DOMAIN
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the thermostat entity."""
         self.hass = hass
@@ -785,14 +785,14 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         return self._temp_step
 
     @property
-    def current_temperature(self) -> float | None:
+    def native_current_temperature(self) -> float | None:
         """Return the current indoor temperature/humidity."""
         if is_humidity_type(self._thermostat_type):
             return self._indoor_humidity
         return self._indoor_temp
 
     @property
-    def target_temperature(self) -> float:
+    def native_target_temperature(self) -> float:
         """Return the target temperature."""
         return self._target_temp
 

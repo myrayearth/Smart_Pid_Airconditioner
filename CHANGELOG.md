@@ -7,6 +7,17 @@
 
 ---
 
+## [0.2.3] - 2026-11-21
+
+### 수정 (Fixed)
+- Home Assistant 2027.11 호환성을 위해 `SmartPIDThermostatEntity` (`climate.py`)의 deprecated 온도 속성 마이그레이션:
+  - `_attr_temperature_unit` → `_attr_native_temperature_unit`
+  - `current_temperature` → `native_current_temperature`
+  - `target_temperature` → `native_target_temperature`
+- `SmartPIDThermostatEntity` `native_*` 속성 사용 여부 검증 회귀 테스트 추가
+
+---
+
 ## [0.2.2] - 2026-11-20
 
 ### 수정 (Fixed)

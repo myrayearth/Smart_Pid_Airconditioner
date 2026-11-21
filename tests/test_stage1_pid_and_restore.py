@@ -8,6 +8,7 @@ import warnings
 import pytest
 from homeassistant.components.climate import HVACMode
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfTemperature
 import homeassistant.util.dt as dt_util
 
 from custom_components.smart_pid_airconditioner import (
@@ -256,4 +257,26 @@ async def test_config_flow_and_options_flow_render(hass) -> None:
     res3 = await of.async_step_init()
     assert res3["type"] == "form"
     assert res3["step_id"] == "init"
+
+
+@pytest.mark.asyncio
+async def test_climate_entity_uses_native_temperature_properties(hass) -> None:
+    """Verify SmartPIDThermostatEntity uses non-deprecated native_* temperature attributes."""
+    assert "_attr_native_temperature_unit" in SmartPIDThermostatEntity.__dict__
+    assert "native_current_temperature" in SmartPIDThermostatEntity.__dict__
+    assert "native_target_temperature" in SmartPIDThermostatEntity.__dict__
+
+    assert "_attr_temperature_unit" not in SmartPIDThermostatEntity.__dict__
+    assert "current_temperature" not in SmartPIDThermostatEntity.__dict__
+    assert "target_temperature" not in SmartPIDThermostatEntity.__dict__
+
+    hass.states.async_set("sensor.room_temp", "26.5")
+    entry = _make_climate_entry()
+    entity = SmartPIDThermostatEntity(hass, entry)
+    entity.hass = hass
+    entity._update_sensor_values()
+
+    assert entity._attr_native_temperature_unit == UnitOfTemperature.CELSIUS
+    assert entity.native_target_temperature == 24.0
+    assert entity.native_current_temperature == 26.5
 
