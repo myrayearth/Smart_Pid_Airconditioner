@@ -7,7 +7,13 @@ from homeassistant.const import Platform
 
 
 DOMAIN = "smart_pid_airconditioner"
-PLATFORMS = [Platform.CLIMATE, Platform.HUMIDIFIER, Platform.SENSOR]
+PLATFORMS = [
+    Platform.CLIMATE,
+    Platform.HUMIDIFIER,
+    Platform.SENSOR,
+    Platform.BUTTON,
+    Platform.SELECT,
+]
 
 # Config & Option Keys - Step 1: Base settings
 CONF_CONTROL_MODE = "control_mode"
@@ -342,6 +348,20 @@ DEFAULT_RECORDER_BOOTSTRAP = False
 
 DUAL_MIN_DEADBAND_TEMP = 2.0
 DUAL_MIN_DEADBAND_HUMIDITY = 5.0
+
+# Stage 6: Custom Inertia Profile, Coasting Confirmation, Solar Guard & Switch Command Guard
+CONF_CUSTOM_COAST_WINDOW_MIN = "custom_coast_window_min"
+CONF_CUSTOM_TAU_EM_MIN = "custom_tau_em_min"
+CONF_SOLAR_GUARD = "solar_guard"
+
+DEFAULT_CUSTOM_COAST_WINDOW_MIN = 90
+DEFAULT_CUSTOM_TAU_EM_MIN = 25
+DEFAULT_SOLAR_GUARD = False
+DEFAULT_COAST_WINDOW_FAST_AIR_MIN = 45.0
+DEFAULT_COAST_WINDOW_HIGH_INERTIA_MIN = 180.0
+DEFAULT_DEVICE_UNAVAILABLE_GRACE_SEC = 60
+DEFAULT_SWITCH_CONFIRM_TIMEOUT = 1.5
+DEFAULT_SWITCH_OFF_RETRY_DELAYS = (0.3, 0.7)
 
 
 

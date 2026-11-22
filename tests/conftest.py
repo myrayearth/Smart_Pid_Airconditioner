@@ -66,6 +66,8 @@ def _install_ha_stubs() -> None:
         CLIMATE = "climate"
         HUMIDIFIER = "humidifier"
         SENSOR = "sensor"
+        BUTTON = "button"
+        SELECT = "select"
 
     class EntityCategory(str, Enum):
         CONFIG = "config"
@@ -484,6 +486,62 @@ def _install_ha_stubs() -> None:
     sens_mod.SensorDeviceClass = SensorDeviceClass
     sens_mod.SensorStateClass = SensorStateClass
     sens_mod.SensorEntity = SensorEntity
+
+    # --- homeassistant.components.button ---
+    btn_mod = _ensure_module("homeassistant.components.button")
+
+    class ButtonEntity:
+        hass: HomeAssistant
+        _attr_entity_category: Any = None
+        _attr_device_info: Any = None
+        _attr_has_entity_name: bool = False
+        _attr_translation_key: str | None = None
+        _attr_icon: str | None = None
+
+        @property
+        def entity_category(self) -> Any:
+            return self._attr_entity_category
+
+        @property
+        def device_info(self) -> Any:
+            return self._attr_device_info
+
+        @property
+        def available(self) -> bool:
+            return True
+
+        def async_write_ha_state(self) -> None:
+            pass
+
+    btn_mod.ButtonEntity = ButtonEntity
+
+    # --- homeassistant.components.select ---
+    sel_ent_mod = _ensure_module("homeassistant.components.select")
+
+    class SelectEntity:
+        hass: HomeAssistant
+        _attr_entity_category: Any = None
+        _attr_device_info: Any = None
+        _attr_has_entity_name: bool = False
+        _attr_translation_key: str | None = None
+        _attr_options: list[str] = []
+
+        @property
+        def entity_category(self) -> Any:
+            return self._attr_entity_category
+
+        @property
+        def device_info(self) -> Any:
+            return self._attr_device_info
+
+        @property
+        def options(self) -> list[str]:
+            return self._attr_options
+
+        def async_write_ha_state(self) -> None:
+            pass
+
+    sel_ent_mod.SelectEntity = SelectEntity
 
     # --- homeassistant.helpers.device_registry ---
     dr_mod = _ensure_module("homeassistant.helpers.device_registry")

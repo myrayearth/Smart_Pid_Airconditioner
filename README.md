@@ -24,7 +24,7 @@ Home Assistant용 **지능형 냉방·난방·가습·제습 자가학습 PID �
 - **Derivative Kick 방지 & 1차 LPF 미분항**: 설정값 변경 시 미분 충격을 피하기 위해 측정값 변화율($\Delta T_{\text{room}}, \Delta H_{\text{room}}$)을 사용하며, `10초` 미만 급격한 센서 노이즈 이벤트를 차단하고 1차 저역통과필터($\tau_d = 120\text{초}$)를 적용합니다.
 - **분 단위 적분(`Ki`) & 양방향 제한(`±Max I`)**: 연산 주기와 무관하게 분 단위로 적분항을 정규화하고, 적분항이 `[-Max I, +Max I]` 범위를 넘지 않도록 양방향 클램핑 및 포화 시 안티 와인드업(Anti-windup)을 적용합니다.
 - **외기 피드포워드($K_e$)**: 실외 센서 미설정 시 자동으로 $0.0$ 처리되며, 설정 시 외기 편차를 보상해 외기 변화에 선제 대응합니다.
-- **구간 전환 & 다중 명령 딜레이**: 구간 전환 시 첫 명령 전 `1.0초`, 다중 명령(전원·모드·목표값·팬) 간 `0.5초` 지연과 `_is_dispatching` 재진입 가드로 Zigbee/IR/Wi-Fi 기기의 명령 유실 및 상태 동기화 루프백을 방지합니다.
+- **구간 전환 & 다중 명령 딜레이 + 스위치 명령 가드 (`SwitchCommandGuard`)**: 구간 전환 시 첫 명령 전 `1.0초`, 다중 명령(전원·모드·목표값·팬) 간 `0.5초` 지연과 `_is_dispatching` 재진입 가드로 Zigbee/IR/Wi-Fi 기기의 명령 유실을 방지합니다. PWM 스위치는 `OFF` 명령 시 대기 중인 `ON`을 선점 취소하고 상태 확인(`1.5초`)·제한적 재시도(`0.3s`, `0.7s`)·`ON` 실패 시 안전 `OFF` 복구를 수행하며, 일시적(`60초` 미만) 통신 단절(`unavailable`/`unknown`) 중에는 기존 `_pwm_state`를 보호합니다.
 
 ---
 
@@ -68,9 +68,13 @@ flowchart TD
 기기가 꺼지거나 대기(`section_0`)로 전환된 직후에도 배관·열교환기·바닥 축열체의 잔열/잔냉(코스팅, Afterglow) 때문에 온·습도가 추가로 변하는 현상을 추적합니다.
 - **상태 전이**: `대기 (idle)` → `가동 중 (active)` → `정지 후 코스팅 관찰 (post_stop_coast)` → `자연 변화 관찰 (passive_drift)`
 - **관성 프로파일 (`inertia_profile`)**:
-  - **빠른 공기 순환 (`fast_air`)**: 에어컨, 팬히터, 가습기, 제습기 등 공기를 직접 순환시키는 기기용. 정지 직전 온도/습도 변화 기울기(`slope`)와 감쇠 시정수(`tau_coast`) 기반 예측.
-  - **고관성 축열 (`high_inertia`)**: 온돌 바닥난방·라디에이터용. 1차 지연 가상 축열량(`emitter_charge`, 시정수 `35분`)을 적분해 정지 후 방출되는 잔열 코스팅량 예측.
-- **품질 필터**: 가동 시간이 `5분` 미만이거나(`short_run`), 가동/코스팅 중 **환기 또는 외부 수동 조작**이 개입하면 해당 사이클은 폐기하고 유효 사이클만 **EWMA($\alpha=0.25$)**로 갱신합니다.
+  - **빠른 공기 순환 (`fast_air`)**: 에어컨, 팬히터, 가습기, 제습기 등 공기를 직접 순환시키는 기기용 (시정수 `10분`, 최대 코스팅 관찰 `45분`). 정지 직전 변화 기울기(`slope`)와 감쇠 시정수(`tau_coast`) 기반 예측.
+  - **고관성 축열 (`high_inertia`)**: 온돌 바닥난방·라디에이터용 (시정수 `35분`, 최대 코스팅 관찰 `180분`). 1차 지연 가상 축열량(`emitter_charge`)을 적분해 정지 후 방출되는 잔열 코스팅량 예측.
+  - **사용자 지정 (`custom`)**: 특수 공조기·팬코일·벽난로/복합 난방 등에 맞춰 **사용자 지정 코스팅 관찰 최대 창(`custom_coast_window_min`, 15~720분, 기본 90분)** 및 **열 시상수 τ(`custom_tau_em_min`, 5~180분, 기본 25분)**를 직접 지정할 수 있는 축열형 프로파일.
+- **정밀 정점 확정 & 품질 필터**:
+  - **2단계 연속 반전 정점 확정 (`peak_confirm_delta`)**: 단일 센서 흔들림으로 코스팅 정점을 조기 종료하지 않고 2회 연속 반전 시에만 정점을 확정합니다.
+  - **이상치 격리/재현 검증**: 과거 중앙값 대비 극단적 코스팅은 1회 발생 시 `inconsistent_coast_outlier`로 격리 보류하고 유사 패턴이 2회 재현될 때만 학습에 반영합니다.
+  - **다중 오염 가드**: 가동 `5분` 미만(`short_run`), **환기/수동 조작**, **`60초` 초과 기기 `unavailable`(`device_unavailable`)**, 주간 난방 중 햇빛 유입(`solar_guard` 활성화 시 `sun.sun` 일출 상태 급등 차단)이 개입된 사이클은 폐기하고 유효 사이클만 **EWMA($\alpha=0.25$)**로 갱신합니다.
 
 ### 2. 5분 블록 `Huber-RLS` 온라인 열·수분 모델 추정
 `1분` 단위 관측치를 `5분` 블록으로 평균 내어 공간의 열·수분 동특성 방정식을 실시간 회귀 추정합니다.
@@ -112,9 +116,9 @@ $$\frac{dy}{dt} = \theta_0 \cdot u - \theta_1 \cdot (y_{\text{in}} - y_{\text{ou
    - 현재 목표와의 잔여 오차(`error`)가 **`예측 코스팅량`** 이하로 좁혀지면 목표 도달 전에 미리 정지/대기합니다.
    - **PWM 모드**: 사이클을 미리 종료(`OFF`)해 잔열·잔냉으로 목표 온/습도에 정확히 안착시킵니다.
    - **Air Conditioner 모드**: 활성 구간 최소 유지시간(`240초`) 이후 즉시 **구간 0 (`section_0`)**으로 전환해 불필요한 과냉·과열을 막습니다.
-3. **자동 파라미터 적용 & 5사이클 자동 롤백 보호**:
+3. **자동 파라미터 적용 & 실시간 MAE 기반 5사이클 자동 롤백 보호**:
    - 계절당 최대 5회(전체 20회) 한도 내에서 새 SIMC 파라미터 적용 시 직전 파라미터와 성능 기준선(`baseline_mae`, `baseline_overshoot`)을 스냅샷 저장합니다.
-   - 적용 후 **5사이클 동안 MAE 또는 오버슈트가 30% 초과 악화**되면 즉시 직전 안정 파라미터로 **자동 롤백**하고 Home Assistant **영구 알림(Persistent Notification)**으로 알려줍니다.
+   - 완료된 코스팅 사이클마다 실측 예측 오차(`mean_absolute_error`)와 오버슈트를 실시간 집계하며, 적용 후 **5사이클 동안 MAE 또는 오버슈트가 30% 초과 악화**되면 즉시 직전 안정 파라미터로 **자동 롤백**하고 Home Assistant **영구 알림(Persistent Notification)**으로 알려줍니다.
 
 ---
 
@@ -126,7 +130,11 @@ $$\frac{dy}{dt} = \theta_0 \cdot u - \theta_1 \cdot (y_{\text{in}} - y_{\text{ou
    - *Tip*: `Ki` 우측의 **적분 제한 범위 (`Max I, ±%`)**를 기본 `20%` 정도로 두면 외란 시 적분 포화(Windup)를 막아 반응이 훨씬 안정적입니다.
 3. **스마트 자가학습 및 안전 보호 (선택)** 섹션을 열어 기본 설정을 확인합니다:
    - **튜닝 모드**: 기본값 **`관찰 학습 (shadow_learn)`** 유지 권장 (기존 수동 설정과 100% 동일하게 동작하면서 안전하게 공간 데이터를 축적합니다).
-   - **건물/기기 열 관성 프로파일**: 에어컨·팬히터·가습기·제습기는 `빠른 공기 순환 (fast_air)`, 온돌 바닥난방·라디에이터는 `고관성 축열 (high_inertia)` 선택.
+   - **건물/기기 열 관성 프로파일**:
+     - 에어컨·팬히터·가습기·제습기 → **`빠른 공기 순환 (fast_air)`**
+     - 온돌 바닥난방·라디에이터 → **`고관성 축열 (high_inertia)`**
+     - 특수 설비/별도 시간 조정이 필요한 경우 → **`사용자 지정 (custom)`** 선택 후 **코스팅 관찰 최대 창(`15~720분`, 기본 90분)** 및 **열 시상수 τ(`5~180분`, 기본 25분)** 직접 입력
+   - **(선택) 일사량 가드 (`solar_guard`)**: 햇빛이 강하게 드는 난방 공간에서는 활성화해 낮 시간 창가 온도 급등을 잔열 코스팅으로 오학습하지 않도록 보호하세요.
 4. **(Air Conditioner 모드)** 3단계 구간 설정에서 **구간 0 (`section_0`)**의 대기 동작(`목표값 셋백 대기` / `송풍 전환` / `기기 끄기`)과 셋백 오프셋(예: 냉방 `+2.0°C`, 난방 `-2.0°C`)을 확인합니다.
 
 ### 2단계: 환기 감지 & 안전 보호 & 교차 연동 설정
@@ -140,26 +148,31 @@ $$\frac{dy}{dt} = \theta_0 \cdot u - \theta_1 \cdot (y_{\text{in}} - y_{\text{ou
   - 에어컨과 제습기를 같은 방에 둔 경우, 에어컨 설정에는 `coupled_dehumidifier`(제습기 발열 보상), 제습기 설정에는 `coupled_ac`(에어컨 냉방 가동 시 인터록)를 연결하면 두 기기가 서로의 학습을 방해하지 않습니다.
   - 가습/제습 제어 시 같은 방 온도 센서를 `aux_temp_sensor`에 지정하면 절대습도 기준으로 학습 정밀도가 올라갑니다.
 
-### 3단계: 5종 진단 센서 모니터링
-기기가 며칠간 가동되면서 생성되는 5개 진단 엔티티(`EntityCategory.DIAGNOSTIC`)로 학습 상태를 직관적으로 확인할 수 있습니다.
+### 3단계: 진단·설정 엔티티 모니터링 및 진단 다운로드
+기기가 가동되면서 제어기 기기 화면에 **5종 진단 센서(`DIAGNOSTIC`)**와 **3종 실시간 설정 엔티티(`CONFIG`)**가 함께 생성됩니다.
 
-| 진단 센서 이름 | 표시 상태값 | 핵심 속성(Attributes) 및 해석 포인트 |
+| 엔티티 이름 (분류) | 표시 상태값 / 역할 | 핵심 속성(Attributes) 및 해석 포인트 |
 | :--- | :--- | :--- |
-| **학습 신뢰도** | `0 ~ 100%` | `학습 단계`: `데이터 수집 중`(0~49%) → `기초 안정화`(50~69%) → **`자동 제어 준비 완료`**(70~89%) → `최적화 완료`(90~100%)<br/>`rls_samples`(5분 학습 블록 수), `rejected_outliers`(기각된 이상치 수), `튜닝 모드` |
-| **사이클 단계** | `대기` / `가동 중` / `정지 후 코스팅 관찰` / `자연 변화 관찰` | `accepted_count`(유효 코스팅 사이클 수), `rejected_counts`(단기 가동/환기 등 제외 횟수), `열 관성 프로파일` |
-| **예측 코스팅량** | `°C` / `g/m³` / `%` | 기기 정지 후 잔열/잔냉으로 추가로 변동할 것으로 예측되는 양 |
-| **자동 추천 제어 파라미터** | 추천 `Kp` | `recommended_ki`, `recommended_ke`, `learned_rate`, `learned_loss`, `fallback_reason` |
-| **환기 상태** | `정상` / `열림 감지 대기` / `환기 중 (제어 일시정지)` / `닫힘 후 학습 안정화` | `cooldown_remaining_seconds`, `should_pause_control`, `should_block_learning`, `degraded` (센서 5분 이상 불능 시) |
+| **학습 신뢰도** (진단) | `0 ~ 100%` | `학습 단계`: `데이터 수집 중`(0~49%) → `기초 안정화`(50~69%) → **`자동 제어 준비 완료`**(70~89%) → `최적화 완료`(90~100%)<br/>`rls_samples`, `rejected_outliers`, **`mean_absolute_error`**, **`comparison_count`**, `last_predicted_coast` / `last_observed_coast` |
+| **사이클 단계** (진단) | `대기` / `가동 중` / `정지 후 코스팅 관찰` / `자연 변화 관찰` | `accepted_count`, `rejected_counts`, `열 관성 프로파일`, **`tau_em_min`**, **`max_coast_window_min`** |
+| **예측 코스팅량** (진단) | `°C` / `g/m³` / `%` | 기기 정지 후 잔열/잔냉으로 추가로 변동할 것으로 예측되는 양 |
+| **자동 추천 제어 파라미터** (진단) | 추천 `Kp` | `recommended_ki`, `recommended_ke`, `learned_rate`, `learned_loss`, `fallback_reason` |
+| **환기 상태** (진단) | `정상` / `열림 감지 대기` / `환기 중 (제어 일시정지)` / `닫힘 후 학습 안정화` | `cooldown_remaining_seconds`, `should_pause_control`, `should_block_learning`, `degraded` (센서 5분 이상 불능 시) |
+| **자가학습 튜닝 모드** (설정 Select) | `수동 PID` / `관찰 학습` / `자가학습 자동 제어` | **통합구성요소 리로드 없이** 튜닝 모드를 즉시 전환 |
+| **예측 제어 성향 (SIMC)** (설정 Select) | `절전` / `균형` / `쾌적` | **통합구성요소 리로드 없이** 제어 성향 즉시 전환 및 추천 파라미터 재계산 |
+| **자가학습 초기화** (설정 Button) | 버튼 클릭 | 클릭 즉시 누적 학습 데이터, 코스팅 이력, MAE 및 안전 스냅샷 초기화 |
+
+> **진단 정보 다운로드**: 기기 화면 메뉴에서 **진단 다운로드(Download Diagnostics)**를 누르면 현재 설정, `mean_absolute_error`, RLS 모델 및 코스팅 이력이 포함된 JSON 파일을 바로 내려받아 분석할 수 있습니다.
 
 ### 4단계: `자가학습 자동 제어 (adaptive_auto)` 전환
-1. **학습 신뢰도**가 `70%` 이상이고 속성 **학습 단계**가 **`자동 제어 준비 완료`**(또는 `최적화 완료`)가 되면 통합구성요소 **구성(옵션)**에서 **튜닝 모드**를 **`자가학습 자동 제어 (adaptive_auto)`**로 변경합니다.
-2. 환경에 맞게 **예측 성향(SIMC)**을 조정합니다:
+1. **학습 신뢰도**가 `70%` 이상이고 속성 **학습 단계**가 **`자동 제어 준비 완료`**(또는 `최적화 완료`)가 되면 기기 화면의 **자가학습 튜닝 모드** Select 엔티티(또는 옵션 메뉴)에서 **`자가학습 자동 제어 (adaptive_auto)`**로 즉시 전환할 수 있습니다(리로드 불필요).
+2. 환경에 맞게 **예측 제어 성향 (SIMC)**을 실시간 조정합니다:
    - 에너지 절감 및 스위칭 최소화가 중요하다면 → **`절전 (eco)`**
    - 일반적인 주거 환경 → **`균형 (balanced)`**
    - 빠른 목표 온·습도 도달이 중요하다면 → **`쾌적 (comfort)`**
 
 ### 5단계: 공간 구조 변경·기기 교체 시 초기화
-에어컨/제습기를 새 기기로 교체했거나 방 구조·창호 단열이 크게 바뀐 경우, 개발자 도구 > 동작(서비스)에서 **`smart_pid_airconditioner.reset_learning`**을 호출하면 해당 엔티티의 누적 모델과 스냅샷을 깨끗하게 초기화해 처음부터 다시 학습할 수 있습니다.
+에어컨/제습기를 새 기기로 교체했거나 방 구조·창호 단열이 크게 바뀐 경우, 기기 화면의 **`자가학습 초기화` 버튼**을 누르거나 개발자 도구 > 동작(서비스)에서 **`smart_pid_airconditioner.reset_learning`**을 호출하면 해당 엔티티의 누적 모델과 스냅샷을 깨끗하게 초기화해 처음부터 다시 학습할 수 있습니다.
 
 ---
 
@@ -168,13 +181,17 @@ $$\frac{dy}{dt} = \theta_0 \cdot u - \theta_1 \cdot (y_{\text{in}} - y_{\text{ou
 ```text
 custom_components/smart_pid_airconditioner/
 ├── __init__.py           # 통합구성요소 셋업, v1→v2 마이그레이션, reset_learning 서비스 등록
+├── actuator.py           # SwitchCommandGuard (OFF 선점 취소, 상태 확인, 제한적 재시도, 안전 OFF 복구)
+├── button.py             # EntityCategory.CONFIG 자가학습 초기화 버튼 엔티티
 ├── climate.py            # ClimateEntity 제어기 (에어컨/히터/겸용 PID, 구간 0~4 및 PWM 디스패처)
-├── humidifier.py         # HumidifierEntity 제어기 (가습기/제습기 PID 및 디스패처)
 ├── config_flow.py        # UI 설정(ConfigFlow) 및 옵션(OptionsFlowWithReload) 마법사
 ├── const.py              # 상수, 기본값, 도메인 및 시간 변환 유틸리티
-├── learner.py            # 순수 Python 자가학습 엔진 (Huber-RLS, DynamicCoasting, SIMC, SafetyManager)
+├── diagnostics.py        # Home Assistant Download Diagnostics(진단 정보 JSON 다운로드)
+├── humidifier.py         # HumidifierEntity 제어기 (가습기/제습기 PID 및 디스패처)
+├── learner.py            # 순수 Python 자가학습 엔진 (Huber-RLS, 2단계 정점·이상치 격리 코스팅, SIMC, SafetyManager)
 ├── psychrometrics.py     # Bolton(1980) 상대습도 ↔ 절대습도(g/m³) · 이슬점 변환
-├── runtime.py            # SmartPIDRuntime (1분 코스팅/5분 RLS 루프, Recorder 부트스트랩, 교차 연동)
+├── runtime.py            # SmartPIDRuntime (1분 코스팅/5분 RLS 루프, 일사량/통신불능 가드, MAE 롤백, Select 전환)
+├── select.py             # EntityCategory.CONFIG 리로드 없는 튜닝/예측 모드 Select 엔티티 2종
 ├── sensor.py             # EntityCategory.DIAGNOSTIC 진단 센서 5종
 ├── services.yaml         # reset_learning 서비스 스키마
 ├── storage.py            # ModelStore (10분 디바운싱 .storage 영구 저장 및 스냅샷 직렬화)

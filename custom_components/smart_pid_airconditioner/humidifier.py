@@ -203,6 +203,7 @@ from .const import (
     duration_to_seconds,
     resolve_thermostat_type,
 )
+from .actuator import SwitchCommandGuard
 from .ventilation import VentState, VentStatus, VentilationGuard
 
 _LOGGER = logging.getLogger(__name__)
@@ -332,6 +333,8 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
 
         # Guard flags & Stage 4/5 runtime, manual override, watchdog
         self._runtime: Any = getattr(entry, "runtime_data", None)
+        self._switch_guard = SwitchCommandGuard(hass)
+        self._device_unavailable: bool = False
         self._unsub_runtime: CALLBACK_TYPE | None = None
         self._manual_override_until: datetime | None = None
         self._continuous_run_start: datetime | None = None
@@ -980,6 +983,16 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         else:
             self._outdoor_humidity = None
 
+    def _is_target_device_unavailable(self) -> bool:
+        """Return True if the active target device state is currently unavailable/unknown."""
+        dev_id = self._active_target_device_id()
+        if not dev_id or not self.hass:
+            return self._device_unavailable
+        st = self.hass.states.get(dev_id)
+        if st is not None:
+            self._device_unavailable = st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+        return self._device_unavailable
+
     async def _async_entity_changed(self, event: Event[EventStateChangedData]) -> None:
         """Handle tracked entity state updates."""
         entity_id = event.data["entity_id"]
@@ -992,6 +1005,11 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             return
 
         if entity_id in (self._target_device_id, self._target_device_humidity_id, self._target_device_dehumidity_id):
+            is_unavail = new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            if entity_id == self._active_target_device_id():
+                self._device_unavailable = is_unavail
+            if is_unavail:
+                return
             if (
                 not self._is_dispatching
                 and self._manual_override_min > 0
@@ -1490,6 +1508,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                             is_heating=self._is_heating,
                             vent_status=self._vent_status,
                             manual_override=manual_override_active,
+                            device_unavailable=self._is_target_device_unavailable(),
                         )
 
                 if manual_override_active:
@@ -1762,16 +1781,10 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             return
         st = self.hass.states.get(device_id)
         if st and st.state != STATE_ON:
-            domain = device_id.split(".")[0]
             _LOGGER.info("Turning ON switch %s", device_id)
-            await self.hass.services.async_call(
-                domain,
-                "turn_on",
-                {ATTR_ENTITY_ID: device_id},
-                blocking=True,
-            )
-            self._last_switch_on_time = dt_util.utcnow()
-            self._last_switch_on_times[device_id] = self._last_switch_on_time
+            if await self._switch_guard.async_turn_on(device_id, confirm=False):
+                self._last_switch_on_time = dt_util.utcnow()
+                self._last_switch_on_times[device_id] = self._last_switch_on_time
 
     async def _async_turn_off_switch(self, device_id: str) -> None:
         """Turn off switch/input_boolean if currently on."""
@@ -1779,33 +1792,18 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             return
         st = self.hass.states.get(device_id)
         if st and st.state != STATE_OFF:
-            domain = device_id.split(".")[0]
             _LOGGER.info("Turning OFF switch %s", device_id)
-            await self.hass.services.async_call(
-                domain,
-                "turn_off",
-                {ATTR_ENTITY_ID: device_id},
-                blocking=True,
-            )
-            self._last_switch_off_time = dt_util.utcnow()
-            self._last_switch_off_times[device_id] = self._last_switch_off_time
+            if await self._switch_guard.async_turn_off(device_id, confirm=True):
+                self._last_switch_off_time = dt_util.utcnow()
+                self._last_switch_off_times[device_id] = self._last_switch_off_time
 
     async def _async_turn_off_specific_device(self, device_id: str) -> None:
         """Turn off a specific target device regardless of domain."""
         if not device_id:
             return
-        domain = device_id.split(".")[0]
         st = self.hass.states.get(device_id)
         if st and st.state != STATE_OFF:
-            try:
-                await self.hass.services.async_call(
-                    domain,
-                    "turn_off",
-                    {ATTR_ENTITY_ID: device_id},
-                    blocking=True,
-                )
-            except Exception as err:
-                _LOGGER.warning("Failed to turn off %s: %s", device_id, err)
+            await self._switch_guard.async_turn_off(device_id, confirm=True)
 
     async def _async_turn_off_all_devices(self) -> None:
         """Turn off all associated slave/switch target devices."""

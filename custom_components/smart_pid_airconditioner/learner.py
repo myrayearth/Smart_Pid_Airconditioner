@@ -6,11 +6,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 import math
+from statistics import median
 from typing import Any
 
 INERTIA_FAST_AIR = "fast_air"
 INERTIA_HIGH_INERTIA = "high_inertia"
-INERTIA_PROFILES = (INERTIA_FAST_AIR, INERTIA_HIGH_INERTIA)
+INERTIA_CUSTOM = "custom"
+INERTIA_PROFILES = (INERTIA_FAST_AIR, INERTIA_HIGH_INERTIA, INERTIA_CUSTOM)
 
 PREDICTION_MODES = ("eco", "balanced", "comfort")
 _TAU_C_FACTORS = {
@@ -190,29 +192,42 @@ class HuberRLS:
 
 
 class DynamicCoastingLearner:
-    """Tracks 4-phase cycles and learns coasting (afterglow) for fast_air & high_inertia."""
+    """Tracks 4-phase cycles and learns coasting (afterglow) for fast_air, high_inertia & custom profiles."""
+
+    @staticmethod
+    def _defaults_for_profile(inertia_profile: str) -> tuple[float, float]:
+        if inertia_profile == INERTIA_HIGH_INERTIA:
+            return 35.0, 180.0
+        if inertia_profile == INERTIA_CUSTOM:
+            return 25.0, 90.0
+        return 10.0, 45.0
 
     def __init__(
         self,
         inertia_profile: str = INERTIA_FAST_AIR,
-        tau_em_min: float = 35.0,
+        tau_em_min: float | None = None,
         ewma_alpha: float = 0.25,
         min_run_min: float = 5.0,
-        max_coast_window_min: float = 45.0,
+        max_coast_window_min: float | None = None,
         max_pred: float = 3.0,
         min_slope: float = 0.005,
         min_charge: float = 0.05,
+        peak_confirm_delta: float = 0.1,
     ) -> None:
         self.inertia_profile = (
             inertia_profile if inertia_profile in INERTIA_PROFILES else INERTIA_FAST_AIR
         )
-        self.tau_em_min = float(tau_em_min)
+        def_tau_em, def_coast_win = self._defaults_for_profile(self.inertia_profile)
+        self.tau_em_min = max(1.0, float(def_tau_em if tau_em_min is None else tau_em_min))
         self.ewma_alpha = float(ewma_alpha)
         self.min_run_min = float(min_run_min)
-        self.max_coast_window_min = float(max_coast_window_min)
+        self.max_coast_window_min = max(
+            5.0, float(def_coast_win if max_coast_window_min is None else max_coast_window_min)
+        )
         self.max_pred = float(max_pred)
         self.min_slope = float(min_slope)
         self.min_charge = float(min_charge)
+        self.peak_confirm_delta = max(0.01, float(peak_confirm_delta))
 
         self.phase: CyclePhase = CyclePhase.IDLE
         self.tau_coast: float = 3.0 if self.inertia_profile == INERTIA_FAST_AIR else 1.5
@@ -223,6 +238,8 @@ class DynamicCoastingLearner:
         self.rejected_counts: dict[str, int] = {}
         self.last_quality_reason: str | None = None
         self.history: deque[dict[str, Any]] = deque(maxlen=50)
+        self._quarantined_outliers: deque[dict[str, float]] = deque(maxlen=10)
+        self._last_completed_cycle: dict[str, Any] | None = None
 
         # Cycle tracking state
         self._active_minutes: float = 0.0
@@ -232,8 +249,38 @@ class DynamicCoastingLearner:
         self._peak_coast_value: float | None = None
         self._stop_slope: float = 0.0
         self._stop_charge: float = 0.0
+        self._predicted_coast_at_stop: float = 0.0
+        self._stop_target: float | None = None
+        self._reversal_step: int = 0
+        self._reversal_anchor: float | None = None
         self._cycle_direction_heating: bool = False
         self._cycle_contaminated: bool = False
+
+    def apply_profile_settings(
+        self,
+        inertia_profile: str,
+        *,
+        tau_em_min: float | None = None,
+        max_coast_window_min: float | None = None,
+        peak_confirm_delta: float | None = None,
+    ) -> None:
+        """Update inertia profile and timing parameters without discarding learned history."""
+        self.inertia_profile = (
+            inertia_profile if inertia_profile in INERTIA_PROFILES else INERTIA_FAST_AIR
+        )
+        def_tau_em, def_coast_win = self._defaults_for_profile(self.inertia_profile)
+        self.tau_em_min = max(1.0, float(def_tau_em if tau_em_min is None else tau_em_min))
+        self.max_coast_window_min = max(
+            5.0, float(def_coast_win if max_coast_window_min is None else max_coast_window_min)
+        )
+        if peak_confirm_delta is not None:
+            self.peak_confirm_delta = max(0.01, float(peak_confirm_delta))
+
+    def consume_completed_cycle(self) -> dict[str, Any] | None:
+        """Return and clear the latest completed cycle comparison metrics."""
+        res = self._last_completed_cycle
+        self._last_completed_cycle = None
+        return res
 
     def _reject_cycle(self, reason: str) -> None:
         self.rejected_counts[reason] = self.rejected_counts.get(reason, 0) + 1
@@ -255,12 +302,14 @@ class DynamicCoastingLearner:
         dt_min: float = 1.0,
         blocked_for_learning: bool = False,
         block_reason: str = "ventilation_contamination",
+        target_val: float | None = None,
+        solar_rising_active: bool = False,
     ) -> CyclePhase:
         """Advance cycle state by dt_min (typically 1.0 min) and learn coasting upon completion."""
         dt = max(0.01, float(dt_min))
         u = max(0.0, min(1.0, float(u_effort)))
 
-        # Always update 1st-order virtual emitter charge for high_inertia
+        # Always update 1st-order virtual emitter charge for high_inertia / custom
         alpha_em = dt / (self.tau_em_min + dt)
         self.emitter_charge += alpha_em * (u - self.emitter_charge)
 
@@ -302,6 +351,10 @@ class DynamicCoastingLearner:
                     self._stop_charge = self.emitter_charge
                     self._stop_value = value
                     self._peak_coast_value = value
+                    self._stop_target = float(target_val) if target_val is not None else None
+                    self._predicted_coast_at_stop = self.predict_coast(abs_slope=slope)
+                    self._reversal_step = 0
+                    self._reversal_anchor = None
                     self._coast_minutes = 0.0
                     self.phase = CyclePhase.POST_STOP_COAST
 
@@ -320,23 +373,53 @@ class DynamicCoastingLearner:
                 self.phase = CyclePhase.PASSIVE_DRIFT
             else:
                 self._coast_minutes += dt
-                # Track peak excursion in the active direction
+                # Guard against solar daytime temperature surge corrupting heating afterglow peak
+                if (
+                    solar_rising_active
+                    and self._cycle_direction_heating
+                    and self._stop_value is not None
+                    and (value - self._stop_value) > max(0.5, self._predicted_coast_at_stop + 0.5)
+                ):
+                    self._reject_cycle("solar_gain_contamination")
+                    self.phase = CyclePhase.PASSIVE_DRIFT
+                    return self.phase
+
                 if self._peak_coast_value is None:
                     self._peak_coast_value = value
-                if self._cycle_direction_heating:
-                    if value > self._peak_coast_value:
-                        self._peak_coast_value = value
-                        coast_reversed = False
-                    else:
-                        coast_reversed = (self._peak_coast_value - value) > 0.02
-                else:
-                    if value < self._peak_coast_value:
-                        self._peak_coast_value = value
-                        coast_reversed = False
-                    else:
-                        coast_reversed = (value - self._peak_coast_value) > 0.02
 
-                if (coast_reversed and self._coast_minutes >= 2.0) or (
+                peak_extended = (
+                    (value > self._peak_coast_value)
+                    if self._cycle_direction_heating
+                    else (value < self._peak_coast_value)
+                )
+                peak_confirmed = False
+                if peak_extended:
+                    self._peak_coast_value = value
+                    self._reversal_step = 0
+                    self._reversal_anchor = None
+                else:
+                    drop = (
+                        (self._peak_coast_value - value)
+                        if self._cycle_direction_heating
+                        else (value - self._peak_coast_value)
+                    )
+                    if self._reversal_step == 0:
+                        if drop >= self.peak_confirm_delta:
+                            self._reversal_step = 1
+                            self._reversal_anchor = value
+                    elif self._reversal_anchor is not None:
+                        step_drop = (
+                            (self._reversal_anchor - value)
+                            if self._cycle_direction_heating
+                            else (value - self._reversal_anchor)
+                        )
+                        if step_drop >= self.peak_confirm_delta:
+                            peak_confirmed = True
+                        elif drop < self.peak_confirm_delta * 0.5:
+                            self._reversal_step = 0
+                            self._reversal_anchor = None
+
+                if (peak_confirmed and self._coast_minutes >= 2.0) or (
                     self._coast_minutes >= self.max_coast_window_min
                 ):
                     self._finalize_coast(interrupted=False)
@@ -369,7 +452,27 @@ class DynamicCoastingLearner:
 
         obs_coast = abs(self._peak_coast_value - self._stop_value)
 
-        if self.inertia_profile == INERTIA_HIGH_INERTIA:
+        # Quarantine extreme uncorroborated coasting spikes until seen twice
+        if len(self.history) >= 3:
+            med_coast = median(float(h.get("obs_coast", 0.0)) for h in self.history)
+            delays = [float(h["coast_minutes"]) for h in self.history if h.get("coast_minutes") is not None]
+            med_delay = median(delays) if delays else 0.0
+            is_extreme_coast = obs_coast > max(med_coast * 2.5, med_coast + 1.0)
+            is_extreme_delay = med_delay >= 2.0 and self._coast_minutes > max(med_delay * 3.5, 90.0)
+            if is_extreme_coast or is_extreme_delay:
+                corroborated = any(
+                    abs(o["obs_coast"] - obs_coast) <= max(0.35, obs_coast * 0.3)
+                    and abs(o["coast_minutes"] - self._coast_minutes) <= 30.0
+                    for o in self._quarantined_outliers
+                )
+                self._quarantined_outliers.append(
+                    {"obs_coast": obs_coast, "coast_minutes": self._coast_minutes}
+                )
+                if not corroborated:
+                    self._reject_cycle("inconsistent_coast_outlier")
+                    return
+
+        if self.inertia_profile in (INERTIA_HIGH_INERTIA, INERTIA_CUSTOM):
             if self._stop_charge < self.min_charge:
                 self._reject_cycle("low_slope_or_charge")
                 return
@@ -382,11 +485,21 @@ class DynamicCoastingLearner:
             sample_tau = max(0.0, min(30.0, obs_coast / self._stop_slope))
             self.tau_coast = (1.0 - self.ewma_alpha) * self.tau_coast + self.ewma_alpha * sample_tau
 
+        pred_coast = float(self._predicted_coast_at_stop)
+        coast_error = abs(obs_coast - pred_coast)
+        overshoot = 0.0
+        if self._stop_target is not None:
+            if self._cycle_direction_heating:
+                overshoot = max(0.0, self._peak_coast_value - self._stop_target)
+            else:
+                overshoot = max(0.0, self._stop_target - self._peak_coast_value)
+
         self.accepted_count += 1
         self.last_quality_reason = "accepted"
         self.history.append(
             {
                 "obs_coast": round(obs_coast, 4),
+                "coast_minutes": round(self._coast_minutes, 1),
                 "stop_slope": round(self._stop_slope, 4),
                 "stop_charge": round(self._stop_charge, 4),
                 "tau_coast": round(self.tau_coast, 4),
@@ -394,10 +507,21 @@ class DynamicCoastingLearner:
                 "interrupted": interrupted,
             }
         )
+        self._last_completed_cycle = {
+            "predicted_coast": round(pred_coast, 4),
+            "observed_coast": round(obs_coast, 4),
+            "coast_error": round(coast_error, 4),
+            "overshoot": round(overshoot, 4),
+            "coast_minutes": round(self._coast_minutes, 1),
+            "peak_value": round(self._peak_coast_value, 4),
+            "stop_value": round(self._stop_value, 4),
+            "target_value": round(self._stop_target, 4) if self._stop_target is not None else None,
+            "interrupted": interrupted,
+        }
 
     def predict_coast(self, abs_slope: float | None = None) -> float:
         """Predict coasting excursion after stopping."""
-        if self.inertia_profile == INERTIA_HIGH_INERTIA:
+        if self.inertia_profile in (INERTIA_HIGH_INERTIA, INERTIA_CUSTOM):
             return min(self.max_pred, max(0.0, self.k_afterglow * self.emitter_charge))
         if abs_slope is None:
             if len(self._recent_values) >= 2:
@@ -411,6 +535,9 @@ class DynamicCoastingLearner:
     def to_dict(self) -> dict[str, Any]:
         return {
             "inertia_profile": self.inertia_profile,
+            "tau_em_min": self.tau_em_min,
+            "max_coast_window_min": self.max_coast_window_min,
+            "peak_confirm_delta": self.peak_confirm_delta,
             "phase": self.phase.value,
             "tau_coast": self.tau_coast,
             "k_afterglow": self.k_afterglow,
@@ -423,7 +550,16 @@ class DynamicCoastingLearner:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DynamicCoastingLearner:
-        obj = cls(inertia_profile=str(data.get("inertia_profile", INERTIA_FAST_AIR)))
+        obj = cls(
+            inertia_profile=str(data.get("inertia_profile", INERTIA_FAST_AIR)),
+            tau_em_min=float(data["tau_em_min"]) if "tau_em_min" in data and data["tau_em_min"] is not None else None,
+            max_coast_window_min=(
+                float(data["max_coast_window_min"])
+                if "max_coast_window_min" in data and data["max_coast_window_min"] is not None
+                else None
+            ),
+            peak_confirm_delta=float(data.get("peak_confirm_delta", 0.1)),
+        )
         try:
             obj.phase = CyclePhase(data.get("phase", CyclePhase.IDLE.value))
         except ValueError:
@@ -570,6 +706,33 @@ class TuningSafetyManager:
         self.active_snapshot: TuningSnapshot | None = None
         self.last_fallback_reason: str | None = None
 
+        # Cumulative coasting prediction accuracy (MAE) tracking
+        self.accuracy_count: int = 0
+        self.accuracy_abs_err_sum: float = 0.0
+        self.last_predicted_coast: float | None = None
+        self.last_observed_coast: float | None = None
+        self.last_coast_error: float | None = None
+
+    @property
+    def mean_absolute_error(self) -> float | None:
+        if self.accuracy_count <= 0:
+            return None
+        return round(self.accuracy_abs_err_sum / float(self.accuracy_count), 4)
+
+    def record_prediction_comparison(
+        self, predicted_coast: float, observed_coast: float
+    ) -> float:
+        """Accumulate real-world post-stop coast prediction error (MAE)."""
+        pred = float(predicted_coast)
+        obs = float(observed_coast)
+        err = abs(obs - pred)
+        self.accuracy_count += 1
+        self.accuracy_abs_err_sum += err
+        self.last_predicted_coast = round(pred, 4)
+        self.last_observed_coast = round(obs, 4)
+        self.last_coast_error = round(err, 4)
+        return self.last_coast_error
+
     def get_confidence_stage(
         self, rls_samples: int, valid_cycles: int
     ) -> tuple[ConfidenceStage, float]:
@@ -648,6 +811,11 @@ class TuningSafetyManager:
             "lifetime_applies": self.lifetime_applies,
             "rollback_count": self.rollback_count,
             "last_fallback_reason": self.last_fallback_reason,
+            "accuracy_count": self.accuracy_count,
+            "accuracy_abs_err_sum": self.accuracy_abs_err_sum,
+            "last_predicted_coast": self.last_predicted_coast,
+            "last_observed_coast": self.last_observed_coast,
+            "last_coast_error": self.last_coast_error,
             "active_snapshot": (
                 self.active_snapshot.to_dict() if self.active_snapshot is not None else None
             ),
@@ -660,6 +828,23 @@ class TuningSafetyManager:
         obj.lifetime_applies = int(data.get("lifetime_applies", 0))
         obj.rollback_count = int(data.get("rollback_count", 0))
         obj.last_fallback_reason = data.get("last_fallback_reason")
+        obj.accuracy_count = int(data.get("accuracy_count", 0))
+        obj.accuracy_abs_err_sum = float(data.get("accuracy_abs_err_sum", 0.0))
+        obj.last_predicted_coast = (
+            float(data["last_predicted_coast"])
+            if data.get("last_predicted_coast") is not None
+            else None
+        )
+        obj.last_observed_coast = (
+            float(data["last_observed_coast"])
+            if data.get("last_observed_coast") is not None
+            else None
+        )
+        obj.last_coast_error = (
+            float(data["last_coast_error"])
+            if data.get("last_coast_error") is not None
+            else None
+        )
         snap_raw = data.get("active_snapshot")
         if isinstance(snap_raw, dict):
             obj.active_snapshot = TuningSnapshot.from_dict(snap_raw)

@@ -176,6 +176,8 @@ from .const import (
     CONF_AUX_TEMP_SENSOR,
     CONF_COUPLED_AC,
     CONF_COUPLED_DEHUMIDIFIER,
+    CONF_CUSTOM_COAST_WINDOW_MIN,
+    CONF_CUSTOM_TAU_EM_MIN,
     CONF_INERTIA_PROFILE,
     CONF_MANUAL_OVERRIDE_MIN,
     CONF_MAX_RUN_MIN,
@@ -184,6 +186,7 @@ from .const import (
     CONF_SAFETY_REST_MIN,
     CONF_SEC0_ACTION,
     CONF_SEC0_DELTA,
+    CONF_SOLAR_GUARD,
     CONF_TUNING_MODE,
     CONF_VENT_COOLDOWN_MIN,
     CONF_VENT_DEBOUNCE_SEC,
@@ -191,6 +194,8 @@ from .const import (
     CONF_VENT_MODE,
     CONF_VENT_SENSORS,
     CONF_VENT_SWITCH,
+    DEFAULT_CUSTOM_COAST_WINDOW_MIN,
+    DEFAULT_CUSTOM_TAU_EM_MIN,
     DEFAULT_INERTIA_PROFILE,
     DEFAULT_MANUAL_OVERRIDE_MIN,
     DEFAULT_MAX_RUN_MIN,
@@ -202,6 +207,7 @@ from .const import (
     DEFAULT_SEC0_DELTA_DEHUMIDIFY,
     DEFAULT_SEC0_DELTA_HEAT,
     DEFAULT_SEC0_DELTA_HUMIDIFY,
+    DEFAULT_SOLAR_GUARD,
     DEFAULT_TUNING_MODE,
     DEFAULT_VENT_COOLDOWN_MIN,
     DEFAULT_VENT_DEBOUNCE_SEC,
@@ -501,6 +507,18 @@ def _build_adaptive_learning_section(is_hum: bool, get_val: Any) -> dict[Any, An
                 mode=SelectSelectorMode.DROPDOWN,
             )
         ),
+        vol.Optional(
+            CONF_CUSTOM_COAST_WINDOW_MIN,
+            default=get_val(CONF_CUSTOM_COAST_WINDOW_MIN, DEFAULT_CUSTOM_COAST_WINDOW_MIN),
+        ): NumberSelector(
+            NumberSelectorConfig(min=15, max=720, step=5, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
+        ),
+        vol.Optional(
+            CONF_CUSTOM_TAU_EM_MIN,
+            default=get_val(CONF_CUSTOM_TAU_EM_MIN, DEFAULT_CUSTOM_TAU_EM_MIN),
+        ): NumberSelector(
+            NumberSelectorConfig(min=5, max=180, step=5, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
+        ),
     }
     if is_hum:
         al_schema[
@@ -524,6 +542,12 @@ def _build_adaptive_learning_section(is_hum: bool, get_val: Any) -> dict[Any, An
                 description={"suggested_value": get_val(CONF_COUPLED_DEHUMIDIFIER, None)},
             )
         ] = EntitySelector(EntitySelectorConfig(domain=["humidifier", "switch"]))
+        al_schema[
+            vol.Optional(
+                CONF_SOLAR_GUARD,
+                default=get_val(CONF_SOLAR_GUARD, DEFAULT_SOLAR_GUARD),
+            )
+        ] = BooleanSelector()
 
     al_schema.update(
         {

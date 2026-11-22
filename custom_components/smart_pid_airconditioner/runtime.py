@@ -16,6 +16,8 @@ from .const import (
     CONF_AUX_TEMP_SENSOR,
     CONF_COUPLED_AC,
     CONF_COUPLED_DEHUMIDIFIER,
+    CONF_CUSTOM_COAST_WINDOW_MIN,
+    CONF_CUSTOM_TAU_EM_MIN,
     CONF_INERTIA_PROFILE,
     CONF_KD,
     CONF_KE,
@@ -26,8 +28,14 @@ from .const import (
     CONF_PREDICTION_MODE,
     CONF_RECORDER_BOOTSTRAP,
     CONF_SAFETY_REST_MIN,
+    CONF_SOLAR_GUARD,
     CONF_THERMOSTAT_TYPE,
     CONF_TUNING_MODE,
+    DEFAULT_COAST_WINDOW_FAST_AIR_MIN,
+    DEFAULT_COAST_WINDOW_HIGH_INERTIA_MIN,
+    DEFAULT_CUSTOM_COAST_WINDOW_MIN,
+    DEFAULT_CUSTOM_TAU_EM_MIN,
+    DEFAULT_DEVICE_UNAVAILABLE_GRACE_SEC,
     DEFAULT_INERTIA_PROFILE,
     DEFAULT_KE,
     DEFAULT_KI,
@@ -37,9 +45,11 @@ from .const import (
     DEFAULT_PREDICTION_MODE,
     DEFAULT_RECORDER_BOOTSTRAP,
     DEFAULT_SAFETY_REST_MIN,
+    DEFAULT_SOLAR_GUARD,
     DEFAULT_THERMOSTAT_TYPE,
     DEFAULT_TUNING_MODE,
     DOMAIN,
+    TUNING_MODES,
     TUNING_MODE_AUTO,
     TUNING_MODE_SHADOW,
     is_humidity_type,
@@ -47,6 +57,9 @@ from .const import (
 from .learner import (
     ConfidenceStage,
     CyclePhase,
+    INERTIA_CUSTOM,
+    INERTIA_HIGH_INERTIA,
+    PREDICTION_MODES,
     SimcAutoTuner,
     TuningParameters,
 )
@@ -65,7 +78,6 @@ class SmartPIDRuntime:
         self.entry = entry
         self.store = ModelStore(hass, entry.entry_id)
         self.tuner = SimcAutoTuner()
-        self.snapshot = LearningStateSnapshot(inertia_profile=self._get_setting(CONF_INERTIA_PROFILE, DEFAULT_INERTIA_PROFILE))
 
         self._subscribers: list[Callable[[], None]] = []
         self._unsub_tick: CALLBACK_TYPE | None = None
@@ -76,9 +88,26 @@ class SmartPIDRuntime:
         self.tuning_mode: str = str(self._get_setting(CONF_TUNING_MODE, DEFAULT_TUNING_MODE))
         self.prediction_mode: str = str(self._get_setting(CONF_PREDICTION_MODE, DEFAULT_PREDICTION_MODE))
         self.inertia_profile: str = str(self._get_setting(CONF_INERTIA_PROFILE, DEFAULT_INERTIA_PROFILE))
+        self.custom_coast_window_min: float = float(
+            self._get_setting(CONF_CUSTOM_COAST_WINDOW_MIN, DEFAULT_CUSTOM_COAST_WINDOW_MIN)
+        )
+        self.custom_tau_em_min: float = float(
+            self._get_setting(CONF_CUSTOM_TAU_EM_MIN, DEFAULT_CUSTOM_TAU_EM_MIN)
+        )
+        self.solar_guard_enabled: bool = bool(
+            self._get_setting(CONF_SOLAR_GUARD, DEFAULT_SOLAR_GUARD)
+        )
         self.aux_temp_sensor: str | None = self._get_setting(CONF_AUX_TEMP_SENSOR, None) or None
         self.thermostat_type: str = str(self._get_setting(CONF_THERMOSTAT_TYPE, DEFAULT_THERMOSTAT_TYPE))
         self.is_humidity: bool = is_humidity_type(self.thermostat_type)
+
+        tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
+        self.snapshot = LearningStateSnapshot(
+            inertia_profile=self.inertia_profile,
+            tau_em_min=tau_em,
+            max_coast_window_min=coast_win,
+            peak_confirm_delta=peak_delta,
+        )
 
         self.coupled_dehumidifier: str | None = self._get_setting(CONF_COUPLED_DEHUMIDIFIER, None) or None
         self.coupled_ac: str | None = self._get_setting(CONF_COUPLED_AC, None) or None
@@ -109,6 +138,8 @@ class SmartPIDRuntime:
         self._obs_is_heating: bool = False
         self._obs_vent_status: VentStatus = VentStatus(VentState.NORMAL, False, False, 0, False)
         self._obs_manual_override: bool = False
+        self._obs_device_unavailable: bool = False
+        self._device_unavailable_since: datetime | None = None
 
         # 5-minute RLS block accumulator
         self._block_minutes: int = 0
@@ -157,9 +188,29 @@ class SmartPIDRuntime:
             except Exception:
                 _LOGGER.exception("Error notifying SmartPIDRuntime subscriber")
 
+    def _resolve_coasting_settings(self) -> tuple[float, float, float]:
+        """Resolve (tau_em_min, max_coast_window_min, peak_confirm_delta) for current profile."""
+        if self.inertia_profile == INERTIA_CUSTOM:
+            tau_em = self.custom_tau_em_min
+            coast_win = self.custom_coast_window_min
+        elif self.inertia_profile == INERTIA_HIGH_INERTIA:
+            tau_em = 35.0
+            coast_win = DEFAULT_COAST_WINDOW_HIGH_INERTIA_MIN
+        else:
+            tau_em = 10.0
+            coast_win = DEFAULT_COAST_WINDOW_FAST_AIR_MIN
+        peak_delta = 0.5 if (self.is_humidity and not self.aux_temp_sensor) else 0.1
+        return tau_em, coast_win, peak_delta
+
     async def async_setup(self) -> None:
         """Load persisted state and start 1-minute learning tick."""
-        self.snapshot = await self.store.async_load(inertia_profile=self.inertia_profile)
+        tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
+        self.snapshot = await self.store.async_load(
+            inertia_profile=self.inertia_profile,
+            tau_em_min=tau_em,
+            max_coast_window_min=coast_win,
+            peak_confirm_delta=peak_delta,
+        )
         self.recommended = self.tuner.compute(
             self._active_rls(),
             prediction_mode=self.prediction_mode,
@@ -200,25 +251,60 @@ class SmartPIDRuntime:
         is_heating: bool,
         vent_status: VentStatus,
         manual_override: bool = False,
+        device_unavailable: bool = False,
     ) -> None:
         """Receive latest state observation from climate/humidifier entity."""
+        now = dt_util.utcnow()
+        if device_unavailable:
+            if self._device_unavailable_since is None:
+                self._device_unavailable_since = now
+            unavailable_expired = (
+                (now - self._device_unavailable_since).total_seconds()
+                >= DEFAULT_DEVICE_UNAVAILABLE_GRACE_SEC
+            )
+        else:
+            self._device_unavailable_since = None
+            unavailable_expired = False
+
+        # Preserve last known active state during brief unavailability grace period
+        if not device_unavailable or unavailable_expired:
+            self._obs_is_active = bool(is_active) if not device_unavailable else False
+
         self._obs_indoor = indoor_val
         self._obs_outdoor = outdoor_val
         self._obs_target = target_val
         self._obs_u_effort = max(0.0, min(1.0, float(u_effort)))
-        self._obs_is_active = bool(is_active)
         self._obs_is_heating = bool(is_heating)
         self._obs_vent_status = vent_status
         self._obs_manual_override = bool(manual_override)
+        self._obs_device_unavailable = bool(unavailable_expired)
 
-        if vent_status.should_block_learning or manual_override:
-            reason = "manual_override" if manual_override else (
-                "ventilation_degraded" if vent_status.degraded else "ventilation_contamination"
+        if vent_status.should_block_learning or manual_override or unavailable_expired:
+            reason = (
+                "manual_override"
+                if manual_override
+                else (
+                    "device_unavailable"
+                    if unavailable_expired
+                    else ("ventilation_degraded" if vent_status.degraded else "ventilation_contamination")
+                )
             )
             self.snapshot.coasting.mark_contaminated(reason)
             self._block_contaminated = True
 
         self._notify_subscribers()
+
+    def _is_solar_guard_active(self) -> bool:
+        """Return True when sun is above horizon during heating and solar_guard is enabled."""
+        if not self.solar_guard_enabled or self.is_humidity or not self._obs_is_heating:
+            return False
+        st = self.hass.states.get("sun.sun")
+        if st is None:
+            return False
+        elevation = st.attributes.get("elevation") if isinstance(st.attributes, dict) else None
+        if isinstance(elevation, (int, float)):
+            return str(st.state) == "above_horizon" and float(elevation) > 0.0
+        return str(st.state) == "above_horizon"
 
     def _resolve_learning_values(self) -> tuple[float | None, float | None, str | None]:
         """Return (indoor_learning_val, outdoor_learning_val, fallback_reason)."""
@@ -281,12 +367,30 @@ class SmartPIDRuntime:
         if val_in is None:
             return
 
-        blocked = self._obs_vent_status.should_block_learning or self._obs_manual_override
+        blocked = (
+            self._obs_vent_status.should_block_learning
+            or self._obs_manual_override
+            or self._obs_device_unavailable
+        )
         block_reason = (
             "manual_override"
             if self._obs_manual_override
-            else ("ventilation_degraded" if self._obs_vent_status.degraded else "ventilation_contamination")
+            else (
+                "device_unavailable"
+                if self._obs_device_unavailable
+                else ("ventilation_degraded" if self._obs_vent_status.degraded else "ventilation_contamination")
+            )
         )
+
+        # Resolve target in same domain as val_in (convert target RH% to AH when aux temp active)
+        target_for_cycle = self._obs_target
+        if self.is_humidity and target_for_cycle is not None and fb_reason is None and self.aux_temp_sensor:
+            st_aux = self.hass.states.get(self.aux_temp_sensor)
+            if st_aux is not None and st_aux.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                try:
+                    target_for_cycle = rh_to_ah(float(st_aux.state), float(target_for_cycle))
+                except (ValueError, TypeError):
+                    pass
 
         # 1. Step 4-phase DynamicCoastingLearner (1-minute resolution)
         self.snapshot.coasting.step_cycle(
@@ -297,7 +401,23 @@ class SmartPIDRuntime:
             dt_min=1.0,
             blocked_for_learning=blocked,
             block_reason=block_reason,
+            target_val=target_for_cycle,
+            solar_rising_active=self._is_solar_guard_active(),
         )
+
+        # Feed real-world completed cycle error (MAE) & overshoot into TuningSafetyManager
+        completed = self.snapshot.coasting.consume_completed_cycle()
+        if completed is not None:
+            self.snapshot.safety.record_prediction_comparison(
+                predicted_coast=completed["predicted_coast"],
+                observed_coast=completed["observed_coast"],
+            )
+            self.record_cycle_performance(
+                cycle_mae=completed["coast_error"],
+                cycle_overshoot=completed["overshoot"],
+            )
+            self._dirty = True
+            self.store.async_delay_save(self.snapshot.to_dict, delay=600)
 
         # 2. Accumulate 5-minute block for HuberRLS
         if blocked:
@@ -373,9 +493,10 @@ class SmartPIDRuntime:
                 return manual_kp, manual_ki, manual_ke, reason
 
             prev = TuningParameters(kp=manual_kp, ki=manual_ki, ke=manual_ke)
+            base_mae = self.snapshot.safety.mean_absolute_error
             self.snapshot.safety.begin_application(
                 prev_params=prev,
-                baseline_mae=0.3,
+                baseline_mae=max(0.15, base_mae) if base_mae is not None else 0.3,
                 baseline_overshoot=0.4,
             )
             self._applied_auto_params = self.recommended
@@ -426,9 +547,89 @@ class SmartPIDRuntime:
             return True
         return False
 
+    async def async_set_tuning_mode(self, mode: str) -> None:
+        """Update tuning_mode live without full config entry reload."""
+        if mode not in TUNING_MODES:
+            raise ValueError(f"Unsupported tuning mode: {mode}")
+        if mode == self.tuning_mode:
+            return
+        self.tuning_mode = mode
+        if mode != TUNING_MODE_AUTO:
+            self._applied_auto_params = None
+        new_options = dict(self.entry.options)
+        new_options[CONF_TUNING_MODE] = mode
+        al_sec = new_options.get("adaptive_learning")
+        if isinstance(al_sec, dict):
+            new_options["adaptive_learning"] = {**al_sec, CONF_TUNING_MODE: mode}
+        self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+        self._notify_subscribers()
+
+    async def async_set_prediction_mode(self, mode: str) -> None:
+        """Update SIMC prediction_mode live without full config entry reload."""
+        if mode not in PREDICTION_MODES:
+            raise ValueError(f"Unsupported prediction mode: {mode}")
+        if mode == self.prediction_mode:
+            return
+        self.prediction_mode = mode
+        self.recommended = self.tuner.compute(
+            self._active_rls(),
+            prediction_mode=self.prediction_mode,
+            baseline=self.baseline,
+        )
+        new_options = dict(self.entry.options)
+        new_options[CONF_PREDICTION_MODE] = mode
+        al_sec = new_options.get("adaptive_learning")
+        if isinstance(al_sec, dict):
+            new_options["adaptive_learning"] = {**al_sec, CONF_PREDICTION_MODE: mode}
+        self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+        self._notify_subscribers()
+
+    def get_diagnostics_data(self) -> dict[str, Any]:
+        """Return structured diagnostics snapshot for HA Download Diagnostics."""
+        stage, pct = self.get_confidence()
+        tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
+        return {
+            "entry": {
+                "entry_id": self.entry.entry_id,
+                "title": self.entry.title,
+                "version": self.entry.version,
+                "thermostat_type": self.thermostat_type,
+                "is_humidity": self.is_humidity,
+            },
+            "runtime_config": {
+                "tuning_mode": self.tuning_mode,
+                "prediction_mode": self.prediction_mode,
+                "inertia_profile": self.inertia_profile,
+                "tau_em_min": tau_em,
+                "max_coast_window_min": coast_win,
+                "peak_confirm_delta": peak_delta,
+                "solar_guard_enabled": self.solar_guard_enabled,
+                "aux_temp_sensor": self.aux_temp_sensor,
+                "coupled_dehumidifier": self.coupled_dehumidifier,
+                "coupled_ac": self.coupled_ac,
+                "manual_override_min": self.manual_override_min,
+                "max_run_min": self.max_run_min,
+                "safety_rest_min": self.safety_rest_min,
+            },
+            "confidence": {"stage": stage.value, "percent": pct},
+            "recommended": self.recommended.to_dict(),
+            "applied_auto_params": (
+                self._applied_auto_params.to_dict() if self._applied_auto_params is not None else None
+            ),
+            "fallback_reason": self.fallback_reason,
+            "mean_absolute_error": self.snapshot.safety.mean_absolute_error,
+            "snapshot": self.snapshot.to_dict(),
+        }
+
     async def async_reset_learning(self) -> None:
         """Reset all learned models, coasting history, and safety snapshots."""
-        self.snapshot = LearningStateSnapshot(inertia_profile=self.inertia_profile)
+        tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
+        self.snapshot = LearningStateSnapshot(
+            inertia_profile=self.inertia_profile,
+            tau_em_min=tau_em,
+            max_coast_window_min=coast_win,
+            peak_confirm_delta=peak_delta,
+        )
         self.recommended = self.tuner.compute(
             self._active_rls(),
             prediction_mode=self.prediction_mode,

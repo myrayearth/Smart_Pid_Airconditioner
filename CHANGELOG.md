@@ -7,6 +7,34 @@
 
 ---
 
+## [0.3.0] - 2026-11-22
+
+### 추가 (Added)
+- **사용자 지정 열 관성 프로파일(`custom`) 및 시간 직접 설정 (`const.py`, `learner.py`, `storage.py`, `runtime.py`, `config_flow.py`)**:
+  - `fast_air`(관찰 45분 / τ 10분)·`high_inertia`(관찰 180분 / τ 35분) 외에 **`사용자 지정(custom)`** 프로파일 추가
+  - UI에서 **사용자 지정 코스팅 관찰 최대 창(`custom_coast_window_min`, 15~720분, 기본 90분)** 및 **열 시상수 τ(`custom_tau_em_min`, 5~180분, 기본 25분)**를 직접 지정·저장 가능
+- **UI 설정 엔티티 3종 및 HA 진단 정보 다운로드 (`button.py`, `select.py`, `diagnostics.py`)**:
+  - `SmartPIDResetLearningButton` (`EntityCategory.CONFIG`): 기기 화면 버튼으로 자가학습 모델·코스팅 이력·오차 통계 즉시 초기화
+  - `SmartPIDTuningModeSelect` & `SmartPIDPredictionModeSelect` (`EntityCategory.CONFIG`): 전체 통합구성요소 리로드 없이 `튜닝 모드`·`예측 제어 성향(SIMC)` 실시간 전환
+  - `async_get_config_entry_diagnostics`: 기기 화면에서 구조화된 학습 스냅샷 및 예측 오차 JSON 다운로드 지원
+- **주간 일사량 가드(`solar_guard`) (`const.py`, `config_flow.py`, `learner.py`, `runtime.py`)**:
+  - 난방 제어 시 `sun.sun`이 지평선 위에 있을 때 햇빛 유입으로 발생하는 급격한 온도 상승을 기기 잔열 코스팅으로 오학습하지 않도록 보호 (`solar_gain_contamination` 기각)
+- **스위치 명령 가드(`SwitchCommandGuard`) (`actuator.py`, `climate.py`, `humidifier.py`)**:
+  - `OFF` 명령의 `ON` 선점 취소(generation 기반), `OFF` 상태 확인 대기(`1.5초`) 및 제한적 재시도(`0.3초`·`0.7초`), `ON` 실패 시 안전 `OFF` 복구 적용
+
+### 개선 (Changed)
+- **2단계 연속 반전 코스팅 정점 확정 및 이상치 격리 (`learner.py`)**:
+  - `peak_confirm_delta` 기반 2회 연속 반전 확인으로 센서 노이즈로 인한 조기 정점 판정 방지
+  - 중앙값 대비 극단적 코스팅 이상치는 1회만 발생 시 `inconsistent_coast_outlier`로 격리 보류하고 2회 이상 유사 패턴 관측 시에만 반영
+- **실측 코스팅 MAE 집계 및 5사이클 자동 롤백 실시간 연결 (`learner.py`, `runtime.py`, `sensor.py`)**:
+  - 코스팅 사이클 완료 시 실측 예측 오차(MAE)와 오버슈트를 `TuningSafetyManager`에 실시간 공급해 5사이클 >30% 성능 저하 자동 롤백이 실제 운전 중 작동하도록 개선
+  - `학습 신뢰도` 센서 속성에 `mean_absolute_error`, `comparison_count`, `last_predicted_coast`, `last_observed_coast`, `last_coast_error` 추가 및 `사이클 단계` 센서 속성에 `tau_em_min`, `max_coast_window_min` 노출
+- **대상 기기 `unavailable`/`unknown` 60초 유예 가드 (`runtime.py`, `climate.py`, `humidifier.py`)**:
+  - 일시적(`60초` 미만) 통신 단절 중에는 기존 `_pwm_state` 및 학습 흐름을 유지하고 `60초` 초과 지속 시에만 `device_unavailable` 오염으로 차단
+- **한국어/영어 번역 동기화 및 Stage 6 회귀 테스트 추가 (`strings.json`, `translations/*.json`, `tests/test_stage6_adaptive_enhancements.py`)**
+
+---
+
 ## [0.2.5] - 2026-11-21
 
 ### 수정 (Fixed)

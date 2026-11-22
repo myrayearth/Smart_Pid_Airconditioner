@@ -30,6 +30,9 @@ class LearningStateSnapshot:
         coasting: DynamicCoastingLearner | None = None,
         safety: TuningSafetyManager | None = None,
         inertia_profile: str = INERTIA_FAST_AIR,
+        tau_em_min: float | None = None,
+        max_coast_window_min: float | None = None,
+        peak_confirm_delta: float | None = None,
     ) -> None:
         self.temp_rls = temp_rls or HuberRLS(
             n_features=3,
@@ -41,7 +44,12 @@ class LearningStateSnapshot:
             initial_theta=[0.2, 0.01],
             bounds=[(0.001, 5.0), (0.0001, 0.5)],
         )
-        self.coasting = coasting or DynamicCoastingLearner(inertia_profile=inertia_profile)
+        self.coasting = coasting or DynamicCoastingLearner(
+            inertia_profile=inertia_profile,
+            tau_em_min=tau_em_min,
+            max_coast_window_min=max_coast_window_min,
+            peak_confirm_delta=0.1 if peak_confirm_delta is None else peak_confirm_delta,
+        )
         self.safety = safety or TuningSafetyManager()
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,18 +92,33 @@ class ModelStore:
         )
 
     async def async_load(
-        self, inertia_profile: str = INERTIA_FAST_AIR
+        self,
+        inertia_profile: str = INERTIA_FAST_AIR,
+        *,
+        tau_em_min: float | None = None,
+        max_coast_window_min: float | None = None,
+        peak_confirm_delta: float | None = None,
     ) -> LearningStateSnapshot:
         """Load persisted learning state or return fresh defaults."""
         raw = await self._store.async_load()
         if isinstance(raw, dict):
             try:
                 snap = LearningStateSnapshot.from_dict(raw)
-                snap.coasting.inertia_profile = inertia_profile
+                snap.coasting.apply_profile_settings(
+                    inertia_profile,
+                    tau_em_min=tau_em_min,
+                    max_coast_window_min=max_coast_window_min,
+                    peak_confirm_delta=peak_confirm_delta,
+                )
                 return snap
             except Exception:
                 pass
-        return LearningStateSnapshot(inertia_profile=inertia_profile)
+        return LearningStateSnapshot(
+            inertia_profile=inertia_profile,
+            tau_em_min=tau_em_min,
+            max_coast_window_min=max_coast_window_min,
+            peak_confirm_delta=peak_confirm_delta,
+        )
 
     async def async_save(self, snapshot: LearningStateSnapshot) -> None:
         """Immediately persist learning state."""

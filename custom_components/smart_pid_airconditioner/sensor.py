@@ -90,11 +90,17 @@ class SmartPIDConfidenceSensor(_BaseSmartPIDDiagnosticSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         stage, _ = self._runtime.get_confidence()
+        safety = self._runtime.snapshot.safety
         return {
             "stage": stage.value,
             "rls_samples": self._runtime._active_rls().sample_count,
             "rejected_outliers": self._runtime._active_rls().rejected_outliers,
             "tuning_mode": self._runtime.tuning_mode,
+            "mean_absolute_error": safety.mean_absolute_error,
+            "comparison_count": safety.accuracy_count,
+            "last_predicted_coast": safety.last_predicted_coast,
+            "last_observed_coast": safety.last_observed_coast,
+            "last_coast_error": safety.last_coast_error,
         }
 
 
@@ -114,11 +120,14 @@ class SmartPIDCyclePhaseSensor(_BaseSmartPIDDiagnosticSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         c = self._runtime.snapshot.coasting
+        tau_em, coast_win, _ = self._runtime._resolve_coasting_settings()
         return {
             "accepted_count": c.accepted_count,
             "rejected_counts": dict(c.rejected_counts),
             "last_quality_reason": c.last_quality_reason,
             "inertia_profile": c.inertia_profile,
+            "tau_em_min": tau_em,
+            "max_coast_window_min": coast_win,
         }
 
 

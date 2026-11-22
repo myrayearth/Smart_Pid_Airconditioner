@@ -80,9 +80,12 @@
               "tuning_mode": "Tuning Mode",
               "prediction_mode": "Prediction Profile (SIMC)",
               "inertia_profile": "Thermal Inertia Profile",
+              "custom_coast_window_min": "Custom Max Coasting Window (min)",
+              "custom_tau_em_min": "Custom Thermal Inertia Time Constant τ (min)",
               "aux_temp_sensor": "Auxiliary Indoor Temperature Sensor (for Absolute Humidity)",
               "coupled_dehumidifier": "Coupled Dehumidifier (Heat Compensation)",
               "coupled_ac": "Coupled Air Conditioner (Cooling Interlock)",
+              "solar_guard": "Solar Gain Guard (Heating Coast Protection)",
               "manual_override_min": "Manual Override Grace Period (min)",
               "max_run_min": "Max Continuous Run Watchdog (min, 0=disabled)",
               "safety_rest_min": "Watchdog Forced Rest Duration (min)",
@@ -91,10 +94,13 @@
             "data_description": {
               "tuning_mode": "Shadow Learn keeps manual PID control identical while learning in the background. Switch to Adaptive Auto once confidence reaches Tuned.",
               "prediction_mode": "Selects SIMC auto-tuner responsiveness and switching aggressiveness when Adaptive Auto is active.",
-              "inertia_profile": "Select the thermal/moisture coasting profile matching your HVAC or heating emitter.",
+              "inertia_profile": "Select the thermal/moisture coasting profile matching your HVAC or heating emitter. Choose Custom to use the timing fields below.",
+              "custom_coast_window_min": "Maximum post-stop coasting observation window in minutes when Thermal Inertia Profile is set to Custom (default 90 min).",
+              "custom_tau_em_min": "Initial emitter/room thermal inertia time constant τ in minutes when Thermal Inertia Profile is set to Custom (default 25 min).",
               "aux_temp_sensor": "Optional indoor temperature sensor to convert RH% into absolute humidity (g/m³) for temperature-invariant moisture learning.",
               "coupled_dehumidifier": "Link a co-located dehumidifier so its compressor heat is accounted for in the room thermal model.",
               "coupled_ac": "Link a co-located air conditioner to interlock dehumidifier operation while AC cooling is active.",
+              "solar_guard": "Ignore post-stop temperature rises during heating while sun.sun is above the horizon so daytime solar gain is not mislearned as equipment coasting.",
               "manual_override_min": "Grace period in minutes to pause automatic dispatch after a manual external user change.",
               "max_run_min": "Safety watchdog maximum continuous run duration before forcing a rest break (0 disables).",
               "safety_rest_min": "Forced rest duration when the continuous run watchdog triggers.",
@@ -453,9 +459,12 @@
               "tuning_mode": "Tuning Mode",
               "prediction_mode": "Prediction Profile (SIMC)",
               "inertia_profile": "Thermal Inertia Profile",
+              "custom_coast_window_min": "Custom Max Coasting Window (min)",
+              "custom_tau_em_min": "Custom Thermal Inertia Time Constant τ (min)",
               "aux_temp_sensor": "Auxiliary Indoor Temperature Sensor (for Absolute Humidity)",
               "coupled_dehumidifier": "Coupled Dehumidifier (Heat Compensation)",
               "coupled_ac": "Coupled Air Conditioner (Cooling Interlock)",
+              "solar_guard": "Solar Gain Guard (Heating Coast Protection)",
               "manual_override_min": "Manual Override Grace Period (min)",
               "max_run_min": "Max Continuous Run Watchdog (min, 0=disabled)",
               "safety_rest_min": "Watchdog Forced Rest Duration (min)",
@@ -464,10 +473,13 @@
             "data_description": {
               "tuning_mode": "Shadow Learn keeps manual PID control identical while learning in the background. Switch to Adaptive Auto once confidence reaches Tuned.",
               "prediction_mode": "Selects SIMC auto-tuner responsiveness and switching aggressiveness when Adaptive Auto is active.",
-              "inertia_profile": "Select the thermal/moisture coasting profile matching your HVAC or heating emitter.",
+              "inertia_profile": "Select the thermal/moisture coasting profile matching your HVAC or heating emitter. Choose Custom to use the timing fields below.",
+              "custom_coast_window_min": "Maximum post-stop coasting observation window in minutes when Thermal Inertia Profile is set to Custom (default 90 min).",
+              "custom_tau_em_min": "Initial emitter/room thermal inertia time constant τ in minutes when Thermal Inertia Profile is set to Custom (default 25 min).",
               "aux_temp_sensor": "Optional indoor temperature sensor to convert RH% into absolute humidity (g/m³) for temperature-invariant moisture learning.",
               "coupled_dehumidifier": "Link a co-located dehumidifier so its compressor heat is accounted for in the room thermal model.",
               "coupled_ac": "Link a co-located air conditioner to interlock dehumidifier operation while AC cooling is active.",
+              "solar_guard": "Ignore post-stop temperature rises during heating while sun.sun is above the horizon so daytime solar gain is not mislearned as equipment coasting.",
               "manual_override_min": "Grace period in minutes to pause automatic dispatch after a manual external user change.",
               "max_run_min": "Safety watchdog maximum continuous run duration before forcing a rest break (0 disables).",
               "safety_rest_min": "Forced rest duration when the continuous run watchdog triggers.",
@@ -940,7 +952,8 @@
     "inertia_profile": {
       "options": {
         "fast_air": "Fast Air Circulation (AC / Fan Heater / Humidifier / Dehumidifier)",
-        "high_inertia": "High Thermal Inertia (Radiant Floor / Radiator)"
+        "high_inertia": "High Thermal Inertia (Radiant Floor / Radiator)",
+        "custom": "Custom (Manual Duration)"
       }
     },
     "ventilation_mode": {
@@ -966,6 +979,29 @@
     }
   },
   "entity": {
+    "button": {
+      "reset_learning": {
+        "name": "Reset Self-Learning"
+      }
+    },
+    "select": {
+      "tuning_mode": {
+        "name": "Learning Tuning Mode",
+        "state": {
+          "manual_pid": "Manual PID (Legacy)",
+          "shadow_learn": "Shadow Learn (Background Learning Only)",
+          "adaptive_auto": "Adaptive Auto (Early Stop + Auto Tune)"
+        }
+      },
+      "prediction_mode": {
+        "name": "SIMC Prediction Profile",
+        "state": {
+          "eco": "Eco (Minimal Switching, Gentle Response)",
+          "balanced": "Balanced (Recommended)",
+          "comfort": "Comfort (Fast Setpoint Tracking)"
+        }
+      }
+    },
     "sensor": {
       "learning_confidence": {
         "name": "Learning Confidence",
@@ -986,6 +1022,21 @@
               "shadow_learn": "Shadow learn",
               "adaptive_auto": "Adaptive auto"
             }
+          },
+          "mean_absolute_error": {
+            "name": "Coasting Prediction MAE"
+          },
+          "comparison_count": {
+            "name": "Coasting Prediction Comparisons"
+          },
+          "last_predicted_coast": {
+            "name": "Last Predicted Coast"
+          },
+          "last_observed_coast": {
+            "name": "Last Observed Coast"
+          },
+          "last_coast_error": {
+            "name": "Last Coast Error"
           }
         }
       },
@@ -1002,8 +1053,15 @@
             "name": "Thermal inertia profile",
             "state": {
               "fast_air": "Fast air",
-              "high_inertia": "High inertia"
+              "high_inertia": "High inertia",
+              "custom": "Custom"
             }
+          },
+          "tau_em_min": {
+            "name": "Thermal Time Constant τ (min)"
+          },
+          "max_coast_window_min": {
+            "name": "Max Coasting Window (min)"
           }
         }
       },

@@ -220,6 +220,7 @@ from .const import (
     duration_to_seconds,
     resolve_thermostat_type,
 )
+from .actuator import SwitchCommandGuard
 from .ventilation import VentState, VentStatus, VentilationGuard
 
 _LOGGER = logging.getLogger(__name__)
@@ -408,6 +409,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
         # Guard flags & Stage 4/5 runtime, manual override, watchdog
         self._runtime: Any = getattr(entry, "runtime_data", None)
+        self._switch_guard = SwitchCommandGuard(hass)
+        self._device_unavailable: bool = False
         self._unsub_runtime: CALLBACK_TYPE | None = None
         self._manual_override_until: datetime | None = None
         self._continuous_run_start: datetime | None = None
@@ -1385,6 +1388,16 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             else:
                 self._outdoor_temp = None
 
+    def _is_target_device_unavailable(self) -> bool:
+        """Return True if the active target device state is currently unavailable/unknown."""
+        dev_id = self._active_target_device_id
+        if not dev_id or not self.hass:
+            return self._device_unavailable
+        st = self.hass.states.get(dev_id)
+        if st is not None:
+            self._device_unavailable = st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+        return self._device_unavailable
+
     @callback
     def _async_entity_changed(self, event: Event) -> None:
         """Handle state change event for sensors or slave climate/switch."""
@@ -1423,7 +1436,11 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 if entity_id == self._active_target_device_id:
                     new_state = event.data.get("new_state")
                     if new_state:
-                        self._pwm_state = (new_state.state.lower() == "on")
+                        if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                            self._device_unavailable = True
+                        else:
+                            self._device_unavailable = False
+                            self._pwm_state = (new_state.state.lower() == "on")
                         self.async_write_ha_state()
                 elif (
                     (self._thermostat_type in (THERMOSTAT_TYPE_HEAT_COOL, THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY))
@@ -1437,6 +1454,13 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                         )
                         self._run_async(self._async_turn_off_specific_device(entity_id))
                 return
+
+            new_state = event.data.get("new_state")
+            if new_state:
+                self._device_unavailable = new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+                if self._device_unavailable:
+                    self.async_write_ha_state()
+                    return
 
             if not self._sync_slave_state:
                 return
@@ -2366,6 +2390,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                             is_heating=self._is_heating,
                             vent_status=self._vent_status,
                             manual_override=manual_override_active,
+                            device_unavailable=self._is_target_device_unavailable(),
                         )
 
                 # Branch for switch PWM mode (no climate sections / delta / fan)
@@ -2993,29 +3018,10 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
     # Switch PWM Control Methods
     # ------------------------------------------------------------------
     async def _async_turn_off_specific_device(self, entity_id: str) -> None:
-        """Turn off a specific switch entity immediately."""
+        """Turn off a specific switch entity immediately via SwitchCommandGuard."""
         if not entity_id:
             return
-        target_domain = entity_id.split(".")[0] if "." in entity_id else "homeassistant"
-        try:
-            await self.hass.services.async_call(
-                target_domain,
-                SERVICE_TURN_OFF,
-                {ATTR_ENTITY_ID: entity_id},
-                blocking=True,
-            )
-        except Exception as err:
-            _LOGGER.debug("Failed turning off %s via %s: %s", entity_id, target_domain, err)
-            if target_domain != "homeassistant":
-                try:
-                    await self.hass.services.async_call(
-                        "homeassistant",
-                        SERVICE_TURN_OFF,
-                        {ATTR_ENTITY_ID: entity_id},
-                        blocking=True,
-                    )
-                except Exception:
-                    pass
+        await self._switch_guard.async_turn_off(entity_id, confirm=True)
 
     async def _async_turn_on_switch(self, force: bool = False) -> None:
         """Turn on the target switch with anti-short-cycling delay enforcement."""
@@ -3072,44 +3078,17 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             if inactive_dev and inactive_dev != active_dev:
                 await self._async_turn_off_specific_device(inactive_dev)
 
-        target_domain = (
-            active_dev.split(".")[0]
-            if "." in active_dev
-            else "homeassistant"
-        )
         _LOGGER.info(
             "Turning ON switch %s (duty: %.1f%%, on_time: %.1fs)",
             active_dev,
             self._pwm_duty_cycle,
             self._pwm_on_time,
         )
-        try:
-            await self.hass.services.async_call(
-                target_domain,
-                SERVICE_TURN_ON,
-                {ATTR_ENTITY_ID: active_dev},
-                blocking=True,
-            )
+        if await self._switch_guard.async_turn_on(active_dev, confirm=False):
             self._pwm_state = True
             self._last_switch_on_time = now
             self._last_switch_on_times[active_dev] = now
             self.async_write_ha_state()
-        except Exception as err:
-            _LOGGER.error("Failed to turn on switch %s via %s: %s", active_dev, target_domain, err)
-            if target_domain != "homeassistant":
-                try:
-                    await self.hass.services.async_call(
-                        "homeassistant",
-                        SERVICE_TURN_ON,
-                        {ATTR_ENTITY_ID: active_dev},
-                        blocking=True,
-                    )
-                    self._pwm_state = True
-                    self._last_switch_on_time = now
-                    self._last_switch_on_times[active_dev] = now
-                    self.async_write_ha_state()
-                except Exception as fb_err:
-                    _LOGGER.error("Fallback homeassistant.turn_on failed for %s: %s", active_dev, fb_err)
 
     async def _async_turn_off_switch(self, force: bool = False) -> None:
         """Turn off the target switch with anti-short-cycling delay enforcement."""
@@ -3148,39 +3127,12 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             self._pwm_turn_off_cancel()
             self._pwm_turn_off_cancel = None
 
-        target_domain = (
-            active_dev.split(".")[0]
-            if "." in active_dev
-            else "homeassistant"
-        )
+        self._pwm_state = False
         _LOGGER.info("Turning OFF switch %s", active_dev)
-        try:
-            await self.hass.services.async_call(
-                target_domain,
-                SERVICE_TURN_OFF,
-                {ATTR_ENTITY_ID: active_dev},
-                blocking=True,
-            )
-            self._pwm_state = False
+        if await self._switch_guard.async_turn_off(active_dev, confirm=True):
             self._last_switch_off_time = now
             self._last_switch_off_times[active_dev] = now
-            self.async_write_ha_state()
-        except Exception as err:
-            _LOGGER.error("Failed to turn off switch %s via %s: %s", active_dev, target_domain, err)
-            if target_domain != "homeassistant":
-                try:
-                    await self.hass.services.async_call(
-                        "homeassistant",
-                        SERVICE_TURN_OFF,
-                        {ATTR_ENTITY_ID: active_dev},
-                        blocking=True,
-                    )
-                    self._pwm_state = False
-                    self._last_switch_off_time = now
-                    self._last_switch_off_times[active_dev] = now
-                    self.async_write_ha_state()
-                except Exception as fb_err:
-                    _LOGGER.error("Fallback homeassistant.turn_off failed for %s: %s", active_dev, fb_err)
+        self.async_write_ha_state()
 
     async def _async_stop_pwm(self) -> None:
         """Stop PWM operation and ensure target switch is turned OFF."""

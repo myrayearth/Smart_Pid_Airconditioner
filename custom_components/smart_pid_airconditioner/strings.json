@@ -80,9 +80,12 @@
               "tuning_mode": "튜닝 모드",
               "prediction_mode": "예측 성향 (SIMC)",
               "inertia_profile": "건물/기기 열 관성 프로파일",
+              "custom_coast_window_min": "사용자 지정 코스팅 관찰 최대 창 (분)",
+              "custom_tau_em_min": "사용자 지정 기기/방열 열 시상수 τ (분)",
               "aux_temp_sensor": "보조 실내 온도 센서 (절대습도 g/m³ 변환용)",
               "coupled_dehumidifier": "동일 공간 제습기 (발열 보정용)",
               "coupled_ac": "동일 공간 에어컨 (냉방 중 제습 억제용)",
+              "solar_guard": "일사량 가드 (주간 난방 코스팅 오학습 방지)",
               "manual_override_min": "외부 수동 조작 유예 시간 (분)",
               "max_run_min": "최대 연속 가동 워치독 (분, 0=비활성)",
               "safety_rest_min": "워치독 강제 휴지 시간 (분)",
@@ -91,10 +94,13 @@
             "data_description": {
               "tuning_mode": "관찰 학습(shadow_learn)은 기존 수동 제어를 유지하며 백그라운드에서 학습만 수행합니다. 충분히 학습된 뒤 자가학습 자동 제어(adaptive_auto)로 전환하세요.",
               "prediction_mode": "자가학습 자동 제어 시 SIMC 자동 튜너의 목표 추종 속도와 스위칭 성향을 결정합니다.",
-              "inertia_profile": "냉난방·습도 조절 기기의 잔열/잔냉(코스팅) 반응 특성을 선택합니다.",
+              "inertia_profile": "냉난방·습도 조절 기기의 잔열/잔냉(코스팅) 반응 특성을 선택합니다. '사용자 지정' 선택 시 아래 시간 항목이 적용됩니다.",
+              "custom_coast_window_min": "열 관성 프로파일이 '사용자 지정'일 때 기기 정지 후 잔열/잔냉(코스팅)을 추적할 최대 시간(분)입니다 (기본 90분).",
+              "custom_tau_em_min": "열 관성 프로파일이 '사용자 지정'일 때 초기 예측 감쇠 기준으로 사용하는 열 시상수(분)입니다 (기본 25분).",
               "aux_temp_sensor": "가습/제습 제어 시 온도에 따른 포화수증기 영향을 제거해 절대습도(g/m³) 기준으로 정밀 학습하기 위한 보조 온도 센서입니다.",
               "coupled_dehumidifier": "같은 공간에서 제습기가 가동될 때 발생하는 발열량을 에어컨 열 모델이 외란이 아닌 열원으로 구분해 학습하도록 연동합니다.",
               "coupled_ac": "같은 공간의 에어컨이 냉방 가동 중일 때 과도한 동시 가동을 피하고 제습기 제어를 연동하기 위한 설정입니다.",
+              "solar_guard": "난방 모드에서 태양이 떠 있는 동안(sun.sun 일출 후) 햇빛 유입으로 인한 온도 상승을 기기 잔열 코스팅으로 오학습하지 않도록 보호합니다.",
               "manual_override_min": "리모컨이나 HA 대시보드 등에서 사용자가 기기를 직접 조작하면 지정된 분 동안 자동 개입을 보류합니다.",
               "max_run_min": "기기가 연속으로 이 시간 이상 가동되면 과부하·성능 저하 방지를 위해 강제 휴식(워치독)에 들어갑니다 (0이면 비활성).",
               "safety_rest_min": "최대 연속 가동 워치독이 발동했을 때 기기를 쉬게 하는 휴식 시간입니다.",
@@ -453,9 +459,12 @@
               "tuning_mode": "튜닝 모드",
               "prediction_mode": "예측 성향 (SIMC)",
               "inertia_profile": "건물/기기 열 관성 프로파일",
+              "custom_coast_window_min": "사용자 지정 코스팅 관찰 최대 창 (분)",
+              "custom_tau_em_min": "사용자 지정 기기/방열 열 시상수 τ (분)",
               "aux_temp_sensor": "보조 실내 온도 센서 (절대습도 g/m³ 변환용)",
               "coupled_dehumidifier": "동일 공간 제습기 (발열 보정용)",
               "coupled_ac": "동일 공간 에어컨 (냉방 중 제습 억제용)",
+              "solar_guard": "일사량 가드 (주간 난방 코스팅 오학습 방지)",
               "manual_override_min": "외부 수동 조작 유예 시간 (분)",
               "max_run_min": "최대 연속 가동 워치독 (분, 0=비활성)",
               "safety_rest_min": "워치독 강제 휴지 시간 (분)",
@@ -464,10 +473,13 @@
             "data_description": {
               "tuning_mode": "관찰 학습(shadow_learn)은 기존 수동 제어를 유지하며 백그라운드에서 학습만 수행합니다. 충분히 학습된 뒤 자가학습 자동 제어(adaptive_auto)로 전환하세요.",
               "prediction_mode": "자가학습 자동 제어 시 SIMC 자동 튜너의 목표 추종 속도와 스위칭 성향을 결정합니다.",
-              "inertia_profile": "냉난방·습도 조절 기기의 잔열/잔냉(코스팅) 반응 특성을 선택합니다.",
+              "inertia_profile": "냉난방·습도 조절 기기의 잔열/잔냉(코스팅) 반응 특성을 선택합니다. '사용자 지정' 선택 시 아래 시간 항목이 적용됩니다.",
+              "custom_coast_window_min": "열 관성 프로파일이 '사용자 지정'일 때 기기 정지 후 잔열/잔냉(코스팅)을 추적할 최대 시간(분)입니다 (기본 90분).",
+              "custom_tau_em_min": "열 관성 프로파일이 '사용자 지정'일 때 초기 예측 감쇠 기준으로 사용하는 열 시상수(분)입니다 (기본 25분).",
               "aux_temp_sensor": "가습/제습 제어 시 온도에 따른 포화수증기 영향을 제거해 절대습도(g/m³) 기준으로 정밀 학습하기 위한 보조 온도 센서입니다.",
               "coupled_dehumidifier": "같은 공간에서 제습기가 가동될 때 발생하는 발열량을 에어컨 열 모델이 외란이 아닌 열원으로 구분해 학습하도록 연동합니다.",
               "coupled_ac": "같은 공간의 에어컨이 냉방 가동 중일 때 과도한 동시 가동을 피하고 제습기 제어를 연동하기 위한 설정입니다.",
+              "solar_guard": "난방 모드에서 태양이 떠 있는 동안(sun.sun 일출 후) 햇빛 유입으로 인한 온도 상승을 기기 잔열 코스팅으로 오학습하지 않도록 보호합니다.",
               "manual_override_min": "리모컨이나 HA 대시보드 등에서 사용자가 기기를 직접 조작하면 지정된 분 동안 자동 개입을 보류합니다.",
               "max_run_min": "기기가 연속으로 이 시간 이상 가동되면 과부하·성능 저하 방지를 위해 강제 휴식(워치독)에 들어갑니다 (0이면 비활성).",
               "safety_rest_min": "최대 연속 가동 워치독이 발동했을 때 기기를 쉬게 하는 휴식 시간입니다.",
@@ -940,7 +952,8 @@
     "inertia_profile": {
       "options": {
         "fast_air": "빠른 공기 순환 (에어컨·팬히터·가습기·제습기)",
-        "high_inertia": "고관성 축열 (온돌 바닥난방·라디에이터)"
+        "high_inertia": "고관성 축열 (온돌 바닥난방·라디에이터)",
+        "custom": "사용자 지정 (시간 직접 설정)"
       }
     },
     "ventilation_mode": {
@@ -966,6 +979,29 @@
     }
   },
   "entity": {
+    "button": {
+      "reset_learning": {
+        "name": "자가학습 초기화"
+      }
+    },
+    "select": {
+      "tuning_mode": {
+        "name": "자가학습 튜닝 모드",
+        "state": {
+          "manual_pid": "수동 PID (기존 방식)",
+          "shadow_learn": "관찰 학습 (기존 제어 유지 + 백그라운드 학습)",
+          "adaptive_auto": "자가학습 자동 제어 (조기 종료 + 자동 보정)"
+        }
+      },
+      "prediction_mode": {
+        "name": "예측 제어 성향 (SIMC)",
+        "state": {
+          "eco": "절전 (최소 스위칭·완만한 반응)",
+          "balanced": "균형 (기본 권장)",
+          "comfort": "쾌적 (빠른 목표 추종)"
+        }
+      }
+    },
     "sensor": {
       "learning_confidence": {
         "name": "학습 신뢰도",
@@ -986,6 +1022,21 @@
               "shadow_learn": "관찰 학습",
               "adaptive_auto": "자가학습 자동 제어"
             }
+          },
+          "mean_absolute_error": {
+            "name": "코스팅 예측 평균 절대 오차 (MAE)"
+          },
+          "comparison_count": {
+            "name": "코스팅 예측 검증 횟수"
+          },
+          "last_predicted_coast": {
+            "name": "직전 예측 코스팅량"
+          },
+          "last_observed_coast": {
+            "name": "직전 실측 코스팅량"
+          },
+          "last_coast_error": {
+            "name": "직전 코스팅 예측 오차"
           }
         }
       },
@@ -1002,8 +1053,15 @@
             "name": "열 관성 프로파일",
             "state": {
               "fast_air": "빠른 공기 순환",
-              "high_inertia": "고관성 축열"
+              "high_inertia": "고관성 축열",
+              "custom": "사용자 지정"
             }
+          },
+          "tau_em_min": {
+            "name": "방열/열 시상수 τ (분)"
+          },
+          "max_coast_window_min": {
+            "name": "코스팅 관찰 최대 창 (분)"
           }
         }
       },
