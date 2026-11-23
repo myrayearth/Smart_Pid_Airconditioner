@@ -693,3 +693,80 @@ async def test_single_bound_entity_overrides_and_reset_existing_false(hass) -> N
     assert rt.snapshot.coasting.accepted_count == 3  # 2 existing + 1 new accumulated
     assert res["warnings"]  # missing override_win logged safely as warning without failing
     await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_duration_dict_vent_debounce_and_string_state_sensor(hass) -> None:
+    """DurationSelector dict in options, empty string bounds, list entity_id, and string sensor values."""
+    now = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
+    dt_util.set_utcnow(now)
+
+    entry = ConfigEntry(
+        entry_id="entry_dur_dict",
+        title="Living Room Boiler Dur",
+        data={
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_HEATER,
+            CONF_CONTROL_MODE: CONTROL_MODE_SWITCH_PWM,
+            CONF_INDOOR_SENSOR: "sensor.living_temp",
+            CONF_TARGET_DEVICE: "switch.boiler",
+            CONF_INERTIA_PROFILE: "fast_air",
+            CONF_KP: 20.0,
+            CONF_KI: 0.5,
+            CONF_KE: 0.5,
+        },
+        options={
+            "ventilation": {
+                CONF_VENT_MODE: VENT_MODE_SENSORS,
+                CONF_VENT_SENSORS: ["binary_sensor.win1"],
+                CONF_VENT_DEBOUNCE_SEC: {"hours": 0, "minutes": 0, "seconds": 45},
+                CONF_VENT_COOLDOWN_MIN: 20.0,
+            }
+        },
+        version=2,
+    )
+    climate_eid = "climate.entry_dur_dict"
+    er.async_get(hass).async_register(
+        climate_eid, entry.entry_id, platform=Platform.CLIMATE, unique_id="entry_dur_dict_thermostat"
+    )
+    assert await async_setup_entry(hass, entry) is True
+    rt: SmartPIDRuntime = entry.runtime_data
+    assert rt.get_bootstrap_defaults()["vent_debounce_sec"] == 45
+    assert rt.get_bootstrap_defaults()["vent_cooldown_min"] == 20
+
+    session = FakeInfluxSession()
+    hass._mock_http_session = session
+
+    # Seed indoor temps as strings under 'state' measurement & 'state' field
+    t = now - timedelta(hours=2)
+    session.add_point("state", "boiler", "value", int((t - timedelta(minutes=2)).timestamp() * 1000), 0)
+    temp = 19.0
+    for _ in range(20):
+        ts_ms = int(t.timestamp() * 1000)
+        session.add_point("state", "boiler", "value", ts_ms, 1)
+        session.add_point("state", "living_temp", "state", ts_ms, f"{temp:.2f}")
+        temp += 0.08
+        t += timedelta(minutes=1)
+    for idx, d in enumerate([0.2, 0.2, -0.15, -0.15]):
+        ts_ms = int(t.timestamp() * 1000)
+        if idx == 0:
+            session.add_point("state", "boiler", "value", ts_ms, 0)
+        temp += d
+        session.add_point("state", "living_temp", "state", ts_ms, f"{temp:.2f}")
+        t += timedelta(minutes=1)
+
+    res = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_BOOTSTRAP_INFLUXDB,
+        {
+            "entity_id": [climate_eid],
+            "days": 1.0,
+            "min_indoor_temp": "",
+            "max_indoor_temp": 25.0,
+            "dry_run": True,
+        },
+        return_response=True,
+    )
+    assert res["dry_run"] is True
+    assert res["accepted_cycles"] == 1
+    assert res["rls_updates"] >= 3
+    await async_unload_entry(hass, entry)

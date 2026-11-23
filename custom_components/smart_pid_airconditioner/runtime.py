@@ -76,6 +76,7 @@ from .const import (
     TUNING_MODES,
     TUNING_MODE_AUTO,
     TUNING_MODE_SHADOW,
+    duration_to_seconds,
     is_humidity_type,
 )
 from .learner import (
@@ -694,6 +695,32 @@ class SmartPIDRuntime:
         else:
             primary_dev = target_dev or target_climate or dev_cool or dev_dehum
 
+        raw_vent_sensors = self._get_setting(CONF_VENT_SENSORS, [])
+        if isinstance(raw_vent_sensors, str):
+            vent_sensors = [raw_vent_sensors] if raw_vent_sensors.strip() else []
+        elif isinstance(raw_vent_sensors, (list, tuple, set)):
+            vent_sensors = [str(s) for s in raw_vent_sensors if s]
+        else:
+            vent_sensors = []
+
+        raw_debounce = self._get_setting(CONF_VENT_DEBOUNCE_SEC, DEFAULT_VENT_DEBOUNCE_SEC)
+        vent_debounce_sec = max(
+            0, duration_to_seconds(raw_debounce, DEFAULT_VENT_DEBOUNCE_SEC)
+        )
+
+        raw_cooldown = self._get_setting(CONF_VENT_COOLDOWN_MIN, DEFAULT_VENT_COOLDOWN_MIN)
+        if isinstance(raw_cooldown, dict):
+            vent_cooldown_min = max(
+                0, duration_to_seconds(raw_cooldown, DEFAULT_VENT_COOLDOWN_MIN * 60) // 60
+            )
+        elif raw_cooldown in (None, ""):
+            vent_cooldown_min = DEFAULT_VENT_COOLDOWN_MIN
+        else:
+            try:
+                vent_cooldown_min = max(0, int(float(raw_cooldown)))
+            except (ValueError, TypeError):
+                vent_cooldown_min = DEFAULT_VENT_COOLDOWN_MIN
+
         return {
             "control_mode": control_mode,
             "thermostat_type": t_type,
@@ -708,11 +735,11 @@ class SmartPIDRuntime:
             "device_humidity_entity_id": dev_hum or None,
             "device_dehumidity_entity_id": dev_dehum or None,
             "vent_mode": str(self._get_setting(CONF_VENT_MODE, DEFAULT_VENT_MODE)),
-            "vent_sensors": list(self._get_setting(CONF_VENT_SENSORS, []) or []),
+            "vent_sensors": vent_sensors,
             "vent_logic": str(self._get_setting(CONF_VENT_LOGIC, DEFAULT_VENT_LOGIC)),
             "vent_switch": self._get_setting(CONF_VENT_SWITCH, None) or None,
-            "vent_debounce_sec": int(self._get_setting(CONF_VENT_DEBOUNCE_SEC, DEFAULT_VENT_DEBOUNCE_SEC) or 0),
-            "vent_cooldown_min": int(self._get_setting(CONF_VENT_COOLDOWN_MIN, DEFAULT_VENT_COOLDOWN_MIN) or 0),
+            "vent_debounce_sec": vent_debounce_sec,
+            "vent_cooldown_min": vent_cooldown_min,
         }
 
     async def async_apply_bootstrapped_snapshot(self, snapshot: LearningStateSnapshot) -> None:

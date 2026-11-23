@@ -7,6 +7,18 @@
 
 ---
 
+## [0.4.1] - 2026-11-24
+
+### 수정 (Fixed)
+- **`bootstrap_from_influxdb` 실행 시 `DurationSelector` dict `TypeError` 수정 (`runtime.py`)**:
+  - OptionsFlow에서 `ventilation.vent_debounce_sec`가 `{"hours": 0, "minutes": 0, "seconds": 45}` 딕셔너리 형태로 저장된 엔트리에서 `int()` 변환 시 발생하던 `TypeError`를 `duration_to_seconds()` 변환 및 방어적 타입 파싱으로 해결
+- **InfluxDB 문자열 수치 필드 및 서비스 UI 공란/리스트 입력 방어 (`influxdb_bootstrap.py`, `__init__.py`)**:
+  - 수치형 센서가 문자열 필드(`"state"`)에 저장된 경우에도 `MEAN()` 쿼리 오류 없이 1분 평균 fallback 집계를 지원하도록 보강
+  - 서비스 스키마에서 `entity_id` 리스트 전달 및 선택 숫자 필드의 공란(`""`)/실수(`float`) 입력 허용
+- **회귀 테스트 추가 (`tests/test_influxdb_bootstrap.py`)**
+
+---
+
 ## [0.4.0] - 2026-11-23
 
 ### 추가 (Added)

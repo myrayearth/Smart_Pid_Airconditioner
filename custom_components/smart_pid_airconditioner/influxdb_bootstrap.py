@@ -144,6 +144,7 @@ class _SeriesSpec:
     measurement: str
     field: str
     is_fahrenheit: bool = False
+    is_numeric_field: bool = True
 
 
 class InfluxDBv1Client:
@@ -250,11 +251,14 @@ async def _resolve_series_spec(
             )
             rows = await client.async_query(q)
             if rows:
+                sample_val = rows[0][1]
+                is_num = isinstance(sample_val, (int, float)) and not isinstance(sample_val, bool)
                 return _SeriesSpec(
                     entity_id=entity_id,
                     measurement=meas,
                     field=fld,
                     is_fahrenheit=(is_temperature and meas == "°F"),
+                    is_numeric_field=is_num,
                 )
     return None
 
@@ -267,24 +271,37 @@ async def _fetch_numeric_chunk(
 ) -> dict[int, float]:
     """Query 1-minute aggregated numeric series within [c_start_ms, c_end_ms)."""
     where = _entity_where_clause(spec.entity_id)
-    q = (
-        f'SELECT MEAN("{_escape_ident(spec.field)}") AS val '
-        f'FROM "{_escape_ident(spec.measurement)}" '
-        f"WHERE {where} AND time >= {c_start_ms}ms AND time < {c_end_ms}ms "
-        f"GROUP BY time(1m) fill(none)"
-    )
-    rows = await client.async_query(q)
-    out: dict[int, float] = {}
-    for ts_ms, raw_val in rows:
+    if spec.is_numeric_field:
+        q = (
+            f'SELECT MEAN("{_escape_ident(spec.field)}") AS val '
+            f'FROM "{_escape_ident(spec.measurement)}" '
+            f"WHERE {where} AND time >= {c_start_ms}ms AND time < {c_end_ms}ms "
+            f"GROUP BY time(1m) fill(none)"
+        )
+        rows = await client.async_query(q)
+        out: dict[int, float] = {}
+        for ts_ms, raw_val in rows:
+            num = _parse_float(raw_val)
+            if num is None:
+                continue
+            if spec.is_fahrenheit:
+                num = (num - 32.0) * 5.0 / 9.0
+            m_idx = (ts_ms - c_start_ms) // 60_000
+            if m_idx >= 0:
+                out[m_idx] = num
+        return out
+
+    # Fallback when numeric sensor values were stored as strings (e.g. 'state' field)
+    raw_events = await _fetch_raw_chunk(client, spec, c_start_ms, c_end_ms)
+    buckets: dict[int, list[float]] = {}
+    for m_idx, raw_val in raw_events:
         num = _parse_float(raw_val)
         if num is None:
             continue
         if spec.is_fahrenheit:
             num = (num - 32.0) * 5.0 / 9.0
-        m_idx = (ts_ms - c_start_ms) // 60_000
-        if m_idx >= 0:
-            out[m_idx] = num
-    return out
+        buckets.setdefault(m_idx, []).append(num)
+    return {m_idx: sum(vals) / len(vals) for m_idx, vals in buckets.items()}
 
 
 async def _fetch_pre_chunk_state(
@@ -338,7 +355,8 @@ async def async_bootstrap_from_influxdb(
     database = str(params.get("database") or DEFAULT_INFLUXDB_DATABASE).strip()
     username = params.get("username")
     password = params.get("password")
-    days = int(params.get("days") if params.get("days") is not None else DEFAULT_INFLUXDB_DAYS)
+    raw_days = params.get("days")
+    days = int(float(raw_days)) if raw_days not in (None, "") else DEFAULT_INFLUXDB_DAYS
     if days < 1 or days > MAX_INFLUXDB_DAYS:
         raise ServiceValidationError(
             f"days must be between 1 and {MAX_INFLUXDB_DAYS} (got {days})."

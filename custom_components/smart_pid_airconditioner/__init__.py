@@ -28,18 +28,21 @@ from .runtime import SmartPIDRuntime
 
 _LOGGER = logging.getLogger(__name__)
 
+_OPT_FLOAT = vol.Any(None, "", vol.Coerce(float))
+_OPT_INT = vol.Any(None, "", vol.All(vol.Coerce(float), vol.Coerce(int)))
+
 _BOOTSTRAP_SERVICE_SCHEMA = vol.Schema(
     {
-        vol.Required("entity_id"): str,
+        vol.Required("entity_id"): vol.Any(str, [str]),
         vol.Optional("url"): vol.Any(None, str),
         vol.Optional("database"): vol.Any(None, str),
         vol.Optional("username"): vol.Any(None, str),
         vol.Optional("password"): vol.Any(None, str),
-        vol.Optional("days"): vol.Any(None, vol.Coerce(int)),
-        vol.Optional("min_indoor_temp"): vol.Any(None, vol.Coerce(float)),
-        vol.Optional("max_indoor_temp"): vol.Any(None, vol.Coerce(float)),
-        vol.Optional("min_indoor_humidity"): vol.Any(None, vol.Coerce(float)),
-        vol.Optional("max_indoor_humidity"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("days"): _OPT_INT,
+        vol.Optional("min_indoor_temp"): _OPT_FLOAT,
+        vol.Optional("max_indoor_temp"): _OPT_FLOAT,
+        vol.Optional("min_indoor_humidity"): _OPT_FLOAT,
+        vol.Optional("max_indoor_humidity"): _OPT_FLOAT,
         vol.Optional("indoor_temp_entity_id"): vol.Any(None, str),
         vol.Optional("indoor_humidity_entity_id"): vol.Any(None, str),
         vol.Optional("device_entity_id"): vol.Any(None, str),
@@ -112,7 +115,11 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             await rt.async_reset_learning()
 
     async def _async_handle_bootstrap_influxdb(call: ServiceCall) -> dict[str, Any]:
-        target_entity_id = str(call.data.get("entity_id", "")).strip()
+        raw_eid = call.data.get("entity_id", "")
+        if isinstance(raw_eid, list):
+            target_entity_id = str(raw_eid[0]).strip() if raw_eid else ""
+        else:
+            target_entity_id = str(raw_eid).strip()
         runtime = _resolve_runtime_for_entity(hass, target_entity_id)
         if runtime is None:
             raise HomeAssistantError(
