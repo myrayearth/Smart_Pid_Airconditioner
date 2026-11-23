@@ -332,6 +332,16 @@ DEFAULT_PREDICTION_MODE = "balanced"
 DEFAULT_INERTIA_PROFILE = "fast_air"
 
 SERVICE_RESET_LEARNING = "reset_learning"
+SERVICE_BOOTSTRAP_INFLUXDB = "bootstrap_from_influxdb"
+
+# InfluxDB v1 Historical Bootstrap Constants
+DEFAULT_INFLUXDB_URL = "http://a0d7b954-influxdb:8086"
+DEFAULT_INFLUXDB_DATABASE = "homeassistant"
+DEFAULT_INFLUXDB_DAYS = 365
+MAX_INFLUXDB_DAYS = 1095
+DEFAULT_INFLUXDB_DEVICE_FIELD = "value"
+INFLUXDB_CHUNK_DAYS = 30
+INFLUXDB_MAX_SENSOR_GAP_MIN = 30
 
 # Stage 5: Manual Override, Safety Watchdog, Cross-Coupling, Dual Deadband & Recorder
 CONF_MANUAL_OVERRIDE_MIN = "manual_override_min"

@@ -1086,6 +1086,100 @@
     "reset_learning": {
       "name": "Reset Learning Data",
       "description": "Reset self-learning models, coasting history, and safety snapshots."
+    },
+    "bootstrap_from_influxdb": {
+      "name": "Bootstrap Learning from InfluxDB v1",
+      "description": "Query up to 3 years (1,095 days) of InfluxDB v1 history in 30-day chunks, filter by indoor temperature/humidity bounds, and initialize self-learning models for valid seasonal regimes.",
+      "fields": {
+        "entity_id": {
+          "name": "Target Controller Entity",
+          "description": "Smart PID climate or humidifier entity whose self-learning model will be initialized."
+        },
+        "url": {
+          "name": "InfluxDB URL",
+          "description": "InfluxDB v1 HTTP API base URL (default Add-on hostname: http://a0d7b954-influxdb:8086)."
+        },
+        "database": {
+          "name": "Database Name",
+          "description": "InfluxDB v1 database name to query (default: homeassistant)."
+        },
+        "username": {
+          "name": "Username",
+          "description": "Optional username for InfluxDB HTTP Basic Auth."
+        },
+        "password": {
+          "name": "Password",
+          "description": "Optional password for InfluxDB HTTP Basic Auth (never logged)."
+        },
+        "days": {
+          "name": "Lookback Days",
+          "description": "Number of historical days to query backward from now (1 to 1,095 days, queried in 30-day chunks)."
+        },
+        "min_indoor_temp": {
+          "name": "Min Indoor Temperature (°C)",
+          "description": "Optional lower indoor temperature bound. Minutes below this bound or missing > 30 min are skipped and cleanly abort active cycles."
+        },
+        "max_indoor_temp": {
+          "name": "Max Indoor Temperature (°C)",
+          "description": "Optional upper indoor temperature bound (e.g. 23.5°C to exclude summer off-season when training a winter boiler)."
+        },
+        "min_indoor_humidity": {
+          "name": "Min Indoor Humidity (%)",
+          "description": "Optional lower indoor relative humidity bound (%)."
+        },
+        "max_indoor_humidity": {
+          "name": "Max Indoor Humidity (%)",
+          "description": "Optional upper indoor relative humidity bound (%)."
+        },
+        "indoor_temp_entity_id": {
+          "name": "Indoor Temperature Entity Override",
+          "description": "Optional override; defaults to the controller's configured indoor or auxiliary temperature sensor."
+        },
+        "indoor_humidity_entity_id": {
+          "name": "Indoor Humidity Entity Override",
+          "description": "Optional override; defaults to the humidity controller's indoor sensor or supplies humidity bounds on temperature controllers."
+        },
+        "device_entity_id": {
+          "name": "Control Device Entity Override",
+          "description": "Optional device/switch entity override (defaults to configured target device; supports numeric 1/0)."
+        },
+        "outdoor_entity_id": {
+          "name": "Outdoor Sensor Entity Override",
+          "description": "Optional override; defaults to the controller's configured outdoor sensor."
+        },
+        "ventilation_entity_ids": {
+          "name": "Ventilation Entities Override",
+          "description": "Optional ventilation entities to exclude open/cooldown intervals from learning (defaults to configured ventilation guard)."
+        },
+        "device_field": {
+          "name": "Device Value Field",
+          "description": "InfluxDB field name holding numeric 1/0 or state activity (default: value)."
+        },
+        "indoor_measurement": {
+          "name": "Indoor Measurement Override",
+          "description": "Optional InfluxDB measurement for the primary indoor sensor (auto-discovered if omitted)."
+        },
+        "outdoor_measurement": {
+          "name": "Outdoor Measurement Override",
+          "description": "Optional InfluxDB measurement for the outdoor sensor (auto-discovered if omitted)."
+        },
+        "device_measurement": {
+          "name": "Device Measurement Override",
+          "description": "Optional InfluxDB measurement for the control device (auto-discovered if omitted)."
+        },
+        "ventilation_measurement": {
+          "name": "Ventilation Measurement Override",
+          "description": "Optional InfluxDB measurement for ventilation entities (auto-discovered if omitted)."
+        },
+        "reset_existing": {
+          "name": "Reset Existing Learning State",
+          "description": "Start from a clean snapshot before replaying history, or accumulate onto existing learned parameters."
+        },
+        "dry_run": {
+          "name": "Dry Run (Preview Only)",
+          "description": "Simulate training and return metrics/recommendations without modifying live runtime state or storage."
+        }
+      }
     }
   }
 }

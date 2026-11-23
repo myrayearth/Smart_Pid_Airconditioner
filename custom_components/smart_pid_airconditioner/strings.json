@@ -1086,6 +1086,100 @@
     "reset_learning": {
       "name": "자가학습 데이터 초기화",
       "description": "저장된 열/수분 모델, 코스팅 이력 및 안전 스냅샷을 초기화합니다."
+    },
+    "bootstrap_from_influxdb": {
+      "name": "InfluxDB v1 과거 이력 자가학습 초기화",
+      "description": "InfluxDB v1에서 최대 3년(1,095일) 치 과거 데이터를 30일 청크 단위로 조회하고 실내 온도·습도 범위를 필터링해 유효 계절 구간만 자가학습 모델에 반영합니다.",
+      "fields": {
+        "entity_id": {
+          "name": "대상 제어기 엔티티",
+          "description": "자가학습 모델을 초기화할 Smart PID climate 또는 humidifier 엔티티입니다."
+        },
+        "url": {
+          "name": "InfluxDB 서버 URL",
+          "description": "InfluxDB v1 HTTP API 기본 주소입니다 (기본 Add-on 호스트: http://a0d7b954-influxdb:8086)."
+        },
+        "database": {
+          "name": "데이터베이스 이름",
+          "description": "조회할 InfluxDB v1 데이터베이스 이름입니다 (기본값: homeassistant)."
+        },
+        "username": {
+          "name": "사용자 이름",
+          "description": "InfluxDB HTTP 기본 인증(Basic Auth)이 설정된 경우 입력하는 사용자 이름입니다."
+        },
+        "password": {
+          "name": "비밀번호",
+          "description": "InfluxDB HTTP 기본 인증 비밀번호입니다 (로그에 기록되지 않습니다)."
+        },
+        "days": {
+          "name": "조회 기간 (일)",
+          "description": "현재 시점 기준 과거로 조회할 일수입니다 (1~1,095일, 30일 청크 분할 조회)."
+        },
+        "min_indoor_temp": {
+          "name": "실내 최소 온도 (°C)",
+          "description": "학습에 포함할 실내 온도 하한입니다. 이 온도 미만 구간과 30분 초과 결측 구간은 건너뛰고 진행 중인 사이클을 단절합니다."
+        },
+        "max_indoor_temp": {
+          "name": "실내 최대 온도 (°C)",
+          "description": "학습에 포함할 실내 온도 상한입니다 (예: 겨울 보일러 학습 시 23.5°C 설정으로 여름 비가동 구간 제외)."
+        },
+        "min_indoor_humidity": {
+          "name": "실내 최소 습도 (%)",
+          "description": "학습에 포함할 실내 상대습도 하한(%)입니다."
+        },
+        "max_indoor_humidity": {
+          "name": "실내 최대 습도 (%)",
+          "description": "학습에 포함할 실내 상대습도 상한(%)입니다."
+        },
+        "indoor_temp_entity_id": {
+          "name": "실내 온도 센서 엔티티 (선택 덮어쓰기)",
+          "description": "비워 두면 대상 제어기에 설정된 실내 온도(또는 보조 온도) 센서를 자동으로 사용합니다."
+        },
+        "indoor_humidity_entity_id": {
+          "name": "실내 습도 센서 엔티티 (선택 덮어쓰기)",
+          "description": "비워 두면 습도 제어기의 실내 습도 센서를 자동으로 사용하며, 온도 제어기에서도 습도 범위 필터용으로 지정할 수 있습니다."
+        },
+        "device_entity_id": {
+          "name": "제어 기기 엔티티 (선택 덮어쓰기)",
+          "description": "가동 여부를 읽을 스위치/기기 엔티티입니다 (비워 두면 대상 제어기에 연결된 기기를 사용하며 숫자 1/0을 지원합니다)."
+        },
+        "outdoor_entity_id": {
+          "name": "실외 센서 엔티티 (선택 덮어쓰기)",
+          "description": "비워 두면 대상 제어기에 설정된 실외 센서를 자동으로 사용합니다."
+        },
+        "ventilation_entity_ids": {
+          "name": "환기 센서/스위치 엔티티 (선택 덮어쓰기)",
+          "description": "지정 시 환기 열림 및 닫힘 후 20분 쿨다운 구간을 학습에서 자동 제외합니다 (비우면 기존 환기 설정 사용)."
+        },
+        "device_field": {
+          "name": "기기 상태 필드명",
+          "description": "InfluxDB에서 제어 기기의 1/0 가동 값이 저장된 필드명입니다 (기본값: value)."
+        },
+        "indoor_measurement": {
+          "name": "실내 센서 Measurement (선택)",
+          "description": "비워 두면 온도(°C/°F/state/sensor) 및 습도(%/state) 후보에서 데이터가 있는 measurement를 자동 탐색합니다."
+        },
+        "outdoor_measurement": {
+          "name": "실외 센서 Measurement (선택)",
+          "description": "비워 두면 유형별 후보 measurement에서 자동으로 탐색합니다."
+        },
+        "device_measurement": {
+          "name": "제어 기기 Measurement (선택)",
+          "description": "비워 두면 state/switch/input_boolean 후보에서 자동으로 탐색합니다."
+        },
+        "ventilation_measurement": {
+          "name": "환기 센서 Measurement (선택)",
+          "description": "비워 두면 state/binary_sensor/switch 후보에서 자동으로 탐색합니다."
+        },
+        "reset_existing": {
+          "name": "기존 학습 상태 초기화 후 재생",
+          "description": "켜면 기존 모델을 비우고 처음부터 학습하며, 끄면 기존 수렴 모델 위에 추가 누적 학습합니다."
+        },
+        "dry_run": {
+          "name": "미리보기 (Dry Run)",
+          "description": "켜면 실제 런타임이나 저장소를 수정하지 않고 예상 학습 결과와 추천 PID 값만 반환합니다."
+        }
+      }
     }
   }
 }

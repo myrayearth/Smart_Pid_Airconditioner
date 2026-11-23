@@ -282,6 +282,24 @@ class DynamicCoastingLearner:
         self._last_completed_cycle = None
         return res
 
+    def abort_cycle_to_idle(self) -> None:
+        """Abort any in-progress cycle cleanly to IDLE while keeping learned history/factors."""
+        self.phase = CyclePhase.IDLE
+        self.emitter_charge = 0.0
+        self._active_minutes = 0.0
+        self._coast_minutes = 0.0
+        self._recent_values.clear()
+        self._stop_value = None
+        self._peak_coast_value = None
+        self._stop_slope = 0.0
+        self._stop_charge = 0.0
+        self._predicted_coast_at_stop = 0.0
+        self._stop_target = None
+        self._reversal_step = 0
+        self._reversal_anchor = None
+        self._cycle_contaminated = False
+        self._last_completed_cycle = None
+
     def _reject_cycle(self, reason: str) -> None:
         self.rejected_counts[reason] = self.rejected_counts.get(reason, 0) + 1
         self.last_quality_reason = reason

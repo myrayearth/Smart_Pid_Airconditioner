@@ -7,6 +7,23 @@
 
 ---
 
+## [0.4.0] - 2026-11-23
+
+### 추가 (Added)
+- **InfluxDB v1 장기 과거 이력 자가학습 초기화 서비스 (`influxdb_bootstrap.py`, `__init__.py`, `services.yaml`)**:
+  - 신규 서비스 `smart_pid_airconditioner.bootstrap_from_influxdb` (`SupportsResponse.OPTIONAL`) 등록
+  - 외부 PyPI 패키지 없이 HA 내장 `async_get_clientsession`과 Python 표준 라이브러리만으로 InfluxDB v1 HTTP `GET /query` (`epoch=ms`, `BasicAuth` 비밀번호 비노출) 통신 구현
+  - 최대 **3년(1,095일)** 데이터를 **30일 단위 청크**로 순차 조회하고 각 청크 시작 전 `ORDER BY time DESC LIMIT 1` LOCF 시드 적용
+  - HA InfluxDB 태그 관례(도메인 제거 짧은 ID·전체 ID) 및 유형별 measurement(`°C`/`°F`→°C 자동 환산/`state`/`sensor`, `%`/`state`, `state`/`switch`/`input_boolean` 등) 자동 탐색, 숫자형 `1`/`0` 및 문자열 가동 상태 지원
+  - **계절·구간 분리 필터링(Regime Segmentation)**: `min_indoor_temp` / `max_indoor_temp`, `min_indoor_humidity` / `max_indoor_humidity` 범위 이탈 또는 30분 초과 결측 시 진행 중 `DynamicCoastingLearner` 사이클(`abort_cycle_to_idle`)과 5분 RLS 누적 블록을 즉시 단절하고, 이미 수렴된 모델 파라미터·공분산 행렬·코스팅 계수는 보존해 다년간 동일 계절 데이터 누적 학습 지원
+  - 습도 제어 시 `rh_to_ah()` 절대습도 변환 재생, `VentilationGuard` 기반 환기 및 닫힘 후 20분 쿨다운 차단, `dry_run` 미리보기 모드 지원
+- **코어 런타임·학습기 확장 (`const.py`, `learner.py`, `runtime.py`)**:
+  - `DynamicCoastingLearner.abort_cycle_to_idle()`, `SmartPIDRuntime.get_bootstrap_defaults()`, `SmartPIDRuntime.async_apply_bootstrapped_snapshot()` 추가 및 `entity_registry` 기반 정확한 `entity_id`→`runtime` 매핑 적용
+- **서비스 UI 메타데이터·번역 및 회귀 테스트 추가 (`strings.json`, `translations/*.json`, `tests/conftest.py`, `tests/test_influxdb_bootstrap.py`)**:
+  - `services.yaml` 22개 입력 필드 및 한/영 번역 동기화, Mock InfluxQL 기반 2년 계절 필터·사이클 단절·95일 4청크·습도/환기·`dry_run`·인증/오류 처리 테스트 7종 추가
+
+---
+
 ## [0.3.0] - 2026-11-22
 
 ### 추가 (Added)

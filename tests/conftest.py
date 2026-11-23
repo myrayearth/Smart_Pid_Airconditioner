@@ -168,6 +168,8 @@ def _install_ha_stubs() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, dict[str, Any], bool, Context | None]] = []
             self.handlers: dict[tuple[str, str], Callable] = {}
+            self.schemas: dict[tuple[str, str], Any] = {}
+            self.supports_response: dict[tuple[str, str], Any] = {}
 
         async def async_call(
             self,
@@ -176,14 +178,23 @@ def _install_ha_stubs() -> None:
             service_data: dict[str, Any] | None = None,
             blocking: bool = False,
             context: Context | None = None,
+            return_response: bool = False,
             **kwargs: Any,
-        ) -> None:
-            self.calls.append((domain, service, dict(service_data or {}), blocking, context))
+        ) -> Any:
+            payload = dict(service_data or {})
+            schema = self.schemas.get((domain, service))
+            if schema is not None:
+                payload = schema(payload)
+            self.calls.append((domain, service, payload, blocking, context))
             handler = self.handlers.get((domain, service))
+            res = None
             if handler:
-                res = handler(types.SimpleNamespace(data=dict(service_data or {}), context=context))
+                res = handler(types.SimpleNamespace(data=payload, context=context))
                 if asyncio.iscoroutine(res):
-                    await res
+                    res = await res
+            if return_response:
+                return res
+            return None
 
         def async_register(
             self,
@@ -191,8 +202,13 @@ def _install_ha_stubs() -> None:
             service: str,
             service_func: Callable,
             schema: Any = None,
+            supports_response: Any = None,
         ) -> None:
             self.handlers[(domain, service)] = service_func
+            if schema is not None:
+                self.schemas[(domain, service)] = schema
+            if supports_response is not None:
+                self.supports_response[(domain, service)] = supports_response
 
         def async_remove(self, domain: str, service: str) -> None:
             self.handlers.pop((domain, service), None)
@@ -257,6 +273,11 @@ def _install_ha_stubs() -> None:
         data: dict[str, Any] = field(default_factory=dict)
         context: Context = field(default_factory=Context)
 
+    class SupportsResponse(str, Enum):
+        NONE = "none"
+        OPTIONAL = "optional"
+        ONLY = "only"
+
     core_mod.HomeAssistant = HomeAssistant
     core_mod.State = State
     core_mod.Event = Event
@@ -265,6 +286,19 @@ def _install_ha_stubs() -> None:
     core_mod.EventStateChangedData = EventStateChangedData
     core_mod.CALLBACK_TYPE = Callable[[], None]
     core_mod.callback = callback
+    core_mod.SupportsResponse = SupportsResponse
+
+    # --- homeassistant.exceptions ---
+    exc_mod = _ensure_module("homeassistant.exceptions")
+
+    class HomeAssistantError(Exception):
+        pass
+
+    class ServiceValidationError(HomeAssistantError):
+        pass
+
+    exc_mod.HomeAssistantError = HomeAssistantError
+    exc_mod.ServiceValidationError = ServiceValidationError
 
     # --- homeassistant.config_entries ---
     ce_mod = _ensure_module("homeassistant.config_entries")
@@ -561,17 +595,44 @@ def _install_ha_stubs() -> None:
     class FakeRegistry:
         def __init__(self) -> None:
             self._entities: dict[tuple[Any, str, str], str] = {}
+            self._by_entity_id: dict[str, types.SimpleNamespace] = {}
+
+        def async_register(
+            self,
+            entity_id: str,
+            config_entry_id: str,
+            *,
+            platform: Any = None,
+            domain: str = "smart_pid_airconditioner",
+            unique_id: str | None = None,
+        ) -> None:
+            self._by_entity_id[entity_id] = types.SimpleNamespace(
+                entity_id=entity_id,
+                config_entry_id=config_entry_id,
+                platform=domain,
+                unique_id=unique_id,
+            )
+            if platform is not None and unique_id is not None:
+                self._entities[(platform, domain, unique_id)] = entity_id
+
+        def async_get(self, entity_id: str) -> Any:
+            return self._by_entity_id.get(entity_id)
 
         def async_get_entity_id(self, platform: Any, domain: str, unique_id: str) -> str | None:
             return self._entities.get((platform, domain, unique_id))
 
         def async_remove(self, entity_id: str) -> None:
+            self._by_entity_id.pop(entity_id, None)
             to_del = [k for k, v in self._entities.items() if v == entity_id]
             for k in to_del:
                 del self._entities[k]
 
     _reg = FakeRegistry()
     er_mod.async_get = lambda hass: _reg
+
+    # --- homeassistant.helpers.aiohttp_client ---
+    aiohttp_mod = _ensure_module("homeassistant.helpers.aiohttp_client")
+    aiohttp_mod.async_get_clientsession = lambda hass: getattr(hass, "_mock_http_session", None)
 
     # --- homeassistant.helpers.entity_platform ---
     ep_mod = _ensure_module("homeassistant.helpers.entity_platform")
@@ -769,7 +830,12 @@ def _reset_test_env():
     dt_util.set_utcnow(datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc))
     Store._memory_backing.clear()
     import homeassistant.components.persistent_notification as pn
+    from homeassistant.helpers import entity_registry as er
+
     pn._notifications.clear()
+    reg = er.async_get(None)
+    reg._entities.clear()
+    reg._by_entity_id.clear()
     yield
 
 

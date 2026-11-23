@@ -5,8 +5,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import voluptuous as vol
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 
 from .const import (
     CONF_KI,
@@ -14,12 +19,71 @@ from .const import (
     DEFAULT_THERMOSTAT_TYPE,
     DOMAIN,
     PLATFORMS,
+    SERVICE_BOOTSTRAP_INFLUXDB,
     SERVICE_RESET_LEARNING,
     is_humidity_type,
 )
+from .influxdb_bootstrap import async_bootstrap_from_influxdb
 from .runtime import SmartPIDRuntime
 
 _LOGGER = logging.getLogger(__name__)
+
+_BOOTSTRAP_SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): str,
+        vol.Optional("url"): vol.Any(None, str),
+        vol.Optional("database"): vol.Any(None, str),
+        vol.Optional("username"): vol.Any(None, str),
+        vol.Optional("password"): vol.Any(None, str),
+        vol.Optional("days"): vol.Any(None, vol.Coerce(int)),
+        vol.Optional("min_indoor_temp"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("max_indoor_temp"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("min_indoor_humidity"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("max_indoor_humidity"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("indoor_temp_entity_id"): vol.Any(None, str),
+        vol.Optional("indoor_humidity_entity_id"): vol.Any(None, str),
+        vol.Optional("device_entity_id"): vol.Any(None, str),
+        vol.Optional("outdoor_entity_id"): vol.Any(None, str),
+        vol.Optional("ventilation_entity_ids"): vol.Any(None, str, [str]),
+        vol.Optional("device_field"): vol.Any(None, str),
+        vol.Optional("indoor_measurement"): vol.Any(None, str),
+        vol.Optional("outdoor_measurement"): vol.Any(None, str),
+        vol.Optional("device_measurement"): vol.Any(None, str),
+        vol.Optional("ventilation_measurement"): vol.Any(None, str),
+        vol.Optional("reset_existing"): vol.Any(None, bool),
+        vol.Optional("dry_run"): vol.Any(None, bool),
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+
+def _resolve_runtime_for_entity(
+    hass: HomeAssistant, entity_id: str
+) -> SmartPIDRuntime | None:
+    """Find the SmartPIDRuntime managing a given climate or humidifier entity ID."""
+    runtimes: dict[str, SmartPIDRuntime] = hass.data.get(DOMAIN, {})
+    if not runtimes or not entity_id:
+        return None
+
+    reg = er.async_get(hass)
+    if reg is not None:
+        async_get = getattr(reg, "async_get", None)
+        if callable(async_get):
+            reg_entry = async_get(entity_id)
+            if reg_entry is not None:
+                entry_id = getattr(reg_entry, "config_entry_id", None)
+                if entry_id and entry_id in runtimes:
+                    return runtimes[entry_id]
+
+        for entry_id, rt in runtimes.items():
+            for platform, suffix in (
+                (Platform.CLIMATE, "thermostat"),
+                (Platform.HUMIDIFIER, "humidifier"),
+            ):
+                if reg.async_get_entity_id(platform, DOMAIN, f"{entry_id}_{suffix}") == entity_id:
+                    return rt
+
+    return None
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -36,18 +100,40 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             return
 
         if target_entity_id:
-            for rt in runtimes.values():
+            rt = _resolve_runtime_for_entity(hass, target_entity_id)
+            if rt is not None:
+                await rt.async_reset_learning()
+                return
+            for rt in list(runtimes.values()):
                 await rt.async_reset_learning()
             return
 
         for rt in list(runtimes.values()):
             await rt.async_reset_learning()
 
+    async def _async_handle_bootstrap_influxdb(call: ServiceCall) -> dict[str, Any]:
+        target_entity_id = str(call.data.get("entity_id", "")).strip()
+        runtime = _resolve_runtime_for_entity(hass, target_entity_id)
+        if runtime is None:
+            raise HomeAssistantError(
+                f"Could not find an active Smart PID controller for entity '{target_entity_id}'."
+            )
+        return await async_bootstrap_from_influxdb(hass, runtime, dict(call.data))
+
     if not hass.services.has_service(DOMAIN, SERVICE_RESET_LEARNING):
         hass.services.async_register(
             DOMAIN,
             SERVICE_RESET_LEARNING,
             _async_handle_reset_learning,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_BOOTSTRAP_INFLUXDB):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_BOOTSTRAP_INFLUXDB,
+            _async_handle_bootstrap_influxdb,
+            schema=_BOOTSTRAP_SERVICE_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
         )
 
     return True

@@ -92,9 +92,10 @@ $$\frac{dy}{dt} = \theta_0 \cdot u - \theta_1 \cdot (y_{\text{in}} - y_{\text{ou
 - **예측 성향 (`prediction_mode`)**: 닫힘 루프 시정수 $\tau_c$ 배수를 조절해 목표 추종 성향을 결정합니다 (`절전(eco)` $2.0\theta$ · `균형(balanced)` $1.5\theta$ · `쾌적(comfort)` $1.0\theta$).
 - **드리프트 안전 클램핑**: 수동 설정 기준값 대비 **±50%** 범위 내로만 자동 추천값을 제한해 급격한 발산을 방지합니다.
 
-### 5. 영구 저장 및 선택적 이력 부트스트랩
+### 5. 영구 저장 및 과거 이력 부트스트랩 (Recorder & InfluxDB v1)
 - 학습 모델(`temp_rls`, `hum_rls`, 코스팅 이력, 안전 스냅샷)은 `.storage/smart_pid_airconditioner.<entry_id>`에 **`10분(600초)` 디바운싱 저장**되어 SD 카드/SSD 쓰기 마모를 최소화하며 HA 재시작 후에도 유지됩니다.
 - `recorder_bootstrap` 옵션을 켜면 최초 설치 시 과거 `3일`간의 HA Recorder 이력을 읽어 초기 모델 추정치를 빠르게 형성합니다.
+- 2~3년 치 장기 데이터가 InfluxDB v1(HA Add-on 등)에 축적된 경우 **`smart_pid_airconditioner.bootstrap_from_influxdb`** 서비스를 호출하면 30일 단위 청크 분할 조회와 실내 온·습도 구간 필터링을 통해 비가동 계절을 제외하고 즉시 자가학습 모델을 구축할 수 있습니다.
 
 ---
 
@@ -174,13 +175,30 @@ $$\frac{dy}{dt} = \theta_0 \cdot u - \theta_1 \cdot (y_{\text{in}} - y_{\text{ou
 ### 5단계: 공간 구조 변경·기기 교체 시 초기화
 에어컨/제습기를 새 기기로 교체했거나 방 구조·창호 단열이 크게 바뀐 경우, 기기 화면의 **`자가학습 초기화` 버튼**을 누르거나 개발자 도구 > 동작(서비스)에서 **`smart_pid_airconditioner.reset_learning`**을 호출하면 해당 엔티티의 누적 모델과 스냅샷을 깨끗하게 초기화해 처음부터 다시 학습할 수 있습니다.
 
+### 6단계 (선택): InfluxDB v1 2~3년 치 과거 데이터로 즉시 사전 학습
+이미 Home Assistant Add-on 등의 InfluxDB v1에 과거 데이터가 쌓여 있다면 **개발자 도구 > 동작**에서 `smart_pid_airconditioner.bootstrap_from_influxdb`를 실행해 설치 첫날부터 모델을 완성할 수 있습니다. (먼저 `dry_run: true`로 유효 분 수와 추천 파라미터를 미리 확인한 뒤 `dry_run: false`로 반영하세요.)
+
+```yaml
+action: smart_pid_airconditioner.bootstrap_from_influxdb
+data:
+  entity_id: climate.living_room_boiler
+  url: "http://a0d7b954-influxdb:8086"
+  database: "homeassistant"
+  days: 730
+  min_indoor_temp: 16.0
+  max_indoor_temp: 23.5
+  dry_run: true
+```
+- **계절 분리(Regime Segmentation)**: 지정한 온·습도 `[min, max]` 범위를 벗어나거나 30분을 초과해 센서가 결측되면 진행 중인 사이클과 5분 RLS 블록을 즉시 단절(`IDLE` 리셋)해 여름·겨울 간 가짜 기울기가 섞이지 않으며, 이미 학습된 계절 계수는 유지해 여러 해의 동일 계절을 누적 학습합니다.
+- **자동 탐색 & 호환성**: measurement를 비우면 유형별 후보(`°C`, `°F`, `%`, `state`, `switch`, `input_boolean` 등)와 도메인 제거/포함 `entity_id` 태그를 자동 탐색하며, 스위치 `1/0` 숫자 이력·습도 `rh_to_ah()` 절대습도 변환·환기 20분 쿨다운 차단을 모두 반영합니다.
+
 ---
 
 ## 📁 디렉토리 구조
 
 ```text
 custom_components/smart_pid_airconditioner/
-├── __init__.py           # 통합구성요소 셋업, v1→v2 마이그레이션, reset_learning 서비스 등록
+├── __init__.py           # 통합구성요소 셋업, v1→v2 마이그레이션, reset_learning · bootstrap_from_influxdb 등록
 ├── actuator.py           # SwitchCommandGuard (OFF 선점 취소, 상태 확인, 제한적 재시도, 안전 OFF 복구)
 ├── button.py             # EntityCategory.CONFIG 자가학습 초기화 버튼 엔티티
 ├── climate.py            # ClimateEntity 제어기 (에어컨/히터/겸용 PID, 구간 0~4 및 PWM 디스패처)
@@ -188,12 +206,13 @@ custom_components/smart_pid_airconditioner/
 ├── const.py              # 상수, 기본값, 도메인 및 시간 변환 유틸리티
 ├── diagnostics.py        # Home Assistant Download Diagnostics(진단 정보 JSON 다운로드)
 ├── humidifier.py         # HumidifierEntity 제어기 (가습기/제습기 PID 및 디스패처)
+├── influxdb_bootstrap.py # InfluxDB v1 30일 청크 분할 조회 및 계절 필터 기반 과거 이력 사전 학습 엔진
 ├── learner.py            # 순수 Python 자가학습 엔진 (Huber-RLS, 2단계 정점·이상치 격리 코스팅, SIMC, SafetyManager)
 ├── psychrometrics.py     # Bolton(1980) 상대습도 ↔ 절대습도(g/m³) · 이슬점 변환
 ├── runtime.py            # SmartPIDRuntime (1분 코스팅/5분 RLS 루프, 일사량/통신불능 가드, MAE 롤백, Select 전환)
 ├── select.py             # EntityCategory.CONFIG 리로드 없는 튜닝/예측 모드 Select 엔티티 2종
 ├── sensor.py             # EntityCategory.DIAGNOSTIC 진단 센서 5종
-├── services.yaml         # reset_learning 서비스 스키마
+├── services.yaml         # reset_learning 및 bootstrap_from_influxdb 서비스 스키마
 ├── storage.py            # ModelStore (10분 디바운싱 .storage 영구 저장 및 스냅샷 직렬화)
 ├── ventilation.py        # 4상태 환기 감지기 (디바운스, 쿨다운, 센서 불능 유예)
 ├── manifest.json         # 통합구성요소 메타데이터

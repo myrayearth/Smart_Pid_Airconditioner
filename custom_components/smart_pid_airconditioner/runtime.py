@@ -14,10 +14,12 @@ import homeassistant.util.dt as dt_util
 
 from .const import (
     CONF_AUX_TEMP_SENSOR,
+    CONF_CONTROL_MODE,
     CONF_COUPLED_AC,
     CONF_COUPLED_DEHUMIDIFIER,
     CONF_CUSTOM_COAST_WINDOW_MIN,
     CONF_CUSTOM_TAU_EM_MIN,
+    CONF_INDOOR_SENSOR,
     CONF_INERTIA_PROFILE,
     CONF_KD,
     CONF_KE,
@@ -25,14 +27,28 @@ from .const import (
     CONF_KP,
     CONF_MANUAL_OVERRIDE_MIN,
     CONF_MAX_RUN_MIN,
+    CONF_OUTDOOR_SENSOR,
     CONF_PREDICTION_MODE,
     CONF_RECORDER_BOOTSTRAP,
     CONF_SAFETY_REST_MIN,
     CONF_SOLAR_GUARD,
+    CONF_TARGET_CLIMATE,
+    CONF_TARGET_DEVICE,
+    CONF_TARGET_DEVICE_COOL,
+    CONF_TARGET_DEVICE_DEHUMIDITY,
+    CONF_TARGET_DEVICE_HEAT,
+    CONF_TARGET_DEVICE_HUMIDITY,
     CONF_THERMOSTAT_TYPE,
     CONF_TUNING_MODE,
+    CONF_VENT_COOLDOWN_MIN,
+    CONF_VENT_DEBOUNCE_SEC,
+    CONF_VENT_LOGIC,
+    CONF_VENT_MODE,
+    CONF_VENT_SENSORS,
+    CONF_VENT_SWITCH,
     DEFAULT_COAST_WINDOW_FAST_AIR_MIN,
     DEFAULT_COAST_WINDOW_HIGH_INERTIA_MIN,
+    DEFAULT_CONTROL_MODE,
     DEFAULT_CUSTOM_COAST_WINDOW_MIN,
     DEFAULT_CUSTOM_TAU_EM_MIN,
     DEFAULT_DEVICE_UNAVAILABLE_GRACE_SEC,
@@ -48,7 +64,15 @@ from .const import (
     DEFAULT_SOLAR_GUARD,
     DEFAULT_THERMOSTAT_TYPE,
     DEFAULT_TUNING_MODE,
+    DEFAULT_VENT_COOLDOWN_MIN,
+    DEFAULT_VENT_DEBOUNCE_SEC,
+    DEFAULT_VENT_LOGIC,
+    DEFAULT_VENT_MODE,
     DOMAIN,
+    THERMOSTAT_TYPE_HEAT_COOL,
+    THERMOSTAT_TYPE_HEATER,
+    THERMOSTAT_TYPE_HUMIDIFIER,
+    THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY,
     TUNING_MODES,
     TUNING_MODE_AUTO,
     TUNING_MODE_SHADOW,
@@ -630,6 +654,77 @@ class SmartPIDRuntime:
             max_coast_window_min=coast_win,
             peak_confirm_delta=peak_delta,
         )
+        self.recommended = self.tuner.compute(
+            self._active_rls(),
+            prediction_mode=self.prediction_mode,
+            baseline=self.baseline,
+        )
+        self._applied_auto_params = None
+        self.fallback_reason = None
+        self._block_minutes = 0
+        self._block_start_val = None
+        self._block_end_val = None
+        self._block_u_sum = 0.0
+        self._block_out_diff_sum = 0.0
+        self._block_aux_heat_sum = 0.0
+        self._block_contaminated = False
+        self._dirty = False
+        await self.store.async_save(self.snapshot)
+        self._notify_subscribers()
+
+    def get_bootstrap_defaults(self) -> dict[str, Any]:
+        """Resolve configured sensor, device, and ventilation entity IDs for bootstrapping."""
+        control_mode = str(self._get_setting(CONF_CONTROL_MODE, DEFAULT_CONTROL_MODE))
+        t_type = self.thermostat_type
+        target_dev = self._get_setting(CONF_TARGET_DEVICE, None)
+        target_climate = self._get_setting(CONF_TARGET_CLIMATE, None)
+        dev_cool = self._get_setting(CONF_TARGET_DEVICE_COOL, None)
+        dev_heat = self._get_setting(CONF_TARGET_DEVICE_HEAT, None)
+        dev_hum = self._get_setting(CONF_TARGET_DEVICE_HUMIDITY, None)
+        dev_dehum = self._get_setting(CONF_TARGET_DEVICE_DEHUMIDITY, None)
+
+        if t_type == THERMOSTAT_TYPE_HEAT_COOL:
+            primary_dev = dev_heat or dev_cool or target_dev or target_climate
+        elif t_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
+            primary_dev = dev_hum or dev_dehum or target_dev or target_climate
+        elif t_type == THERMOSTAT_TYPE_HEATER:
+            primary_dev = target_dev or target_climate or dev_heat
+        elif t_type == THERMOSTAT_TYPE_HUMIDIFIER:
+            primary_dev = target_dev or target_climate or dev_hum
+        else:
+            primary_dev = target_dev or target_climate or dev_cool or dev_dehum
+
+        return {
+            "control_mode": control_mode,
+            "thermostat_type": t_type,
+            "is_humidity": self.is_humidity,
+            "is_heating_default": t_type in (THERMOSTAT_TYPE_HEATER, THERMOSTAT_TYPE_HUMIDIFIER),
+            "indoor_sensor": self._get_setting(CONF_INDOOR_SENSOR, None) or None,
+            "outdoor_sensor": self._get_setting(CONF_OUTDOOR_SENSOR, None) or None,
+            "aux_temp_sensor": self.aux_temp_sensor,
+            "device_entity_id": primary_dev or None,
+            "device_cool_entity_id": dev_cool or None,
+            "device_heat_entity_id": dev_heat or None,
+            "device_humidity_entity_id": dev_hum or None,
+            "device_dehumidity_entity_id": dev_dehum or None,
+            "vent_mode": str(self._get_setting(CONF_VENT_MODE, DEFAULT_VENT_MODE)),
+            "vent_sensors": list(self._get_setting(CONF_VENT_SENSORS, []) or []),
+            "vent_logic": str(self._get_setting(CONF_VENT_LOGIC, DEFAULT_VENT_LOGIC)),
+            "vent_switch": self._get_setting(CONF_VENT_SWITCH, None) or None,
+            "vent_debounce_sec": int(self._get_setting(CONF_VENT_DEBOUNCE_SEC, DEFAULT_VENT_DEBOUNCE_SEC) or 0),
+            "vent_cooldown_min": int(self._get_setting(CONF_VENT_COOLDOWN_MIN, DEFAULT_VENT_COOLDOWN_MIN) or 0),
+        }
+
+    async def async_apply_bootstrapped_snapshot(self, snapshot: LearningStateSnapshot) -> None:
+        """Atomically replace learning snapshot from historical bootstrap, persist, and notify."""
+        tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
+        snapshot.coasting.apply_profile_settings(
+            self.inertia_profile,
+            tau_em_min=tau_em,
+            max_coast_window_min=coast_win,
+            peak_confirm_delta=peak_delta,
+        )
+        self.snapshot = snapshot
         self.recommended = self.tuner.compute(
             self._active_rls(),
             prediction_mode=self.prediction_mode,

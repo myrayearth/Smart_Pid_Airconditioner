@@ -15,3 +15,192 @@ reset_learning:
       selector:
         entity:
           integration: smart_pid_airconditioner
+
+bootstrap_from_influxdb:
+  name: Bootstrap Learning from InfluxDB v1
+  description: Query InfluxDB v1 historical data with indoor temperature/humidity range filtering and replay it into the self-learning model.
+  fields:
+    entity_id:
+      name: Target Controller Entity
+      description: Smart PID climate or humidifier entity whose learning model will be initialized.
+      required: true
+      selector:
+        entity:
+          integration: smart_pid_airconditioner
+          domain:
+            - climate
+            - humidifier
+    url:
+      name: InfluxDB URL
+      description: Base HTTP URL of the InfluxDB v1 server (default Add-on hostname).
+      required: false
+      default: "http://a0d7b954-influxdb:8086"
+      selector:
+        text:
+    database:
+      name: Database Name
+      description: InfluxDB v1 database name.
+      required: false
+      default: "homeassistant"
+      selector:
+        text:
+    username:
+      name: Username
+      description: Optional HTTP Basic Auth username for InfluxDB.
+      required: false
+      selector:
+        text:
+    password:
+      name: Password
+      description: Optional HTTP Basic Auth password for InfluxDB.
+      required: false
+      selector:
+        text:
+          type: password
+    days:
+      name: Lookback Days
+      description: Number of historical days to query (1 to 1095 days, queried in 30-day chunks).
+      required: false
+      default: 365
+      selector:
+        number:
+          min: 1
+          max: 1095
+          step: 1
+          unit_of_measurement: days
+          mode: box
+    min_indoor_temp:
+      name: Min Indoor Temperature
+      description: Optional lower indoor temperature bound (°C). Data below this bound is skipped and aborts active cycles cleanly.
+      required: false
+      selector:
+        number:
+          min: -20
+          max: 50
+          step: 0.5
+          unit_of_measurement: "°C"
+          mode: box
+    max_indoor_temp:
+      name: Max Indoor Temperature
+      description: Optional upper indoor temperature bound (°C). Data above this bound is skipped and aborts active cycles cleanly.
+      required: false
+      selector:
+        number:
+          min: -20
+          max: 50
+          step: 0.5
+          unit_of_measurement: "°C"
+          mode: box
+    min_indoor_humidity:
+      name: Min Indoor Humidity
+      description: Optional lower indoor relative humidity bound (%).
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: box
+    max_indoor_humidity:
+      name: Max Indoor Humidity
+      description: Optional upper indoor relative humidity bound (%).
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: box
+    indoor_temp_entity_id:
+      name: Indoor Temperature Entity Override
+      description: Optional indoor temperature sensor entity ID (defaults to entity configured sensor).
+      required: false
+      selector:
+        entity:
+          domain:
+            - sensor
+    indoor_humidity_entity_id:
+      name: Indoor Humidity Entity Override
+      description: Optional indoor humidity sensor entity ID (defaults to entity configured sensor for humidity controllers).
+      required: false
+      selector:
+        entity:
+          domain:
+            - sensor
+    device_entity_id:
+      name: Control Device Entity Override
+      description: Optional switch or slave climate/humidifier entity ID (defaults to entity configured target device).
+      required: false
+      selector:
+        entity:
+          domain:
+            - switch
+            - input_boolean
+            - climate
+            - humidifier
+    outdoor_entity_id:
+      name: Outdoor Sensor Entity Override
+      description: Optional outdoor temperature or humidity sensor entity ID.
+      required: false
+      selector:
+        entity:
+          domain:
+            - sensor
+    ventilation_entity_ids:
+      name: Ventilation Sensor Entities Override
+      description: Optional list of window/door/ventilation entities used to block learning during ventilation & cooldown.
+      required: false
+      selector:
+        entity:
+          domain:
+            - binary_sensor
+            - switch
+            - input_boolean
+          multiple: true
+    device_field:
+      name: Device Value Field
+      description: Field name in InfluxDB containing switch/device state (default is value for numeric 1/0).
+      required: false
+      default: "value"
+      selector:
+        text:
+    indoor_measurement:
+      name: Indoor Measurement Override
+      description: Optional InfluxDB measurement for the primary indoor sensor (auto-discovered if omitted).
+      required: false
+      selector:
+        text:
+    outdoor_measurement:
+      name: Outdoor Measurement Override
+      description: Optional InfluxDB measurement for the outdoor sensor (auto-discovered if omitted).
+      required: false
+      selector:
+        text:
+    device_measurement:
+      name: Device Measurement Override
+      description: Optional InfluxDB measurement for the target device (auto-discovered if omitted).
+      required: false
+      selector:
+        text:
+    ventilation_measurement:
+      name: Ventilation Measurement Override
+      description: Optional InfluxDB measurement for ventilation entities (auto-discovered if omitted).
+      required: false
+      selector:
+        text:
+    reset_existing:
+      name: Reset Existing Learning State
+      description: Reset current learned snapshot before replaying historical data, or accumulate on top of existing state.
+      required: false
+      default: true
+      selector:
+        boolean:
+    dry_run:
+      name: Dry Run (Preview Only)
+      description: When enabled, simulates training and returns metrics without modifying live runtime or storage.
+      required: false
+      default: true
+      selector:
+        boolean:
