@@ -11,11 +11,10 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, PERCENTAGE, UnitOfTemperature
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .config_utils import SmartPIDRuntimeEntityMixin
 from .learner import CyclePhase
 from .runtime import SmartPIDRuntime
 from .ventilation import VentState
@@ -40,37 +39,13 @@ async def async_setup_entry(
     )
 
 
-class _BaseSmartPIDDiagnosticSensor(SensorEntity):
+class _BaseSmartPIDDiagnosticSensor(SmartPIDRuntimeEntityMixin, SensorEntity):
     """Base diagnostic sensor subscribed to SmartPIDRuntime."""
 
-    _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime, key: str) -> None:
-        self._entry = entry
-        self._runtime = runtime
-        self._attr_unique_id = f"{entry.entry_id}_{key}"
-        self._attr_translation_key = key
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=entry.title,
-            manufacturer="Smart PID",
-            model="Smart PID Controller",
-        )
-        self._unsub: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        self._unsub = self._runtime.subscribe(self._on_runtime_update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub is not None:
-            self._unsub()
-            self._unsub = None
-
-    @callback
-    def _on_runtime_update(self) -> None:
-        self.async_write_ha_state()
+        self._init_runtime_entity(entry, runtime, key)
 
 
 class SmartPIDConfidenceSensor(_BaseSmartPIDDiagnosticSensor):

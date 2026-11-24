@@ -223,6 +223,22 @@ from .const import (
     resolve_thermostat_type,
 )
 from .actuator import SwitchCommandGuard
+from .config_utils import (
+    SmartPIDExtraStoredData,
+    build_device_info,
+    build_ventilation_guard,
+    get_entry_setting,
+    is_state_unavailable,
+    parse_humidity_state,
+    parse_temperature_state,
+    run_async_on_loop,
+)
+from .pid_core import (
+    compute_effective_min_off,
+    compute_pid_step,
+    determine_active_section,
+    evaluate_sensor_recovery,
+)
 from .ventilation import VentState, VentStatus, VentilationGuard
 
 _LOGGER = logging.getLogger(__name__)
@@ -276,56 +292,6 @@ async def async_setup_entry(
     async_add_entities([SmartPIDThermostatEntity(hass, entry)], True)
 
 
-@dataclass
-class SmartPIDExtraStoredData(ExtraStoredData):
-    """Extra stored data for Smart PID Thermostat / Humidifier state restoration."""
-
-    last_switch_on_times: dict[str, str]
-    last_switch_off_times: dict[str, str]
-    active_section: int
-    integral: float
-    last_run_duration_sec: float = 0.0
-
-    def as_dict(self) -> dict[str, Any]:
-        """Return a dict representation of the extra data."""
-        return {
-            "last_switch_on_times": dict(self.last_switch_on_times),
-            "last_switch_off_times": dict(self.last_switch_off_times),
-            "active_section": self.active_section,
-            "integral": self.integral,
-            "last_run_duration_sec": self.last_run_duration_sec,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> SmartPIDExtraStoredData | None:
-        """Initialize extra stored data from a dict."""
-        if not isinstance(data, dict):
-            return None
-        try:
-            on_times = {
-                str(k): str(v)
-                for k, v in (data.get("last_switch_on_times") or {}).items()
-                if v is not None
-            }
-            off_times = {
-                str(k): str(v)
-                for k, v in (data.get("last_switch_off_times") or {}).items()
-                if v is not None
-            }
-            active_sec = int(data.get("active_section", 1))
-            integral = float(data.get("integral", 0.0))
-            last_run_dur = max(0.0, float(data.get("last_run_duration_sec", 0.0)))
-            return cls(
-                last_switch_on_times=on_times,
-                last_switch_off_times=off_times,
-                active_section=active_sec,
-                integral=integral,
-                last_run_duration_sec=last_run_dur,
-            )
-        except (ValueError, TypeError):
-            return None
-
-
 class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
     """Smart PID Thermostat Climate Entity."""
 
@@ -338,12 +304,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self._entry = entry
         self._attr_unique_id = f"{entry.entry_id}_thermostat"
         self._attr_name = None
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=entry.title,
-            manufacturer="Smart PID",
-            model="Smart PID Controller",
-        )
+        self._attr_device_info = build_device_info(entry)
 
         # Lock to prevent concurrent calculation loops and race conditions
         self._calc_lock = asyncio.Lock()
@@ -431,61 +392,11 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
     def _run_async(self, coro) -> None:
         """Execute a coroutine safely on the Home Assistant event loop."""
-        try:
-            loop = self.hass.loop
-            if loop.is_running():
-                loop.call_soon_threadsafe(lambda: self.hass.async_create_task(coro))
-            else:
-                self.hass.async_create_task(coro)
-        except Exception:
-            self.hass.async_create_task(coro)
+        run_async_on_loop(self.hass, coro)
 
     def _get_setting(self, key: str, default: Any) -> Any:
         """Helper to get value from options first, then entry data, then default, checking nested sections."""
-        target_sec = None
-        for i in range(1, 5):
-            if key.startswith(f"sec{i}_"):
-                target_sec = f"section_{i}"
-                break
-
-        # If key belongs to a section, check options[section_X][key] first
-        if target_sec and target_sec in self._entry.options:
-            sec_dict = self._entry.options[target_sec]
-            if isinstance(sec_dict, dict) and key in sec_dict and sec_dict[key] is not None:
-                return sec_dict[key]
-
-        # Check top-level options
-        val = self._entry.options.get(key)
-        if val is not None:
-            return val
-
-        # Check all sections in options
-        for sec in ("ki_group", "section_0", "section_1", "section_2", "section_3", "section_4", "ventilation"):
-            sec_dict = self._entry.options.get(sec)
-            if isinstance(sec_dict, dict):
-                sec_val = sec_dict.get(key)
-                if sec_val is not None:
-                    return sec_val
-
-        # Check target section in entry data
-        if target_sec and target_sec in self._entry.data:
-            sec_dict = self._entry.data[target_sec]
-            if isinstance(sec_dict, dict) and key in sec_dict and sec_dict[key] is not None:
-                return sec_dict[key]
-
-        # Check top-level entry data
-        val = self._entry.data.get(key)
-        if val is not None:
-            return val
-
-        # Check all sections in entry data
-        for sec in ("ki_group", "section_0", "section_1", "section_2", "section_3", "section_4", "ventilation"):
-            sec_dict = self._entry.data.get(sec)
-            if isinstance(sec_dict, dict):
-                sec_val = sec_dict.get(key)
-                if sec_val is not None:
-                    return sec_val
-        return default
+        return get_entry_setting(self._entry, key, default)
 
     def _load_config(self) -> None:
         """Load configuration parameters."""
@@ -608,95 +519,32 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     if isinstance(f_modes, list) and f_modes:
                         self._available_fan_modes = list(dict.fromkeys(str(m) for m in f_modes))
 
-        # Sections
-        self._sec1_max: float = float(
-            self._get_setting(CONF_SEC1_MAX, DEFAULT_SEC1_MAX)
+        # Sections 1..4
+        _sec_defaults = (
+            (1, DEFAULT_SEC1_MAX, DEFAULT_SEC1_DELTA, DEFAULT_SEC1_FAN),
+            (2, DEFAULT_SEC2_MAX, DEFAULT_SEC2_DELTA, DEFAULT_SEC2_FAN),
+            (3, DEFAULT_SEC3_MAX, DEFAULT_SEC3_DELTA, DEFAULT_SEC3_FAN),
+            (4, None, DEFAULT_SEC4_DELTA, DEFAULT_SEC4_FAN),
         )
-        self._sec1_apply_temp: bool = bool(
-            self._get_setting(CONF_SEC1_APPLY_TEMP, DEFAULT_SEC_APPLY_TEMP)
-        )
-        self._sec1_apply_delta: bool = self._sec1_apply_temp
-        self._sec1_delta: float = float(
-            self._get_setting(CONF_SEC1_DELTA, DEFAULT_SEC1_DELTA)
-        )
-        self._sec1_apply_fan: bool = bool(
-            self._get_setting(CONF_SEC1_APPLY_FAN, DEFAULT_SEC_APPLY_FAN)
-        )
-        self._sec1_fan: str = str(self._get_setting(CONF_SEC1_FAN, DEFAULT_SEC1_FAN))
-        self._sec1_apply_hvac_mode: bool = bool(
-            self._get_setting(
-                CONF_SEC1_APPLY_HVAC_MODE, DEFAULT_SEC_APPLY_HVAC_MODE
+        for idx, def_max, def_delta, def_fan in _sec_defaults:
+            if def_max is not None:
+                setattr(self, f"_sec{idx}_max", float(self._get_setting(f"sec{idx}_max", def_max)))
+            apply_temp = bool(self._get_setting(f"sec{idx}_apply_temp", DEFAULT_SEC_APPLY_TEMP))
+            setattr(self, f"_sec{idx}_apply_temp", apply_temp)
+            setattr(self, f"_sec{idx}_apply_delta", apply_temp)
+            setattr(self, f"_sec{idx}_delta", float(self._get_setting(f"sec{idx}_delta", def_delta)))
+            setattr(self, f"_sec{idx}_apply_fan", bool(self._get_setting(f"sec{idx}_apply_fan", DEFAULT_SEC_APPLY_FAN)))
+            setattr(self, f"_sec{idx}_fan", str(self._get_setting(f"sec{idx}_fan", def_fan)))
+            setattr(
+                self,
+                f"_sec{idx}_apply_hvac_mode",
+                bool(self._get_setting(f"sec{idx}_apply_hvac_mode", DEFAULT_SEC_APPLY_HVAC_MODE)),
             )
-        )
-        self._sec1_hvac_mode: str = str(
-            self._get_setting(CONF_SEC1_HVAC_MODE, DEFAULT_SEC_HVAC_MODE)
-        )
-
-        self._sec2_max: float = float(
-            self._get_setting(CONF_SEC2_MAX, DEFAULT_SEC2_MAX)
-        )
-        self._sec2_apply_temp: bool = bool(
-            self._get_setting(CONF_SEC2_APPLY_TEMP, DEFAULT_SEC_APPLY_TEMP)
-        )
-        self._sec2_apply_delta: bool = self._sec2_apply_temp
-        self._sec2_delta: float = float(
-            self._get_setting(CONF_SEC2_DELTA, DEFAULT_SEC2_DELTA)
-        )
-        self._sec2_apply_fan: bool = bool(
-            self._get_setting(CONF_SEC2_APPLY_FAN, DEFAULT_SEC_APPLY_FAN)
-        )
-        self._sec2_fan: str = str(self._get_setting(CONF_SEC2_FAN, DEFAULT_SEC2_FAN))
-        self._sec2_apply_hvac_mode: bool = bool(
-            self._get_setting(
-                CONF_SEC2_APPLY_HVAC_MODE, DEFAULT_SEC_APPLY_HVAC_MODE
+            setattr(
+                self,
+                f"_sec{idx}_hvac_mode",
+                str(self._get_setting(f"sec{idx}_hvac_mode", DEFAULT_SEC_HVAC_MODE)),
             )
-        )
-        self._sec2_hvac_mode: str = str(
-            self._get_setting(CONF_SEC2_HVAC_MODE, DEFAULT_SEC_HVAC_MODE)
-        )
-
-        self._sec3_max: float = float(
-            self._get_setting(CONF_SEC3_MAX, DEFAULT_SEC3_MAX)
-        )
-        self._sec3_apply_temp: bool = bool(
-            self._get_setting(CONF_SEC3_APPLY_TEMP, DEFAULT_SEC_APPLY_TEMP)
-        )
-        self._sec3_apply_delta: bool = self._sec3_apply_temp
-        self._sec3_delta: float = float(
-            self._get_setting(CONF_SEC3_DELTA, DEFAULT_SEC3_DELTA)
-        )
-        self._sec3_apply_fan: bool = bool(
-            self._get_setting(CONF_SEC3_APPLY_FAN, DEFAULT_SEC_APPLY_FAN)
-        )
-        self._sec3_fan: str = str(self._get_setting(CONF_SEC3_FAN, DEFAULT_SEC3_FAN))
-        self._sec3_apply_hvac_mode: bool = bool(
-            self._get_setting(
-                CONF_SEC3_APPLY_HVAC_MODE, DEFAULT_SEC_APPLY_HVAC_MODE
-            )
-        )
-        self._sec3_hvac_mode: str = str(
-            self._get_setting(CONF_SEC3_HVAC_MODE, DEFAULT_SEC_HVAC_MODE)
-        )
-
-        self._sec4_apply_temp: bool = bool(
-            self._get_setting(CONF_SEC4_APPLY_TEMP, DEFAULT_SEC_APPLY_TEMP)
-        )
-        self._sec4_apply_delta: bool = self._sec4_apply_temp
-        self._sec4_delta: float = float(
-            self._get_setting(CONF_SEC4_DELTA, DEFAULT_SEC4_DELTA)
-        )
-        self._sec4_apply_fan: bool = bool(
-            self._get_setting(CONF_SEC4_APPLY_FAN, DEFAULT_SEC_APPLY_FAN)
-        )
-        self._sec4_fan: str = str(self._get_setting(CONF_SEC4_FAN, DEFAULT_SEC4_FAN))
-        self._sec4_apply_hvac_mode: bool = bool(
-            self._get_setting(
-                CONF_SEC4_APPLY_HVAC_MODE, DEFAULT_SEC_APPLY_HVAC_MODE
-            )
-        )
-        self._sec4_hvac_mode: str = str(
-            self._get_setting(CONF_SEC4_HVAC_MODE, DEFAULT_SEC_HVAC_MODE)
-        )
 
         # Section 0 (Standby / Early-Stop) settings
         self._sec0_action: str = str(
@@ -718,27 +566,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         )
 
         # Ventilation Guard settings
-        vent_mode = str(self._get_setting(CONF_VENT_MODE, DEFAULT_VENT_MODE))
-        vent_sensors = self._get_setting(CONF_VENT_SENSORS, []) or []
-        if isinstance(vent_sensors, str):
-            vent_sensors = [vent_sensors] if vent_sensors else []
-        vent_logic = str(self._get_setting(CONF_VENT_LOGIC, DEFAULT_VENT_LOGIC))
-        vent_switch = self._get_setting(CONF_VENT_SWITCH, None)
-        vent_debounce = duration_to_seconds(
-            self._get_setting(CONF_VENT_DEBOUNCE_SEC, DEFAULT_VENT_DEBOUNCE_SEC),
-            DEFAULT_VENT_DEBOUNCE_SEC,
-        )
-        vent_cooldown = int(
-            float(self._get_setting(CONF_VENT_COOLDOWN_MIN, DEFAULT_VENT_COOLDOWN_MIN))
-        )
-        self._vent_guard = VentilationGuard(
-            mode=vent_mode,
-            sensors=list(vent_sensors),
-            logic=vent_logic,
-            switch_entity=str(vent_switch) if vent_switch else None,
-            debounce_sec=vent_debounce,
-            cooldown_min=vent_cooldown,
-        )
+        self._vent_guard = build_ventilation_guard(self._get_setting)
 
         # Stage 5: Manual override grace & safety watchdog
         self._manual_override_min: int = int(
@@ -1245,107 +1073,12 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
     @staticmethod
     def _parse_temperature(state_obj: Any) -> float | None:
         """Safely extract float temperature from entity state or attributes."""
-        if not state_obj:
-            return None
-
-        state_val = state_obj.state
-        if state_val in (STATE_UNAVAILABLE, STATE_UNKNOWN, None):
-            return None
-
-        if isinstance(state_val, str):
-            cleaned_state = state_val.strip().lower()
-            if cleaned_state in ("unknown", "unavailable", "none", "null", "restored", ""):
-                return None
-
-            # Clean common unit suffixes (e.g., '21.5 °C', '21.5°C', '21.5 C') and handle comma decimals
-            cleaned = (
-                state_val.replace("°C", "")
-                .replace("°", "")
-                .replace("C", "")
-                .replace("F", "")
-                .replace(",", ".")
-                .strip()
-            )
-            try:
-                return float(cleaned)
-            except (ValueError, TypeError):
-                pass
-
-        # Check attributes (especially for weather entities where state is 'sunny', 'cloudy', etc.)
-        attrs = getattr(state_obj, "attributes", {}) or {}
-        for attr in (
-            "temperature",
-            "native_temperature",
-            "current_temperature",
-            "temp",
-            "target_temperature",
-            "apparent_temperature",
-        ):
-            if attr in attrs and attrs[attr] is not None:
-                val = attrs[attr]
-                if isinstance(val, (int, float)):
-                    return float(val)
-                if isinstance(val, str):
-                    cleaned = (
-                        val.replace("°C", "")
-                        .replace("°", "")
-                        .replace("C", "")
-                        .replace("F", "")
-                        .replace(",", ".")
-                        .strip()
-                    )
-                    try:
-                        return float(cleaned)
-                    except (ValueError, TypeError):
-                        pass
-
-        return None
+        return parse_temperature_state(state_obj)
 
     @staticmethod
     def _parse_humidity(state_obj: Any) -> float | None:
         """Safely extract float humidity from entity state or attributes."""
-        if not state_obj:
-            return None
-
-        state_val = state_obj.state
-        if state_val in (STATE_UNAVAILABLE, STATE_UNKNOWN, None):
-            return None
-
-        if isinstance(state_val, str):
-            cleaned_state = state_val.strip().lower()
-            if cleaned_state in ("unknown", "unavailable", "none", "null", "restored", ""):
-                return None
-
-            cleaned = (
-                state_val.replace("%", "")
-                .replace(",", ".")
-                .strip()
-            )
-            try:
-                return float(cleaned)
-            except (ValueError, TypeError):
-                pass
-
-        # Check attributes (e.g. for weather entities or climate/humidifier entities)
-        attrs = getattr(state_obj, "attributes", {}) or {}
-        for attr in (
-            "humidity",
-            "relative_humidity",
-            "current_humidity",
-            "target_humidity",
-        ):
-            if attr in attrs and attrs[attr] is not None:
-                val = attrs[attr]
-                if isinstance(val, (int, float)):
-                    return float(val)
-                if isinstance(val, str):
-                    cleaned = val.replace("%", "").replace(",", ".").strip()
-                    try:
-                        return float(cleaned)
-                    except (ValueError, TypeError):
-                        pass
-
-        return None
+        return parse_humidity_state(state_obj)
 
     def _update_sensor_values(self) -> None:
         """Read and parse sensor values from Home Assistant state machine."""
@@ -1354,47 +1087,32 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
         # Indoor sensor
         indoor_state = self.hass.states.get(self._indoor_sensor_id)
-        if (
-            indoor_state
-            and indoor_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
-        ):
+        parsed: float | None = None
+        if indoor_state and indoor_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             parsed = self._parse_humidity(indoor_state) if is_hum else self._parse_temperature(indoor_state)
-            if parsed is not None:
-                if self._sensor_fault_active:
-                    if self._sensor_recovery_first_at is None:
-                        self._sensor_recovery_first_at = now
-                    elif (now - self._sensor_recovery_first_at).total_seconds() >= 30.0:
-                        self._sensor_fault_active = False
-                        self._sensor_recovery_first_at = None
-                        if is_hum:
-                            self._indoor_humidity = parsed
-                        else:
-                            self._indoor_temp = parsed
-                        self._last_indoor_update = now
-                        self._sensor_stale_count = 0
-                else:
-                    if is_hum:
-                        self._indoor_humidity = parsed
-                    else:
-                        self._indoor_temp = parsed
-                    self._last_indoor_update = now
-                    self._sensor_stale_count = 0
-            else:
-                self._sensor_fault_active = True
-                self._sensor_recovery_first_at = None
-                self._sensor_stale_count += 1
-                if is_hum:
-                    self._indoor_humidity = None
-                else:
-                    self._indoor_temp = None
+            if parsed is None:
                 _LOGGER.warning(
                     "Invalid indoor sensor value from %s: %s",
                     self._indoor_sensor_id,
                     indoor_state.state,
                 )
-        else:
-            self._sensor_fault_active = True
-            self._sensor_recovery_first_at = None
+
+        accept, self._sensor_fault_active, self._sensor_recovery_first_at = (
+            evaluate_sensor_recovery(
+                parsed=parsed,
+                fault_active=self._sensor_fault_active,
+                recovery_first_at=self._sensor_recovery_first_at,
+                now=now,
+            )
+        )
+        if accept and parsed is not None:
+            if is_hum:
+                self._indoor_humidity = parsed
+            else:
+                self._indoor_temp = parsed
+            self._last_indoor_update = now
+            self._sensor_stale_count = 0
+        elif parsed is None:
             self._sensor_stale_count += 1
             if is_hum:
                 self._indoor_humidity = None
@@ -1435,12 +1153,9 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
     def _is_target_device_unavailable(self) -> bool:
         """Return True if the active target device state is currently unavailable/unknown."""
-        dev_id = self._active_target_device_id
-        if not dev_id or not self.hass:
-            return self._device_unavailable
-        st = self.hass.states.get(dev_id)
-        if st is not None:
-            self._device_unavailable = st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+        unavail = is_state_unavailable(self.hass, self._active_target_device_id)
+        if unavail is not None:
+            self._device_unavailable = unavail
         return self._device_unavailable
 
     @callback
@@ -1996,88 +1711,18 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         force_sec0: bool = False,
     ) -> int:
         """Determine active section using hysteresis state machine (±1.5% deadband) and Section 0 dwell."""
-        s1 = self._sec1_max
-        s2 = self._sec2_max
-        s3 = self._sec3_max
-        band = HYSTERESIS_BAND
-
-        if force_sec0:
-            return 0
-
-        # Initial fallback if section not initialized
-        if current_sec not in (0, 1, 2, 3, 4):
-            if output <= s1:
-                return 1
-            if output <= s2:
-                return 2
-            if output <= s3:
-                return 3
-            return 4
-
-        if current_sec == 0:
-            if (
-                self._section_entered_at is not None
-                and now is not None
-                and (now - self._section_entered_at).total_seconds() < MIN_DWELL_SEC0
-            ):
-                return 0
-            if output <= self._sec0_threshold + band:
-                return 0
-            if output <= s1:
-                return 1
-            if output <= s2:
-                return 2
-            if output <= s3:
-                return 3
-            return 4
-
-        # Check transition from active (1..4) into Section 0 standby
-        if (
-            output <= self._sec0_threshold
-            and self._section_entered_at is not None
-            and now is not None
-            and (now - self._section_entered_at).total_seconds() >= MIN_DWELL_ACTIVE
-        ):
-            return 0
-
-        # Hysteresis transitions
-        if current_sec == 1:
-            if output > s3 + band:
-                return 4
-            if output > s2 + band:
-                return 3
-            if output > s1 + band:
-                return 2
-            return 1
-
-        if current_sec == 2:
-            if output > s3 + band:
-                return 4
-            if output > s2 + band:
-                return 3
-            if output < s1 - band:
-                return 1
-            return 2
-
-        if current_sec == 3:
-            if output > s3 + band:
-                return 4
-            if output < s1 - band:
-                return 1
-            if output < s2 - band:
-                return 2
-            return 3
-
-        if current_sec == 4:
-            if output < s1 - band:
-                return 1
-            if output < s2 - band:
-                return 2
-            if output < s3 - band:
-                return 3
-            return 4
-
-        return current_sec
+        return determine_active_section(
+            output=output,
+            current_sec=current_sec,
+            sec1_max=self._sec1_max,
+            sec2_max=self._sec2_max,
+            sec3_max=self._sec3_max,
+            sec0_threshold=self._sec0_threshold,
+            section_entered_at=self._section_entered_at,
+            now=now,
+            force_sec0=force_sec0,
+            allow_sec0=True,
+        )
 
     def _get_section_parameters(
         self, section: int
@@ -2089,44 +1734,15 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             if self._sec0_action == SEC0_ACTION_OFF:
                 return (False, 0.0, "low", HVACMode.OFF.value, False, False, True)
             return (True, self._sec0_delta, "low", "follow", True, False, False)
-        if section == 1:
-            return (
-                self._sec1_apply_temp,
-                self._sec1_delta,
-                self._sec1_fan,
-                self._sec1_hvac_mode,
-                self._sec1_apply_delta,
-                self._sec1_apply_fan,
-                self._sec1_apply_hvac_mode,
-            )
-        if section == 2:
-            return (
-                self._sec2_apply_temp,
-                self._sec2_delta,
-                self._sec2_fan,
-                self._sec2_hvac_mode,
-                self._sec2_apply_delta,
-                self._sec2_apply_fan,
-                self._sec2_apply_hvac_mode,
-            )
-        if section == 3:
-            return (
-                self._sec3_apply_temp,
-                self._sec3_delta,
-                self._sec3_fan,
-                self._sec3_hvac_mode,
-                self._sec3_apply_delta,
-                self._sec3_apply_fan,
-                self._sec3_apply_hvac_mode,
-            )
+        idx = section if section in (1, 2, 3) else 4
         return (
-            self._sec4_apply_temp,
-            self._sec4_delta,
-            self._sec4_fan,
-            self._sec4_hvac_mode,
-            self._sec4_apply_delta,
-            self._sec4_apply_fan,
-            self._sec4_apply_hvac_mode,
+            getattr(self, f"_sec{idx}_apply_temp"),
+            getattr(self, f"_sec{idx}_delta"),
+            getattr(self, f"_sec{idx}_fan"),
+            getattr(self, f"_sec{idx}_hvac_mode"),
+            getattr(self, f"_sec{idx}_apply_delta"),
+            getattr(self, f"_sec{idx}_apply_fan"),
+            getattr(self, f"_sec{idx}_apply_hvac_mode"),
         )
 
     async def _async_calculate_and_control(
@@ -2277,91 +1893,43 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                             self._kp, self._ki, self._ke
                         )
 
-                    if is_heating:
-                        # Heating error: e(t) = T_target(t) - T_room(t)
-                        error = self._target_temp - indoor_val
-                        # Outdoor feedforward Ke term for heating:
-                        # When outdoor is colder than target, heat loss is higher -> increase heating demand
-                        if self._outdoor_sensor_id and outdoor_val is not None:
-                            e_term = eff_ke * (self._target_temp - outdoor_val)
-                        else:
-                            e_term = 0.0
-                    else:
-                        # Cooling error: e(t) = T_room(t) - T_target(t)
-                        error = indoor_val - self._target_temp
-                        # Outdoor feedforward Ke term for cooling:
-                        # When outdoor is hotter than target, heat gain is higher -> increase cooling demand
-                        if self._outdoor_sensor_id and outdoor_val is not None:
-                            e_term = eff_ke * (outdoor_val - self._target_temp)
-                        else:
-                            e_term = 0.0
-
-                    # (2) P term: P(t) = Kp * e(t)
-                    p_term = eff_kp * error
-
-                    # (3) D term using derivative on measurement with 1st-order LPF (tau_d=120s)
-                    # Block < 10s event-driven derivative spikes (which previously amplified noise 20x)
                     prev_val = self._prev_room_humidity if is_hum else self._prev_room_temp
-                    d_dt = (
-                        (now - self._last_d_calc_time).total_seconds()
-                        if self._last_d_calc_time is not None
-                        else dt
+                    step = compute_pid_step(
+                        indoor_val=indoor_val,
+                        target_val=self._target_temp,
+                        outdoor_val=outdoor_val,
+                        has_outdoor_sensor=bool(self._outdoor_sensor_id),
+                        is_heating=is_heating,
+                        kp=eff_kp,
+                        ki=eff_ki,
+                        kd=self._kd,
+                        ke=eff_ke,
+                        max_i=self._max_i,
+                        dt=dt,
+                        sample_period=self._sample_period,
+                        now=now,
+                        force=force,
+                        integral=self._integral,
+                        filtered_d=self._filtered_d,
+                        last_d_calc_time=self._last_d_calc_time,
+                        prev_val=prev_val,
+                        freeze_integral=(self._vent_status.should_pause_control or self._active_section == 0),
+                        per_minute_integral=True,
                     )
-                    if not force and self._last_d_calc_time is not None and d_dt < MIN_DERIVATIVE_EVENT_DT:
-                        d_term = self._filtered_d
+                    error = step.error
+                    p_term = step.p_term
+                    i_term = step.i_term
+                    d_term = step.d_term
+                    e_term = step.e_term
+                    final_output = step.final_output
+                    self._integral = step.integral
+                    self._filtered_d = step.filtered_d
+                    self._last_d_calc_time = step.last_d_calc_time
+                    if is_hum:
+                        self._prev_room_humidity = step.prev_val
                     else:
-                        effective_d_dt = max(MIN_DERIVATIVE_EVENT_DT, d_dt)
-                        dt_norm = (
-                            (effective_d_dt / float(self._sample_period))
-                            if self._sample_period > 0
-                            else 1.0
-                        )
-                        dt_norm = max(0.1, dt_norm)
-
-                        if prev_val is not None:
-                            diff_val = indoor_val - prev_val
-                            if is_heating:
-                                raw_d = -self._kd * (diff_val / dt_norm)
-                            else:
-                                raw_d = self._kd * (diff_val / dt_norm)
-                            alpha = effective_d_dt / (DEFAULT_TAU_D + effective_d_dt)
-                            self._filtered_d = alpha * raw_d + (1.0 - alpha) * self._filtered_d
-                            d_term = self._filtered_d
-                        else:
-                            d_term = 0.0
-                        self._last_d_calc_time = now
-                        if is_hum:
-                            self._prev_room_humidity = indoor_val
-                        else:
-                            self._prev_room_temp = indoor_val
-
+                        self._prev_room_temp = step.prev_val
                     self._prev_error = error
-
-                    # (5) I term normalized to per-minute dt (dt / 60.0) with anti-windup and [-max_i, +max_i]
-                    # Freeze integral during VENTILATING or Section 0 standby
-                    max_i_limit = max(0.0, float(self._max_i))
-                    if self._vent_status.should_pause_control or self._active_section == 0:
-                        self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
-                    else:
-                        dt_min = dt / 60.0
-                        candidate_i = self._integral + (eff_ki * error * dt_min)
-                        candidate_i = max(-max_i_limit, min(max_i_limit, candidate_i))
-                        candidate_raw = p_term + candidate_i + d_term + e_term
-
-                        # Anti-windup check:
-                        # When raw output saturates and error reinforces saturation, stop accumulation
-                        if candidate_raw >= 100.0 and error > 0:
-                            self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
-                        elif candidate_raw <= 0.0 and error < 0:
-                            self._integral = max(-max_i_limit, min(max_i_limit, self._integral))
-                        else:
-                            self._integral = candidate_i
-
-                    i_term = self._integral
-
-                    # Total raw and final outputs (0.0 ~ 100.0%)
-                    raw_output = p_term + i_term + d_term + e_term
-                    final_output = max(0.0, min(100.0, raw_output))
 
                     # Store diagnostics
                     self._pid_error = round(error, 2)
@@ -3086,13 +2654,12 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         now = dt_util.utcnow()
         last_off = self._last_switch_off_times.get(active_dev, self._last_switch_off_time)
         pwm_dur = float(self._pwm_duration) if self._pwm_duration > 0 else float(DEFAULT_PWM_DURATION_SWITCH)
-        dynamic_min_off = (
-            float(self._last_run_duration_sec) * float(self._dynamic_min_off_multiplier)
-            if self._dynamic_min_off_multiplier > 0.0
-            else 0.0
+        base_min_off = compute_effective_min_off(
+            self._min_off_time,
+            self._last_run_duration_sec,
+            self._dynamic_min_off_multiplier,
         )
-        base_min_off = max(float(self._min_off_time), dynamic_min_off)
-        if self._dynamic_min_off_multiplier > 0.0 and dynamic_min_off > float(self._min_off_time):
+        if base_min_off > float(self._min_off_time):
             effective_min_off = base_min_off
         elif (float(self._min_on_time) + float(self._min_off_time)) >= pwm_dur:
             effective_min_off = min(float(self._min_off_time), max(1.0, pwm_dur * 0.05))

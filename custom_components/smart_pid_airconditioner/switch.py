@@ -7,11 +7,11 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, is_heating_type
+from .config_utils import SmartPIDRuntimeEntityMixin
+from .const import is_heating_type
 from .runtime import SmartPIDRuntime
 
 
@@ -27,37 +27,13 @@ async def async_setup_entry(
     async_add_entities([SmartPIDSunriseSavingSwitch(entry, runtime)], True)
 
 
-class SmartPIDSunriseSavingSwitch(SwitchEntity):
+class SmartPIDSunriseSavingSwitch(SmartPIDRuntimeEntityMixin, SwitchEntity):
     """Live toggle switch for Sunrise Saving mode on heating controllers."""
 
-    _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
-    _attr_translation_key = "sunrise_saving"
 
     def __init__(self, entry: ConfigEntry, runtime: SmartPIDRuntime) -> None:
-        self._entry = entry
-        self._runtime = runtime
-        self._attr_unique_id = f"{entry.entry_id}_sunrise_saving"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=entry.title,
-            manufacturer="Smart PID",
-            model="Smart PID Controller",
-        )
-        self._unsub: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        self._unsub = self._runtime.subscribe(self._on_runtime_update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub is not None:
-            self._unsub()
-            self._unsub = None
-
-    @callback
-    def _on_runtime_update(self) -> None:
-        self.async_write_ha_state()
+        self._init_runtime_entity(entry, runtime, "sunrise_saving")
 
     @property
     def is_on(self) -> bool:

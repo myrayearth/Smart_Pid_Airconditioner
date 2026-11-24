@@ -96,6 +96,7 @@ from .learner import (
     SimcAutoTuner,
     TuningParameters,
 )
+from .config_utils import get_entry_setting
 from .psychrometrics import rh_to_ah
 from .storage import LearningStateSnapshot, ModelStore
 from .ventilation import VentState, VentStatus
@@ -227,19 +228,12 @@ class SmartPIDRuntime:
             self._notify_subscribers()
 
     def _get_setting(self, key: str, default: Any = None) -> Any:
-        if key in self.entry.options and self.entry.options[key] is not None:
-            return self.entry.options[key]
-        for sec in ("adaptive_learning", "ki_group", "ventilation", "section_0"):
-            d = self.entry.options.get(sec)
-            if isinstance(d, dict) and key in d and d[key] is not None:
-                return d[key]
-        if key in self.entry.data and self.entry.data[key] is not None:
-            return self.entry.data[key]
-        for sec in ("adaptive_learning", "ki_group", "ventilation", "section_0"):
-            d = self.entry.data.get(sec)
-            if isinstance(d, dict) and key in d and d[key] is not None:
-                return d[key]
-        return default
+        return get_entry_setting(
+            self.entry,
+            key,
+            default,
+            sections=("adaptive_learning", "ki_group", "ventilation", "section_0"),
+        )
 
     def _active_rls(self):
         return self.snapshot.hum_rls if self.is_humidity else self.snapshot.temp_rls

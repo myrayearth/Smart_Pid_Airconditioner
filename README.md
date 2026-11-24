@@ -210,17 +210,22 @@ custom_components/smart_pid_airconditioner/
 ├── button.py             # EntityCategory.CONFIG 자가학습 초기화 버튼 엔티티
 ├── climate.py            # ClimateEntity 제어기 (에어컨/히터/겸용 PID, 구간 0~4 및 PWM 디스패처)
 ├── config_flow.py        # UI 설정(ConfigFlow) 및 옵션(OptionsFlowWithReload) 마법사
+├── config_utils.py       # 공통 설정 조회, DeviceInfo, 센서 파싱, ExtraStoredData, 런타임 엔티티 믹스인
 ├── const.py              # 상수, 기본값, 도메인 및 시간 변환 유틸리티
 ├── diagnostics.py        # Home Assistant Download Diagnostics(진단 정보 JSON 다운로드)
+├── flow_schemas.py       # ConfigFlow / OptionsFlow 공통 스키마 빌더, 셀렉터 및 입력 검증기
 ├── humidifier.py         # HumidifierEntity 제어기 (가습기/제습기 PID 및 디스패처)
 ├── influxdb_bootstrap.py # InfluxDB v1 30일 청크 분할 조회 및 계절 필터 기반 과거 이력 사전 학습 엔진
 ├── learner.py            # 순수 Python 자가학습 엔진 (Huber-RLS, 2단계 정점·이상치 격리 코스팅, SIMC, SafetyManager)
+├── pid_core.py           # 공통 PID 연산, 구간 0~4 히스테리시스/유지시간, 동적 최소 OFF, 센서 복구 가드
 ├── psychrometrics.py     # Bolton(1980) 상대습도 ↔ 절대습도(g/m³) · 이슬점 변환
 ├── runtime.py            # SmartPIDRuntime (1분 코스팅/5분 RLS 루프, 일사량/통신불능 가드, MAE 롤백, Select 전환)
 ├── select.py             # EntityCategory.CONFIG 리로드 없는 튜닝/예측 모드 Select 엔티티 2종
 ├── sensor.py             # EntityCategory.DIAGNOSTIC 진단 센서 5종
 ├── services.yaml         # reset_learning 및 bootstrap_from_influxdb 서비스 스키마
 ├── storage.py            # ModelStore (10분 디바운싱 .storage 영구 저장 및 스냅샷 직렬화)
+├── switch.py             # EntityCategory.CONFIG 일출 절약 모드 스위치 엔티티
+├── time.py               # EntityCategory.CONFIG 일출 절약 모드 시작/종료 시각 엔티티
 ├── ventilation.py        # 4상태 환기 감지기 (디바운스, 쿨다운, 센서 불능 유예)
 ├── manifest.json         # 통합구성요소 메타데이터
 ├── strings.json          # 기본 UI/엔티티 리소스 (한국어)
