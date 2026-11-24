@@ -6,6 +6,7 @@ from datetime import timedelta
 import json
 from pathlib import Path
 from typing import Any, Callable
+from collections.abc import Mapping
 
 import pytest
 
@@ -55,31 +56,43 @@ from homeassistant.components.climate import HVACMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import Event, State
+from homeassistant.exceptions import HomeAssistantError
 import homeassistant.util.dt as dt_util
 
 
 class FakeBus:
-    """Minimal Home Assistant event bus mock supporting async_listen and async_fire."""
+    """Minimal Home Assistant event bus mock supporting async_listen, event_filter, and async_fire."""
 
     def __init__(self) -> None:
-        self._listeners: dict[str, list[Callable[[Event], None]]] = {}
+        self._listeners: dict[
+            str,
+            list[tuple[Callable[[Event], None], Callable[[Mapping[str, Any]], bool] | None]],
+        ] = {}
 
     def async_listen(
-        self, event_type: str, listener: Callable[[Event], None]
+        self,
+        event_type: str,
+        listener: Callable[[Event], None],
+        *,
+        event_filter: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> Callable[[], None]:
-        self._listeners.setdefault(event_type, []).append(listener)
+        if event_type == "state_reported" and event_filter is None:
+            raise HomeAssistantError(f"Event filter is required for event {event_type}")
+        entry = (listener, event_filter)
+        self._listeners.setdefault(event_type, []).append(entry)
 
         def _unsub() -> None:
             lst = self._listeners.get(event_type, [])
-            if listener in lst:
-                lst.remove(listener)
+            if entry in lst:
+                lst.remove(entry)
 
         return _unsub
 
     def async_fire(self, event_type: str, event_data: dict[str, Any]) -> None:
         ev = Event(event_type=event_type, data=dict(event_data))
-        for cb in list(self._listeners.get(event_type, [])):
-            cb(ev)
+        for cb, ev_filter in list(self._listeners.get(event_type, [])):
+            if ev_filter is None or ev_filter(ev.data):
+                cb(ev)
 
     def listener_count(self, event_type: str) -> int:
         return len(self._listeners.get(event_type, []))
@@ -143,6 +156,14 @@ async def test_state_reported_refreshes_timestamps_and_prevents_failsafe_climate
 
     t1 = t0 + timedelta(minutes=5)
     dt_util.set_utcnow(t1)
+    # Unrelated entity state_reported is filtered out and does not clear stale status
+    hass.bus.async_fire(
+        "state_reported",
+        {"entity_id": "sensor.unrelated_other", "new_state": State("sensor.unrelated_other", "99.0")},
+    )
+    assert entity._sensor_stale_count == 2
+    assert entity._last_indoor_update == t0 - timedelta(minutes=20)
+
     # Periodic state_reported with identical values
     hass.bus.async_fire(
         "state_reported",

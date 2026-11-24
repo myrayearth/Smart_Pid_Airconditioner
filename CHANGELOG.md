@@ -7,6 +7,17 @@
 
 ---
 
+## [0.6.3] - 2026-11-24
+
+### 수정 (Fixed)
+- **Home Assistant Core 2026.x `state_reported` `event_filter` 필수 요구 오류 수정 (`config_utils.py`, `climate.py`, `humidifier.py`)**:
+  - HA 2024.5+/2026.x 환경에서 필터 없는 `hass.bus.async_listen("state_reported", ...)` 호출 시 `HomeAssistantError: Event filter is required for event state_reported`가 발생해 주 `climate`/`humidifier` 엔티티 등록이 실패하고 `unavailable` 상태로 남던 치명적 문제 해결
+  - `config_utils.py`에 공식 `homeassistant.helpers.event.async_track_state_report_event` 우선 사용 및 `event_filter` 포함 `async_listen` 폴백을 제공하는 `async_subscribe_state_reported()` 헬퍼 신설
+  - `climate.py`, `humidifier.py`의 `_async_state_reported()` / `_async_entity_changed()` 진입부에 `self.hass is None` 방어 가드 추가
+  - `tests/conftest.py`에 `async_track_state_report_event` 스텁을 추가하고 `tests/test_stage11_resilience_and_overheat.py`의 `FakeBus`가 `event_filter` 미전달 시 HA Core와 동일하게 예외를 발생시키며 타 엔티티 이벤트를 필터링하도록 검증 강화
+
+---
+
 ## [0.6.2] - 2026-11-24
 
 ### 수정 (Fixed)

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
+from homeassistant.helpers import event as ha_event
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.restore_state import ExtraStoredData
 
@@ -249,6 +250,42 @@ def is_state_unavailable(hass: HomeAssistant | None, entity_id: str | None) -> b
     if st is None:
         return None
     return st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+
+
+def async_subscribe_state_reported(
+    hass: HomeAssistant,
+    entity_ids: Iterable[str],
+    action: Callable[[Event], Any],
+) -> CALLBACK_TYPE | None:
+    """Subscribe to HA `state_reported` events for tracked entity IDs safely.
+
+    Uses `async_track_state_report_event` on HA 2024.5+/2026.x where raw
+    unfiltered `state_reported` bus listeners are rejected, falling back to a
+    filtered `hass.bus.async_listen` (or legacy unfiltered mock signature).
+    """
+    tracked = list(dict.fromkeys(e for e in entity_ids if e))
+    if not tracked:
+        return None
+
+    track_report = getattr(ha_event, "async_track_state_report_event", None)
+    if callable(track_report):
+        return track_report(hass, tracked, action)
+
+    bus = getattr(hass, "bus", None)
+    async_listen = getattr(bus, "async_listen", None)
+    if not callable(async_listen):
+        return None
+
+    tracked_set = set(tracked)
+
+    @callback
+    def _event_filter(event_data: Mapping[str, Any]) -> bool:
+        return isinstance(event_data, Mapping) and event_data.get(ATTR_ENTITY_ID) in tracked_set
+
+    try:
+        return async_listen("state_reported", action, event_filter=_event_filter)
+    except TypeError:
+        return async_listen("state_reported", action)
 
 
 @dataclass

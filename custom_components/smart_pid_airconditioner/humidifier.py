@@ -208,6 +208,7 @@ from .const import (
 from .actuator import SwitchCommandGuard
 from .config_utils import (
     SmartPIDExtraStoredData,
+    async_subscribe_state_reported,
     build_device_info,
     build_ventilation_guard,
     get_entry_setting,
@@ -750,12 +751,11 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 self.hass, valid_sensors, self._async_entity_changed
             )
 
-        bus = getattr(self.hass, "bus", None)
-        async_listen = getattr(bus, "async_listen", None)
-        if callable(async_listen) and (self._indoor_sensor_id or self._outdoor_sensor_id):
-            self._unsub_state_reported = async_listen(
-                "state_reported", self._async_state_reported
-            )
+        self._unsub_state_reported = async_subscribe_state_reported(
+            self.hass,
+            (self._indoor_sensor_id, self._outdoor_sensor_id),
+            self._async_state_reported,
+        )
 
         # Periodic interval tick
         self._unsub_interval_tick = async_track_time_interval(
@@ -879,6 +879,8 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
     @callback
     def _async_state_reported(self, event: Event) -> None:
         """Refresh sensor timestamps and reset stale counter on state_reported heartbeats."""
+        if self.hass is None:
+            return
         data = event.data if isinstance(event.data, Mapping) else {}
         entity_id = data.get(ATTR_ENTITY_ID)
         if not entity_id or entity_id not in (self._indoor_sensor_id, self._outdoor_sensor_id):
@@ -901,6 +903,8 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
 
     async def _async_entity_changed(self, event: Event[EventStateChangedData]) -> None:
         """Handle tracked entity state updates."""
+        if self.hass is None:
+            return
         entity_id = event.data["entity_id"]
         new_state = event.data["new_state"]
         if new_state is None:

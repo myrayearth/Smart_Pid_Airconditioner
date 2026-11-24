@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -745,6 +746,21 @@ def _install_ha_stubs() -> None:
 
         return _unsub
 
+    def async_track_state_report_event(
+        hass: HomeAssistant, entity_ids: list[str] | str, action: Callable
+    ) -> Callable[[], None]:
+        ids = {entity_ids} if isinstance(entity_ids, str) else set(entity_ids)
+        bus = getattr(hass, "bus", None)
+        async_listen = getattr(bus, "async_listen", None)
+        if callable(async_listen):
+            return async_listen(
+                "state_reported",
+                action,
+                event_filter=lambda event_data: isinstance(event_data, Mapping)
+                and event_data.get("entity_id") in ids,
+            )
+        return lambda: None
+
     def async_track_time_interval(
         hass: HomeAssistant, action: Callable, interval: timedelta
     ) -> Callable[[], None]:
@@ -761,6 +777,7 @@ def _install_ha_stubs() -> None:
         return lambda: None
 
     ev_mod.async_track_state_change_event = async_track_state_change_event
+    ev_mod.async_track_state_report_event = async_track_state_report_event
     ev_mod.async_track_time_interval = async_track_time_interval
     ev_mod.async_call_later = async_call_later
     ev_mod.async_track_point_in_time = async_track_point_in_time
