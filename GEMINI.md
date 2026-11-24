@@ -33,3 +33,4 @@ github_repo: "https://github.com/myrayearth/smart_pid_airconditioner.git"
    - PID 제어, PWM 스위칭, 공조기/릴레이 제어 시 센서 값 결측(`unavailable`/`unknown`)이나 통신 두절에 대비한 안전 정지(Fallback) 로직을 반드시 포함한다.
    - 릴레이나 압축기의 물리적 손상을 막기 위해 최소 작동/휴지 시간(Min Cycle Duration) 제약을 코드 수준에서 강제한다.
 4. **다국어 및 UI 설정**: Config Flow 구현 시 한국어 번역 파일(`translations/ko.json`)을 항상 동기화해 작성한다.
+5. **작업 완료 시 자동 버전업 및 릴리스 (Auto Release)**: 기능 구현·수정 및 테스트 검증이 완료되면 별도 요청 없이도 `CHANGELOG.md` 버전 규칙(메이저 기능 업데이트 +0.1, 마이너/버그 픽스 +0.0.1)에 따라 `manifest.json`과 `CHANGELOG.md`를 버전업하고, 커밋 → Git 태그(`vX.Y.Z`) 생성 → 원격(`origin main` 및 태그) 푸시까지 자동으로 일괄 완료한다.

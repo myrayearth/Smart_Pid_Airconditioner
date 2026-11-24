@@ -7,6 +7,24 @@
 
 ---
 
+## [0.6.0] - 2026-11-24
+
+### 추가 (Added)
+- **Stage 11 통신 복원력 및 안전 래치 (`__init__.py`, `const.py`, `runtime.py`, `climate.py`, `humidifier.py`, `strings.json`, `translations/*.json`, `tests/test_stage11_resilience_and_overheat.py`)**:
+  - `state_reported` 이벤트 방어적 구독으로 동일 값 주기 보고 시 `_last_indoor_update`/`_last_outdoor_update` 갱신 및 `_sensor_stale_count` 초기화(정상 센서 `stale` Fail-Safe 오탐 방지)
+  - 기기 `unavailable` 60초 유예 중 1분 틱 관측 버퍼링(최대 10건) 및 동일 상태 복귀 시 순차 재생, 상태 변경·유예 만료 시 버퍼 폐기 및 `device_unavailable` 오염 처리
+  - 난방 컨트롤러 절대 과열 안전 래치(`OVERHEAT_LATCH_TEMP_C = 35.0°C` 강제 OFF + 영구 알림, `OVERHEAT_RESET_TEMP_C = 34.0°C` 이하 복귀 시 해제, `overheat_latched` 속성 노출)
+  - `hass.data[DOMAIN]["reload_off"]` 기반 리로드 시 PWM 최소 OFF 보호 시간 인계
+- **Stage 8~10 실측 지연·이중 메모리·편향/미달 방어 (`learner.py`, `runtime.py`, `climate.py`, `sensor.py`, `switch.py`, `storage.py`, `tests/test_stage8_dead_time_and_predictive_on.py`, `tests/test_stage9_dual_layer_memory.py`, `tests/test_stage10_bias_and_shortfall.py`)**:
+  - 실측 반응 지연(Dead Time θ) 학습 및 외기 밴드 기반 선행 가동(Predictive ON)
+  - 단기·장기 이중 계층 코스팅 메모리(Dual-Layer Memory) 및 휴면 감쇠
+  - 부호 있는 코스팅 예측 편향 보정(`coast_bias`) 및 조기 종료 연속 미달 방어(`shortfall_margin_scale`)
+
+### 개선 (Changed / Refactored)
+- **공용 모듈 분리 (`config_utils.py`, `pid_core.py`, `flow_schemas.py`, `tests/test_shared_modules.py`)**: 중복 로직을 공용 유틸리티·PID 코어·Config/Options 스키마 빌더로 추출해 유지보수성 강화
+
+---
+
 ## [0.5.1] - 2026-11-24
 
 ### 수정 (Fixed)
