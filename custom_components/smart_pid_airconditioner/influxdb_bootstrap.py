@@ -41,9 +41,13 @@ _HUMIDITY_MEASUREMENT_CANDIDATES = ("%", "state", "sensor")
 _DEVICE_MEASUREMENT_CANDIDATES = ("state", "switch", "input_boolean", "climate", "humidifier")
 _VENT_MEASUREMENT_CANDIDATES = ("state", "binary_sensor", "switch", "input_boolean")
 
-_ACTIVE_STRINGS = frozenset(
+_DEFAULT_DEVICE_ACTIVE_STRINGS = frozenset(
     {"1", "on", "true", "heat", "heating", "cool", "cooling", "humidifying", "drying"}
 )
+_DEFAULT_DEVICE_INACTIVE_STRINGS = frozenset({"0", "off", "false", "idle"})
+_DEFAULT_VENT_OPEN_STRINGS = frozenset({"1", "on", "open", "true"})
+_DEFAULT_VENT_CLOSED_STRINGS = frozenset({"0", "off", "closed", "false"})
+_EXCEPTIONAL_STRINGS = frozenset({"", "unknown", "unavailable", "none", "null"})
 _HEATING_STRINGS = frozenset({"heat", "heating", "humidifying"})
 _COOLING_STRINGS = frozenset({"cool", "cooling", "drying"})
 
@@ -75,42 +79,205 @@ def _parse_float(val: Any) -> float | None:
     return num if math.isfinite(num) else None
 
 
-def _parse_device_active(val: Any) -> bool:
-    """Interpret InfluxDB numeric (1/0) or string device state."""
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return math.isfinite(float(val)) and float(val) >= 0.5
+def _norm_key(val: Any) -> tuple[float | None, str | None]:
+    """Normalize numeric and string values so 1 == 1.0 == '1' and 'on' == ' ON '."""
     if val is None:
-        return False
+        return None, None
+    if isinstance(val, bool):
+        return (1.0 if val else 0.0), ("true" if val else "false")
+    if isinstance(val, (int, float)):
+        fval = float(val)
+        if not math.isfinite(fval):
+            return None, None
+        return fval, str(int(fval) if fval.is_integer() else fval)
     s = str(val).strip().lower()
-    if s in _ACTIVE_STRINGS:
-        return True
+    if not s:
+        return None, None
     try:
-        num = float(s)
-        return math.isfinite(num) and num >= 0.5
+        fval = float(s)
+        if math.isfinite(fval):
+            return fval, s
     except ValueError:
-        return False
+        pass
+    return None, s
 
 
-def _parse_vent_state(val: Any) -> str:
-    """Convert InfluxDB state value into 'on' or 'off' string for VentilationGuard."""
-    if isinstance(val, bool):
-        return "on" if val else "off"
-    if isinstance(val, (int, float)):
-        return "on" if (math.isfinite(float(val)) and float(val) >= 0.5) else "off"
-    if val is None:
-        return "off"
-    s = str(val).strip().lower()
-    if s in ("unavailable", "unknown"):
-        return s
-    if s in ("on", "open", "true", "1"):
-        return "on"
-    try:
-        num = float(s)
-        return "on" if (math.isfinite(num) and num >= 0.5) else "off"
-    except ValueError:
-        return "off"
+def _coerce_value_list(raw: Any) -> list[Any] | None:
+    """Coerce optional user value list (list, tuple, set, or single scalar) into list or None."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (list, tuple, set)):
+        items = [v for v in raw if v is not None and v != ""]
+        return items if items else None
+    return [raw]
+
+
+class _StateMatcher:
+    """Normalizing matcher for device active/inactive and ventilation open/closed states."""
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        active_values: list[Any] | None = None,
+        inactive_values: list[Any] | None = None,
+    ) -> None:
+        self.kind = kind
+        self._raw_active = list(active_values) if active_values is not None else None
+        self._raw_inactive = list(inactive_values) if inactive_values is not None else None
+        self._norm_active = (
+            [_norm_key(v) for v in self._raw_active] if self._raw_active is not None else None
+        )
+        self._norm_inactive = (
+            [_norm_key(v) for v in self._raw_inactive] if self._raw_inactive is not None else None
+        )
+
+    @staticmethod
+    def _matches_list(target: tuple[float | None, str | None], candidates: list[tuple[float | None, str | None]]) -> bool:
+        t_num, t_str = target
+        if t_num is None and t_str is None:
+            return False
+        for c_num, c_str in candidates:
+            if t_num is not None and c_num is not None and math.isclose(t_num, c_num, rel_tol=0.0, abs_tol=1e-9):
+                return True
+            if t_str is not None and c_str is not None and t_str == c_str:
+                return True
+        return False
+
+    def _default_match(self, raw_val: Any, norm: tuple[float | None, str | None]) -> bool | None:
+        t_num, t_str = norm
+        if t_num is None and t_str is None:
+            return None
+        if t_str in _EXCEPTIONAL_STRINGS:
+            return None
+
+        if self.kind == "ventilation":
+            if isinstance(raw_val, bool):
+                return raw_val
+            if t_str in _DEFAULT_VENT_OPEN_STRINGS:
+                return True
+            if t_str in _DEFAULT_VENT_CLOSED_STRINGS:
+                return False
+            if t_num is not None:
+                return t_num >= 0.5
+            return None
+
+        # Device default fallback
+        if isinstance(raw_val, bool):
+            return raw_val
+        if t_str in _DEFAULT_DEVICE_ACTIVE_STRINGS:
+            return True
+        if t_str in _DEFAULT_DEVICE_INACTIVE_STRINGS:
+            return False
+        if t_num is not None:
+            return t_num >= 0.5
+        return None
+
+    def match(self, raw_val: Any) -> bool | None:
+        """Return True (active/open), False (inactive/closed), or None (unknown -> keep LOCF)."""
+        norm = _norm_key(raw_val)
+        if norm == (None, None):
+            return None
+
+        if self._norm_active is not None and self._matches_list(norm, self._norm_active):
+            return True
+        if self._norm_inactive is not None and self._matches_list(norm, self._norm_inactive):
+            return False
+
+        # If both lists were explicitly specified, any unmapped value keeps LOCF
+        if self._norm_active is not None and self._norm_inactive is not None:
+            return None
+
+        # If only one side was specified, fall back for the opposite side while preserving LOCF for unknown
+        default_res = self._default_match(raw_val, norm)
+        if self._norm_active is not None and default_res is False:
+            return False
+        if self._norm_inactive is not None and default_res is True:
+            return True
+        if self._norm_active is None and self._norm_inactive is None:
+            return default_res
+        return None
+
+    def applied_active_summary(self) -> list[Any]:
+        if self._raw_active is not None:
+            return list(self._raw_active)
+        if self.kind == "ventilation":
+            return [1, "on", "open", "true"]
+        return [1, "on", "true", "heat", "heating", "cool", "cooling", "humidifying", "drying"]
+
+    def applied_inactive_summary(self) -> list[Any]:
+        if self._raw_inactive is not None:
+            return list(self._raw_inactive)
+        if self.kind == "ventilation":
+            return [0, "off", "closed", "false"]
+        return [0, "off", "false", "idle"]
+
+
+class _UniqueValueCollector:
+    """Collect distinct raw values observed in InfluxDB for dry-run state inspection."""
+
+    def __init__(self) -> None:
+        self._seen: dict[tuple[str, Any], Any] = {}
+
+    def add(self, val: Any) -> None:
+        if val is None:
+            return
+        if isinstance(val, bool):
+            self._seen[("bool", val)] = val
+        elif isinstance(val, (int, float)):
+            fval = float(val)
+            if not math.isfinite(fval):
+                return
+            canonical: int | float = int(fval) if fval.is_integer() else round(fval, 6)
+            self._seen[("num", canonical)] = canonical
+        else:
+            s = str(val).strip()
+            self._seen[("str", s)] = s
+
+    def values(self) -> list[Any]:
+        return [
+            v
+            for _, v in sorted(
+                self._seen.items(),
+                key=lambda item: (item[0][0], str(item[0][1])),
+            )
+        ]
+
+
+def _resolve_vent_matcher(
+    entity_id: str,
+    sensor_map: dict[str, Any] | None,
+    common_open: list[Any] | None,
+    common_closed: list[Any] | None,
+) -> _StateMatcher:
+    """Build ventilation matcher with priority: sensor_map[entity_id] -> common -> default."""
+    per_sensor: Any = None
+    if isinstance(sensor_map, dict):
+        if entity_id in sensor_map:
+            per_sensor = sensor_map[entity_id]
+        elif "." in entity_id:
+            short_id = entity_id.split(".", 1)[1]
+            if short_id in sensor_map:
+                per_sensor = sensor_map[short_id]
+
+    if isinstance(per_sensor, dict):
+        open_vals = _coerce_value_list(
+            per_sensor.get("open", per_sensor.get("active"))
+        )
+        closed_vals = _coerce_value_list(
+            per_sensor.get("closed", per_sensor.get("inactive"))
+        )
+        return _StateMatcher(
+            kind="ventilation",
+            active_values=open_vals if open_vals is not None else common_open,
+            inactive_values=closed_vals if closed_vals is not None else common_closed,
+        )
+
+    return _StateMatcher(
+        kind="ventilation",
+        active_values=common_open,
+        inactive_values=common_closed,
+    )
 
 
 class _ReplayState:
@@ -376,7 +543,13 @@ async def async_bootstrap_from_influxdb(
             f"min_indoor_humidity ({min_hum}) cannot exceed max_indoor_humidity ({max_hum})."
         )
 
-    device_field = str(params.get("device_field") or DEFAULT_INFLUXDB_DEVICE_FIELD).strip()
+    raw_device_field = str(params.get("device_field") or "").strip()
+    device_active_values = _coerce_value_list(params.get("device_active_values"))
+    device_inactive_values = _coerce_value_list(params.get("device_inactive_values"))
+    vent_open_values = _coerce_value_list(params.get("ventilation_open_values"))
+    vent_closed_values = _coerce_value_list(params.get("ventilation_closed_values"))
+    raw_vent_map = params.get("ventilation_sensor_map")
+    vent_sensor_map = raw_vent_map if isinstance(raw_vent_map, dict) else None
     reset_existing = bool(params.get("reset_existing", True))
     dry_run = bool(params.get("dry_run", True))
 
@@ -521,7 +694,10 @@ async def async_bootstrap_from_influxdb(
                     f"Indoor humidity sensor '{indoor_hum_eid}' had no data in InfluxDB for humidity filtering."
                 )
 
-    device_fields = (device_field, "state") if device_field != "state" else ("state", "value")
+    if raw_device_field:
+        device_fields = tuple(dict.fromkeys((raw_device_field, "value", "state")))
+    else:
+        device_fields = ("value", "state")
     device_spec = await _resolve_series_spec(
         client,
         device_eid,
@@ -615,6 +791,20 @@ async def async_bootstrap_from_influxdb(
     last_outdoor_val: float | None = None
     last_outdoor_min: int | None = None
 
+    device_matcher = _StateMatcher(
+        kind="device",
+        active_values=device_active_values,
+        inactive_values=device_inactive_values,
+    )
+    vent_matchers: dict[str, _StateMatcher] = {
+        veid: _resolve_vent_matcher(veid, vent_sensor_map, vent_open_values, vent_closed_values)
+        for veid in vent_specs
+    }
+    dev_unique = _UniqueValueCollector()
+    vent_uniques: dict[str, _UniqueValueCollector] = {
+        veid: _UniqueValueCollector() for veid in vent_specs
+    }
+
     cur_dev_active: bool = False
     cur_dev_heating: bool = is_heating_default
     has_dev_seed: bool = False
@@ -657,22 +847,28 @@ async def async_bootstrap_from_influxdb(
         # Pre-chunk LOCF seed queries for device & ventilation entities
         seed_dev = await _fetch_pre_chunk_state(client, device_spec, c_start_ms)
         if seed_dev is not None:
-            cur_dev_active = _parse_device_active(seed_dev)
+            dev_unique.add(seed_dev)
+            matched_dev = device_matcher.match(seed_dev)
+            if matched_dev is not None:
+                cur_dev_active = matched_dev
+                has_dev_seed = True
             if isinstance(seed_dev, str):
                 s_low = seed_dev.strip().lower()
                 if s_low in _HEATING_STRINGS:
                     cur_dev_heating = True
                 elif s_low in _COOLING_STRINGS:
                     cur_dev_heating = False
-            has_dev_seed = True
         elif not has_dev_seed:
             cur_dev_active = False
 
         for veid, vspec in vent_specs.items():
             seed_v = await _fetch_pre_chunk_state(client, vspec, c_start_ms)
             if seed_v is not None:
-                cur_vent_states[veid] = _parse_vent_state(seed_v)
-                has_vent_seed[veid] = True
+                vent_uniques[veid].add(seed_v)
+                matched_v = vent_matchers[veid].match(seed_v)
+                if matched_v is not None:
+                    cur_vent_states[veid] = "on" if matched_v else "off"
+                    has_vent_seed[veid] = True
             elif not has_vent_seed[veid]:
                 cur_vent_states[veid] = "off"
 
@@ -686,6 +882,12 @@ async def async_bootstrap_from_influxdb(
             for veid, vspec in vent_specs.items()
         }
 
+        for _, raw_dev in dev_events:
+            dev_unique.add(raw_dev)
+        for veid, ev_list in vent_events.items():
+            for _, raw_v in ev_list:
+                vent_uniques[veid].add(raw_v)
+
         dev_ptr = 0
         dev_len = len(dev_events)
         vent_ptrs: dict[str, int] = {veid: 0 for veid in vent_specs}
@@ -693,10 +895,12 @@ async def async_bootstrap_from_influxdb(
         for m in range(chunk_minutes):
             cur_dt = chunk_start + timedelta(minutes=m)
 
-            # Advance device state transitions up to current minute m
+            # Advance device state transitions up to current minute m (keep LOCF on unmapped/unknown)
             while dev_ptr < dev_len and dev_events[dev_ptr][0] <= m:
                 raw_dev = dev_events[dev_ptr][1]
-                cur_dev_active = _parse_device_active(raw_dev)
+                matched_dev = device_matcher.match(raw_dev)
+                if matched_dev is not None:
+                    cur_dev_active = matched_dev
                 if isinstance(raw_dev, str):
                     s_low = raw_dev.strip().lower()
                     if s_low in _HEATING_STRINGS:
@@ -705,13 +909,15 @@ async def async_bootstrap_from_influxdb(
                         cur_dev_heating = False
                 dev_ptr += 1
 
-            # Advance ventilation states up to current minute m
+            # Advance ventilation states up to current minute m (keep LOCF on unmapped/unknown)
             if vent_specs:
                 for veid, ev_list in vent_events.items():
                     ptr = vent_ptrs[veid]
                     ev_len = len(ev_list)
                     while ptr < ev_len and ev_list[ptr][0] <= m:
-                        cur_vent_states[veid] = _parse_vent_state(ev_list[ptr][1])
+                        matched_v = vent_matchers[veid].match(ev_list[ptr][1])
+                        if matched_v is not None:
+                            cur_vent_states[veid] = "on" if matched_v else "off"
                         ptr += 1
                     vent_ptrs[veid] = ptr
                     replay_hass.states.set_state(veid, cur_vent_states[veid])
@@ -893,6 +1099,27 @@ async def async_bootstrap_from_influxdb(
         else round(coasting.tau_coast, 4)
     )
 
+    discovered_states: dict[str, Any] = {
+        "device": {
+            "entity_id": device_eid,
+            "measurement": device_spec.measurement,
+            "field": device_spec.field,
+            "unique_values": dev_unique.values(),
+            "applied_active_values": device_matcher.applied_active_summary(),
+            "applied_inactive_values": device_matcher.applied_inactive_summary(),
+        },
+        "ventilation": {
+            veid: {
+                "measurement": vspec.measurement,
+                "field": vspec.field,
+                "unique_values": vent_uniques[veid].values(),
+                "applied_active_values": vent_matchers[veid].applied_active_summary(),
+                "applied_inactive_values": vent_matchers[veid].applied_inactive_summary(),
+            }
+            for veid, vspec in vent_specs.items()
+        },
+    }
+
     return {
         "applied": applied,
         "dry_run": dry_run,
@@ -900,6 +1127,7 @@ async def async_bootstrap_from_influxdb(
         "total_minutes_scanned": total_minutes_scanned,
         "in_range_minutes": in_range_minutes,
         "skipped_out_of_range_minutes": skipped_out_of_range_minutes,
+        "discovered_states": discovered_states,
         "rls_updates": rls_updates,
         "rls_rejected_outliers": max(0, rls.rejected_outliers - init_rls_rejected),
         "accepted_cycles": max(0, coasting.accepted_count - init_accepted),

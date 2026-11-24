@@ -770,3 +770,247 @@ async def test_duration_dict_vent_debounce_and_string_state_sensor(hass) -> None
     assert res["accepted_cycles"] == 1
     assert res["rls_updates"] >= 3
     await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_boiler_switch_string_and_numeric_with_unknown_locf(hass) -> None:
+    """Boiler switch learns identically for string 'ON'/'off' and numeric 1/0, preserving LOCF on 'unknown'."""
+    now = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
+    dt_util.set_utcnow(now)
+
+    def _make_entry(eid: str) -> ConfigEntry:
+        return ConfigEntry(
+            entry_id=eid,
+            title=f"Boiler {eid}",
+            data={
+                CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_HEATER,
+                CONF_CONTROL_MODE: CONTROL_MODE_SWITCH_PWM,
+                CONF_INDOOR_SENSOR: "sensor.living_temp",
+                CONF_TARGET_DEVICE: "switch.boiler",
+                CONF_INERTIA_PROFILE: "fast_air",
+                CONF_KP: 20.0,
+                CONF_KI: 0.5,
+                CONF_KE: 0.5,
+            },
+            version=2,
+        )
+
+    # Case A: string "ON" / "off" in "state" field (auto-discovered) + "unknown" mid-cycle
+    entry_str = _make_entry("entry_str_sw")
+    er.async_get(hass).async_register(
+        "climate.entry_str_sw", entry_str.entry_id, platform=Platform.CLIMATE, unique_id="entry_str_sw_thermostat"
+    )
+    await async_setup_entry(hass, entry_str)
+
+    sess_str = FakeInfluxSession()
+    hass._mock_http_session = sess_str
+    t = now - timedelta(hours=2)
+    sess_str.add_point("switch", "boiler", "state", int((t - timedelta(minutes=2)).timestamp() * 1000), "off")
+    temp = 19.0
+    for m in range(20):
+        ts_ms = int(t.timestamp() * 1000)
+        if m == 0:
+            sess_str.add_point("switch", "boiler", "state", ts_ms, " ON ")
+        elif m == 10:
+            # Exceptional value must NOT drop active state (LOCF keeps active)
+            sess_str.add_point("switch", "boiler", "state", ts_ms, "unknown")
+        sess_str.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3))
+        temp += 0.08
+        t += timedelta(minutes=1)
+    for idx, d in enumerate([0.2, 0.2, -0.15, -0.15]):
+        ts_ms = int(t.timestamp() * 1000)
+        if idx == 0:
+            sess_str.add_point("switch", "boiler", "state", ts_ms, "off")
+        temp += d
+        sess_str.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3))
+        t += timedelta(minutes=1)
+
+    res_str = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_BOOTSTRAP_INFLUXDB,
+        {
+            "entity_id": "climate.entry_str_sw",
+            "days": 1,
+            "dry_run": False,
+        },
+        return_response=True,
+    )
+    assert res_str["applied"] is True
+    assert res_str["accepted_cycles"] == 1
+    assert res_str["rls_updates"] >= 3
+    assert res_str["discovered_states"]["device"]["field"] == "state"
+    assert "ON" in res_str["discovered_states"]["device"]["unique_values"]
+    assert "off" in res_str["discovered_states"]["device"]["unique_values"]
+    assert "unknown" in res_str["discovered_states"]["device"]["unique_values"]
+
+    # Case B: numeric 1.0 / 0 with explicit device_active_values / device_inactive_values
+    entry_num = _make_entry("entry_num_sw")
+    er.async_get(hass).async_register(
+        "climate.entry_num_sw", entry_num.entry_id, platform=Platform.CLIMATE, unique_id="entry_num_sw_thermostat"
+    )
+    await async_setup_entry(hass, entry_num)
+
+    sess_num = FakeInfluxSession()
+    hass._mock_http_session = sess_num
+    t = now - timedelta(hours=2)
+    sess_num.add_point("state", "boiler", "value", int((t - timedelta(minutes=2)).timestamp() * 1000), 0)
+    temp = 19.0
+    for m in range(20):
+        ts_ms = int(t.timestamp() * 1000)
+        if m == 0:
+            sess_num.add_point("state", "boiler", "value", ts_ms, 1.0)
+        sess_num.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3))
+        temp += 0.08
+        t += timedelta(minutes=1)
+    for idx, d in enumerate([0.2, 0.2, -0.15, -0.15]):
+        ts_ms = int(t.timestamp() * 1000)
+        if idx == 0:
+            sess_num.add_point("state", "boiler", "value", ts_ms, 0)
+        temp += d
+        sess_num.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3))
+        t += timedelta(minutes=1)
+
+    res_num = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_BOOTSTRAP_INFLUXDB,
+        {
+            "entity_id": "climate.entry_num_sw",
+            "days": 1,
+            "device_active_values": ["1"],
+            "device_inactive_values": ["0"],
+            "dry_run": False,
+        },
+        return_response=True,
+    )
+    assert res_num["applied"] is True
+    assert res_num["accepted_cycles"] == 1
+    assert res_num["rls_updates"] >= 3
+    assert res_num["discovered_states"]["device"]["applied_active_values"] == ["1"]
+    assert res_num["discovered_states"]["device"]["applied_inactive_values"] == ["0"]
+
+    await async_unload_entry(hass, entry_str)
+    await async_unload_entry(hass, entry_num)
+
+
+@pytest.mark.asyncio
+async def test_mixed_normal_and_inverted_ventilation_sensor_map(hass) -> None:
+    """Mixed normal (1/'on'=open) and inverted (0/'off'=open) doors block learning & cooldown accurately."""
+    now = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
+    dt_util.set_utcnow(now)
+
+    entry = ConfigEntry(
+        entry_id="entry_inv_vent",
+        title="Inverted Vent Boiler",
+        data={
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_HEATER,
+            CONF_CONTROL_MODE: CONTROL_MODE_SWITCH_PWM,
+            CONF_INDOOR_SENSOR: "sensor.living_temp",
+            CONF_TARGET_DEVICE: "switch.boiler",
+            CONF_INERTIA_PROFILE: "fast_air",
+            CONF_KP: 20.0,
+            CONF_KI: 0.5,
+            CONF_KE: 0.5,
+        },
+        version=2,
+    )
+    er.async_get(hass).async_register(
+        "climate.entry_inv_vent", entry.entry_id, platform=Platform.CLIMATE, unique_id="entry_inv_vent_thermostat"
+    )
+    await async_setup_entry(hass, entry)
+
+    session = FakeInfluxSession()
+    hass._mock_http_session = session
+
+    t = now - timedelta(hours=3)
+    # Seed: normal_door closed ("off"), inverted_door closed (1 = closed for inverted!)
+    seed_ms = int((t - timedelta(minutes=2)).timestamp() * 1000)
+    session.add_point("state", "boiler", "value", seed_ms, 0)
+    session.add_point("binary_sensor", "normal_door", "state", seed_ms, "off")
+    session.add_point("binary_sensor", "inverted_door", "value", seed_ms, 1)
+
+    # Cycle 1: clean (both closed, inverted_door gets "unavailable" briefly -> LOCF stays closed!)
+    temp = 19.0
+    for m in range(20):
+        ts_ms = int(t.timestamp() * 1000)
+        if m == 0:
+            session.add_point("state", "boiler", "value", ts_ms, 1)
+        if m == 5:
+            session.add_point("binary_sensor", "inverted_door", "value", ts_ms, "unavailable")
+        session.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3))
+        temp += 0.08
+        t += timedelta(minutes=1)
+    for idx, d in enumerate([0.2, 0.2, -0.15, -0.15]):
+        ts_ms = int(t.timestamp() * 1000)
+        if idx == 0:
+            session.add_point("state", "boiler", "value", ts_ms, 0)
+        temp += d
+        session.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3))
+        t += timedelta(minutes=1)
+
+    # Wait 10 min
+    for _ in range(10):
+        session.add_point("°C", "living_temp", "value", int(t.timestamp() * 1000), round(temp, 3))
+        t += timedelta(minutes=1)
+
+    # Cycle 2: inverted_door opens (0 = open!) for 3 min then closes (1 = closed), triggering 20m cooldown
+    for m in range(20):
+        ts_ms = int(t.timestamp() * 1000)
+        if m == 0:
+            session.add_point("state", "boiler", "value", ts_ms, 1)
+        if m == 2:
+            session.add_point("binary_sensor", "inverted_door", "value", ts_ms, 0)
+        if m == 5:
+            session.add_point("binary_sensor", "inverted_door", "value", ts_ms, 1)
+        session.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3))
+        temp += 0.05
+        t += timedelta(minutes=1)
+    for idx, d in enumerate([0.1, 0.1, -0.1, -0.1]):
+        ts_ms = int(t.timestamp() * 1000)
+        if idx == 0:
+            session.add_point("state", "boiler", "value", ts_ms, 0)
+        temp += d
+        session.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3))
+        t += timedelta(minutes=1)
+
+    res = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_BOOTSTRAP_INFLUXDB,
+        {
+            "entity_id": "climate.entry_inv_vent",
+            "days": 1,
+            "ventilation_entity_ids": [
+                "binary_sensor.normal_door",
+                "binary_sensor.inverted_door",
+            ],
+            "ventilation_open_values": [1, "on", "open"],
+            "ventilation_closed_values": [0, "off", "closed"],
+            "ventilation_sensor_map": {
+                "binary_sensor.inverted_door": {
+                    "open": [0, "off"],
+                    "closed": [1, "on"],
+                }
+            },
+            "dry_run": True,
+        },
+        return_response=True,
+    )
+
+    # Cycle 1 accepted, Cycle 2 rejected due to inverted_door opening + 20m cooldown
+    assert res["accepted_cycles"] == 1
+    assert res["rejected_cycles"].get("ventilation_contamination", 0) >= 1
+
+    # Verify discovered_states & dry_run immutability
+    disc = res["discovered_states"]
+    assert disc["device"]["unique_values"] == [0, 1]
+    assert "binary_sensor.inverted_door" in disc["ventilation"]
+    inv_info = disc["ventilation"]["binary_sensor.inverted_door"]
+    assert inv_info["applied_active_values"] == [0, "off"]
+    assert inv_info["applied_inactive_values"] == [1, "on"]
+    assert 0 in inv_info["unique_values"] and 1 in inv_info["unique_values"]
+    assert "unavailable" in inv_info["unique_values"]
+
+    rt: SmartPIDRuntime = entry.runtime_data
+    assert rt._active_rls().sample_count == 0
+    assert rt.snapshot.coasting.accepted_count == 0
+    await async_unload_entry(hass, entry)
+

@@ -7,6 +7,20 @@
 
 ---
 
+## [0.4.2] - 2026-11-24
+
+### 추가 (Added)
+- **InfluxDB 기록 상태 사전 확인(`discovered_states`) (`influxdb_bootstrap.py`)**:
+  - `bootstrap_from_influxdb` 반환 결과에 제어 기기 및 각 환기 센서의 탐지된 `measurement`, `field`, 조회 기간 내 고유 기록 값(`unique_values`), 적용된 동작/미동작 매핑(`applied_active_values`, `applied_inactive_values`) 포함 (`dry_run=true`로 사전 확인 가능)
+- **기기·환기(인버트 포함) 커스텀 매핑 및 값 정규화 매처 (`influxdb_bootstrap.py`, `__init__.py`, `services.yaml`, `translations/*.json`)**:
+  - 숫자(`1 == 1.0 == "1"`)·문자열(대소문자 및 공백 무시) 일관 비교 매처 도입
+  - `device_active_values`, `device_inactive_values`, `ventilation_open_values`, `ventilation_closed_values`, `ventilation_sensor_map`(엔티티별 인버트 센서 오버라이드) 파라미터 추가 및 `device_field` 미지정 시 `"value"`/`"state"` 자동 탐색
+  - 매핑에 없는 예외 값(`"unknown"`, `"unavailable"` 등)은 오판정하지 않고 직전 정상 상태(LOCF) 유지
+- **회귀 테스트 보강 (`tests/test_influxdb_bootstrap.py`)**:
+  - 문자열 `"on"`/`"off"` 및 숫자 `1`/`0` 스위치 + `"unknown"` LOCF, 일반+인버트 문열림 센서 혼합 매핑, `dry_run` `discovered_states` 반환 검증 추가
+
+---
+
 ## [0.4.1] - 2026-11-24
 
 ### 수정 (Fixed)

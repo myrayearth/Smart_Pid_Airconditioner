@@ -1152,8 +1152,8 @@
           "description": "Optional ventilation entities to exclude open/cooldown intervals from learning (defaults to configured ventilation guard)."
         },
         "device_field": {
-          "name": "Device Value Field",
-          "description": "InfluxDB field name holding numeric 1/0 or state activity (default: value)."
+          "name": "Device Value Field (Optional)",
+          "description": "InfluxDB field name for switch/device state. Auto-discovers value/state if omitted."
         },
         "indoor_measurement": {
           "name": "Indoor Measurement Override",
@@ -1178,6 +1178,26 @@
         "dry_run": {
           "name": "Dry Run (Preview Only)",
           "description": "Simulate training and return metrics/recommendations without modifying live runtime state or storage."
+        },
+        "device_active_values": {
+          "name": "Device Active (ON) Values (Optional)",
+          "description": "List of InfluxDB values treated as active/ON (e.g. [1, \"on\"]). Uses default fallback if omitted."
+        },
+        "device_inactive_values": {
+          "name": "Device Inactive (OFF) Values (Optional)",
+          "description": "List of InfluxDB values treated as inactive/OFF (e.g. [0, \"off\"]). Uses default fallback if omitted."
+        },
+        "ventilation_open_values": {
+          "name": "Ventilation Open Values (Common, Optional)",
+          "description": "Common list of InfluxDB values treated as open/ventilating across ventilation sensors (e.g. [1, \"on\", \"open\"])."
+        },
+        "ventilation_closed_values": {
+          "name": "Ventilation Closed Values (Common, Optional)",
+          "description": "Common list of InfluxDB values treated as closed/normal across ventilation sensors (e.g. [0, \"off\", \"closed\"])."
+        },
+        "ventilation_sensor_map": {
+          "name": "Per-Sensor Ventilation Mapping (Inverted Sensors, Optional)",
+          "description": "Per-entity override map for inverted or custom sensors (e.g. {\"binary_sensor.inverted_door\": {\"open\": [0, \"off\"], \"closed\": [1, \"on\"]}})."
         }
       }
     }
