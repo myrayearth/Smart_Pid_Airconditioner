@@ -7,6 +7,17 @@
 
 ---
 
+## [0.6.1] - 2026-11-24
+
+### 수정 및 개선 (Fixed & Improved)
+- **InfluxDB v1 과거 이력 부트스트랩 자동 탐색 고도화 (`influxdb_bootstrap.py`, `tests/test_influxdb_bootstrap.py`)**:
+  - 기본 measurement 후보에 엔티티 ID 자체(`entity_id`, 예: `switch.heat`), 도메인 제거 짧은 ID(`short_id`, 예: `heat`), `"units"`를 자동 포함해 HA 기본 InfluxDB 스키마(`unit_of_measurement` 미지정 스위치 등) 및 `default_measurement: units` 환경 완벽 지원
+  - 정적 후보 미탐지 시 `InfluxDBv1Client.async_query_raw()` 기반 `SHOW SERIES WHERE ...` 및 `SHOW FIELD KEYS FROM ...` 동적 탐색 폴백 추가
+  - `_entity_where_clause()`에 `domain` 태그 일치 또는 빈 값(`"domain" = 'switch' OR "domain" = ''`) 조건을 추가해 동명 엔티티(`sensor.heat` vs `switch.heat`) 간 도메인 충돌 방지 및 커스텀 스키마 호환성 유지
+  - 탐색 실패 시 시도한 measurement/field 후보, `SHOW SERIES` 발견 목록 로그 경고 및 `device_measurement`/`device_field` 오버라이드 안내 개선
+
+---
+
 ## [0.6.0] - 2026-11-24
 
 ### 추가 (Added)

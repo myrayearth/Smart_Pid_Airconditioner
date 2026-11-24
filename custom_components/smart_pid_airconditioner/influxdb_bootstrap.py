@@ -61,12 +61,61 @@ def _escape_ident(val: str) -> str:
 
 
 def _entity_where_clause(entity_id: str) -> str:
-    """Match both stripped short entity_id (HA InfluxDB default) and full domain.entity_id."""
+    """Match domain-scoped short entity_id (HA InfluxDB default) and full domain.entity_id."""
     eid = entity_id.strip()
     if "." in eid:
-        short_id = eid.split(".", 1)[1]
-        return f'("entity_id" = \'{_escape_tag(short_id)}\' OR "entity_id" = \'{_escape_tag(eid)}\')'
+        domain, short_id = eid.split(".", 1)
+        return (
+            f'(("entity_id" = \'{_escape_tag(short_id)}\' '
+            f'AND ("domain" = \'{_escape_tag(domain)}\' OR "domain" = \'\')) '
+            f'OR "entity_id" = \'{_escape_tag(eid)}\')'
+        )
     return f'"entity_id" = \'{_escape_tag(eid)}\''
+
+
+def _expand_measurement_candidates(
+    entity_id: str, base_candidates: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Expand measurement candidates with entity_id, short_id, and 'units'."""
+    eid = entity_id.strip()
+    short_id = eid.split(".", 1)[1] if "." in eid else ""
+    extras: list[str] = [eid]
+    if short_id:
+        extras.append(short_id)
+    extras.append("units")
+    return tuple(dict.fromkeys((*base_candidates, *extras)))
+
+
+def _split_unescaped(text: str, sep: str) -> list[str]:
+    """Split text on unescaped separator characters."""
+    parts: list[str] = []
+    buf: list[str] = []
+    escaped = False
+    for ch in text:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == sep:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+
+def _parse_show_series_key(series_key: str) -> tuple[str, dict[str, str]]:
+    """Parse InfluxDB SHOW SERIES key ('<meas>,<tag1>=<val1>,...') into (measurement, tags)."""
+    parts = _split_unescaped(series_key, ",")
+    measurement = parts[0] if parts else ""
+    tags: dict[str, str] = {}
+    for token in parts[1:]:
+        kv = _split_unescaped(token, "=")
+        if len(kv) >= 2:
+            tags[kv[0]] = "=".join(kv[1:])
+    return measurement, tags
 
 
 def _parse_float(val: Any) -> float | None:
@@ -334,8 +383,8 @@ class InfluxDBv1Client:
             encoded = base64.b64encode(raw).decode("ascii")
             self._headers["Authorization"] = f"Basic {encoded}"
 
-    async def async_query(self, query: str) -> list[tuple[int, Any]]:
-        """Execute InfluxQL query with epoch=ms and return list of (ts_ms, value)."""
+    async def async_query_raw(self, query: str) -> list[dict[str, Any]]:
+        """Execute InfluxQL query with epoch=ms and return raw series dictionaries."""
         params = {
             "db": self._database,
             "q": query,
@@ -373,26 +422,93 @@ class InfluxDBv1Client:
             raise HomeAssistantError(f"InfluxDB returned error: {payload['error']}")
 
         results = payload.get("results") or []
-        rows: list[tuple[int, Any]] = []
+        series_list: list[dict[str, Any]] = []
         for res in results:
             if not isinstance(res, dict):
                 continue
             if res.get("error"):
                 raise HomeAssistantError(f"InfluxDB query error: {res['error']}")
             for series in res.get("series") or []:
-                cols = series.get("columns") or []
-                values = series.get("values") or []
-                if len(cols) < 2:
-                    continue
-                time_idx = cols.index("time") if "time" in cols else 0
-                val_idx = next((i for i, c in enumerate(cols) if c != "time"), 1)
-                for row in values:
-                    if len(row) > max(time_idx, val_idx) and row[time_idx] is not None:
-                        try:
-                            rows.append((int(row[time_idx]), row[val_idx]))
-                        except (ValueError, TypeError):
-                            continue
+                if isinstance(series, dict):
+                    series_list.append(series)
+        return series_list
+
+    async def async_query(self, query: str) -> list[tuple[int, Any]]:
+        """Execute InfluxQL query with epoch=ms and return list of (ts_ms, value)."""
+        series_list = await self.async_query_raw(query)
+        rows: list[tuple[int, Any]] = []
+        for series in series_list:
+            cols = series.get("columns") or []
+            values = series.get("values") or []
+            if len(cols) < 2:
+                continue
+            time_idx = cols.index("time") if "time" in cols else 0
+            val_idx = next((i for i, c in enumerate(cols) if c != "time"), 1)
+            for row in values:
+                if len(row) > max(time_idx, val_idx) and row[time_idx] is not None:
+                    try:
+                        rows.append((int(row[time_idx]), row[val_idx]))
+                    except (ValueError, TypeError):
+                        continue
         return rows
+
+    async def async_discover_measurements(self, entity_id: str) -> list[str]:
+        """Discover measurements containing entity_id via SHOW SERIES."""
+        eid = entity_id.strip()
+        expected_domain = eid.split(".", 1)[0] if "." in eid else None
+        where = _entity_where_clause(eid)
+        try:
+            series_list = await self.async_query_raw(f"SHOW SERIES WHERE {where}")
+        except Exception as err:
+            _LOGGER.debug("SHOW SERIES discovery failed for '%s': %s", eid, err)
+            return []
+
+        exact_domain_meas: list[str] = []
+        fallback_meas: list[str] = []
+        for series in series_list:
+            cols = series.get("columns") or []
+            key_idx = cols.index("key") if "key" in cols else 0
+            for row in series.get("values") or []:
+                if not isinstance(row, (list, tuple)) or len(row) <= key_idx:
+                    continue
+                meas, tags = _parse_show_series_key(str(row[key_idx]))
+                if not meas:
+                    continue
+                dom = tags.get("domain")
+                tag_eid = tags.get("entity_id")
+                if expected_domain is not None and dom == expected_domain:
+                    exact_domain_meas.append(meas)
+                elif not dom or tag_eid == eid:
+                    fallback_meas.append(meas)
+
+        return list(dict.fromkeys([*exact_domain_meas, *fallback_meas]))
+
+    async def async_discover_fields(self, measurement: str) -> list[str]:
+        """Discover available field keys for a measurement via SHOW FIELD KEYS."""
+        try:
+            series_list = await self.async_query_raw(
+                f'SHOW FIELD KEYS FROM "{_escape_ident(measurement)}"'
+            )
+        except Exception as err:
+            _LOGGER.debug("SHOW FIELD KEYS failed for '%s': %s", measurement, err)
+            return []
+
+        discovered: list[str] = []
+        for series in series_list:
+            cols = series.get("columns") or []
+            key_idx = cols.index("fieldKey") if "fieldKey" in cols else 0
+            for row in series.get("values") or []:
+                if not isinstance(row, (list, tuple)) or len(row) <= key_idx:
+                    continue
+                fld = str(row[key_idx]).strip()
+                if fld:
+                    discovered.append(fld)
+
+        priority = ("value", "state", "state_str")
+        ordered = [f for f in priority if f in discovered] + [
+            f for f in discovered if f not in priority
+        ]
+        return list(dict.fromkeys(ordered))
 
 
 async def _resolve_series_spec(
@@ -405,28 +521,90 @@ async def _resolve_series_spec(
     end_ms: int,
     *,
     is_temperature: bool = False,
+    diagnostics: dict[str, Any] | None = None,
 ) -> _SeriesSpec | None:
     """Resolve measurement and field containing data in [start_ms, end_ms]."""
     where = _entity_where_clause(entity_id)
-    measurements = (explicit_measurement,) if explicit_measurement else meas_candidates
+    measurements = (
+        (explicit_measurement,)
+        if explicit_measurement
+        else _expand_measurement_candidates(entity_id, meas_candidates)
+    )
 
+    tried_measurements: list[str] = []
+    tried_fields: list[str] = list(dict.fromkeys(field_candidates))
+    tried_pairs: set[tuple[str, str]] = set()
+
+    async def _try_pair(meas: str, fld: str) -> _SeriesSpec | None:
+        if (meas, fld) in tried_pairs:
+            return None
+        tried_pairs.add((meas, fld))
+        if meas not in tried_measurements:
+            tried_measurements.append(meas)
+        if fld not in tried_fields:
+            tried_fields.append(fld)
+        q = (
+            f'SELECT "{_escape_ident(fld)}" FROM "{_escape_ident(meas)}" '
+            f"WHERE {where} AND time >= {start_ms}ms AND time <= {end_ms}ms LIMIT 1"
+        )
+        rows = await client.async_query(q)
+        if rows:
+            sample_val = rows[0][1]
+            is_num = isinstance(sample_val, (int, float)) and not isinstance(sample_val, bool)
+            return _SeriesSpec(
+                entity_id=entity_id,
+                measurement=meas,
+                field=fld,
+                is_fahrenheit=(is_temperature and meas == "°F"),
+                is_numeric_field=is_num,
+            )
+        return None
+
+    # Pass 1: Static / expanded measurement candidates
     for meas in measurements:
         for fld in field_candidates:
-            q = (
-                f'SELECT "{_escape_ident(fld)}" FROM "{_escape_ident(meas)}" '
-                f"WHERE {where} AND time >= {start_ms}ms AND time <= {end_ms}ms LIMIT 1"
-            )
-            rows = await client.async_query(q)
-            if rows:
-                sample_val = rows[0][1]
-                is_num = isinstance(sample_val, (int, float)) and not isinstance(sample_val, bool)
-                return _SeriesSpec(
-                    entity_id=entity_id,
-                    measurement=meas,
-                    field=fld,
-                    is_fahrenheit=(is_temperature and meas == "°F"),
-                    is_numeric_field=is_num,
-                )
+            spec = await _try_pair(meas, fld)
+            if spec is not None:
+                return spec
+
+    # Pass 2: Dynamic measurement discovery via SHOW SERIES
+    discovered_measurements: list[str] = []
+    if explicit_measurement is None:
+        discovered_measurements = await client.async_discover_measurements(entity_id)
+        for meas in discovered_measurements:
+            for fld in field_candidates:
+                spec = await _try_pair(meas, fld)
+                if spec is not None:
+                    return spec
+
+    # Pass 3: Dynamic field discovery via SHOW FIELD KEYS
+    field_discovery_targets = (
+        (explicit_measurement,)
+        if explicit_measurement
+        else tuple(discovered_measurements)
+    )
+    for meas in field_discovery_targets:
+        discovered_fields = await client.async_discover_fields(meas)
+        for fld in discovered_fields:
+            spec = await _try_pair(meas, fld)
+            if spec is not None:
+                return spec
+
+    if diagnostics is not None:
+        diagnostics["tried_measurements"] = tried_measurements
+        diagnostics["tried_fields"] = tried_fields
+        diagnostics["discovered_measurements"] = discovered_measurements
+
+    _LOGGER.warning(
+        "Failed to resolve InfluxDB series for '%s' in [%d..%d]: "
+        "tried measurements=%s, fields=%s, SHOW SERIES discovered=%s",
+        entity_id,
+        start_ms,
+        end_ms,
+        tried_measurements,
+        tried_fields,
+        discovered_measurements,
+    )
     return None
 
 
@@ -629,6 +807,7 @@ async def async_bootstrap_from_influxdb(
     hum_spec: _SeriesSpec | None = None
 
     if is_humidity:
+        hum_diag: dict[str, Any] = {}
         hum_spec = await _resolve_series_spec(
             client,
             indoor_hum_eid,  # type: ignore[arg-type]
@@ -637,10 +816,13 @@ async def async_bootstrap_from_influxdb(
             ("value", "state"),
             start_ms,
             end_ms,
+            diagnostics=hum_diag,
         )
         if hum_spec is None:
+            discovered = hum_diag.get("discovered_measurements") or []
+            hint = f" (SHOW SERIES found: {discovered}; try 'indoor_measurement')" if discovered else " (try setting 'indoor_measurement')"
             raise HomeAssistantError(
-                f"No historical humidity data found in InfluxDB for '{indoor_hum_eid}' over the last {days} days."
+                f"No historical humidity data found in InfluxDB for '{indoor_hum_eid}' over the last {days} days{hint}."
             )
         if indoor_temp_eid:
             temp_spec = await _resolve_series_spec(
@@ -663,6 +845,7 @@ async def async_bootstrap_from_influxdb(
             elif temp_spec.is_fahrenheit:
                 warnings.append(f"Converted '{indoor_temp_eid}' values from °F to °C.")
     else:
+        temp_diag: dict[str, Any] = {}
         temp_spec = await _resolve_series_spec(
             client,
             indoor_temp_eid,  # type: ignore[arg-type]
@@ -672,10 +855,13 @@ async def async_bootstrap_from_influxdb(
             start_ms,
             end_ms,
             is_temperature=True,
+            diagnostics=temp_diag,
         )
         if temp_spec is None:
+            discovered = temp_diag.get("discovered_measurements") or []
+            hint = f" (SHOW SERIES found: {discovered}; try 'indoor_measurement')" if discovered else " (try setting 'indoor_measurement')"
             raise HomeAssistantError(
-                f"No historical temperature data found in InfluxDB for '{indoor_temp_eid}' over the last {days} days."
+                f"No historical temperature data found in InfluxDB for '{indoor_temp_eid}' over the last {days} days{hint}."
             )
         if temp_spec.is_fahrenheit:
             warnings.append(f"Converted '{indoor_temp_eid}' values from °F to °C.")
@@ -698,6 +884,7 @@ async def async_bootstrap_from_influxdb(
         device_fields = tuple(dict.fromkeys((raw_device_field, "value", "state")))
     else:
         device_fields = ("value", "state")
+    dev_diag: dict[str, Any] = {}
     device_spec = await _resolve_series_spec(
         client,
         device_eid,
@@ -706,10 +893,17 @@ async def async_bootstrap_from_influxdb(
         device_fields,
         start_ms,
         end_ms,
+        diagnostics=dev_diag,
     )
     if device_spec is None:
+        discovered = dev_diag.get("discovered_measurements") or []
+        hint = (
+            f" (SHOW SERIES found: {discovered}; try specifying 'device_measurement' or 'device_field')"
+            if discovered
+            else " (try specifying 'device_measurement' and/or 'device_field')"
+        )
         raise HomeAssistantError(
-            f"No historical device activity data found in InfluxDB for '{device_eid}' over the last {days} days."
+            f"No historical device activity data found in InfluxDB for '{device_eid}' over the last {days} days{hint}."
         )
 
     outdoor_spec: _SeriesSpec | None = None

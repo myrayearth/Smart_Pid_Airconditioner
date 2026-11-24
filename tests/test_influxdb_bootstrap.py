@@ -68,22 +68,50 @@ class FakeInfluxSession:
     """In-memory InfluxQL query evaluator for testing HTTP GET /query calls."""
 
     def __init__(self) -> None:
-        self.series: dict[tuple[str, str, str], list[tuple[int, Any]]] = {}
+        self.series: dict[tuple[str, str, str | None, str], list[tuple[int, Any]]] = {}
         self.requests: list[dict[str, Any]] = []
         self.force_status: int | None = None
         self.force_error: Exception | None = None
         self.force_json_error: str | None = None
 
-    def add_point(self, measurement: str, entity_tag: str, field: str, ts_ms: int, val: Any) -> None:
-        self.series.setdefault((measurement, entity_tag, field), []).append((ts_ms, val))
+    def add_point(
+        self,
+        measurement: str,
+        entity_tag: str,
+        field: str,
+        ts_ms: int,
+        val: Any,
+        *,
+        domain_tag: str | None = None,
+    ) -> None:
+        self.series.setdefault((measurement, entity_tag, domain_tag, field), []).append(
+            (ts_ms, val)
+        )
+
+    @staticmethod
+    def _matches_where(etag: str, dtag: str | None, q: str) -> bool:
+        m_dom = re.search(
+            r'\("entity_id"\s*=\s*\'([^\']+)\'\s+AND\s+\("domain"\s*=\s*\'([^\']+)\'\s+OR\s+"domain"\s*=\s*\'\'\)\)\s+OR\s+"entity_id"\s*=\s*\'([^\']+)\'',
+            q,
+        )
+        if m_dom:
+            short_id, expected_dom, full_id = m_dom.group(1), m_dom.group(2), m_dom.group(3)
+            if etag == full_id:
+                return True
+            if etag == short_id and (dtag is None or dtag == "" or dtag == expected_dom):
+                return True
+            return False
+        matched_tags = set(re.findall(r'"entity_id"\s*=\s*\'([^\']+)\'', q))
+        if not matched_tags:
+            return True
+        return etag in matched_tags
 
     def _lookup_rows(self, meas: str, q: str, field: str) -> list[tuple[int, Any]]:
-        matched_tags = set(re.findall(r'"entity_id"\s*=\s*\'([^\']+)\'', q))
         rows: list[tuple[int, Any]] = []
-        for (m, etag, fld), pts in self.series.items():
+        for (m, etag, dtag, fld), pts in self.series.items():
             if m != meas or fld != field:
                 continue
-            if matched_tags and etag not in matched_tags:
+            if not self._matches_where(etag, dtag, q):
                 continue
             rows.extend(pts)
         rows.sort(key=lambda item: item[0])
@@ -100,6 +128,38 @@ class FakeInfluxSession:
             return _MockResponse(200, {"error": self.force_json_error})
 
         q = str(params.get("q", ""))
+        q_stripped = q.strip()
+        q_upper = q_stripped.upper()
+
+        if q_upper.startswith("SHOW SERIES"):
+            keys: list[list[str]] = []
+            seen_keys: set[str] = set()
+            for m, etag, dtag, _fld in self.series:
+                if not self._matches_where(etag, dtag, q_stripped):
+                    continue
+                key = f"{m},domain={dtag},entity_id={etag}" if dtag else f"{m},entity_id={etag}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    keys.append([key])
+            series_obj = [{"columns": ["key"], "values": keys}] if keys else []
+            return _MockResponse(200, {"results": [{"statement_id": 0, "series": series_obj}]})
+
+        if q_upper.startswith("SHOW FIELD KEYS"):
+            m_fk = re.search(r'FROM\s+"([^"]+)"', q_stripped)
+            if not m_fk:
+                return _MockResponse(200, {"results": [{"statement_id": 0}]})
+            meas = m_fk.group(1)
+            fields = list(
+                dict.fromkeys(fld for (m, _etag, _dtag, fld) in self.series if m == meas)
+            )
+            values = [[fld, "string"] for fld in fields]
+            series_obj = (
+                [{"name": meas, "columns": ["fieldKey", "fieldType"], "values": values}]
+                if values
+                else []
+            )
+            return _MockResponse(200, {"results": [{"statement_id": 0, "series": series_obj}]})
+
         m_meas = re.search(r'FROM\s+"([^"]+)"', q)
         m_fld = re.search(r'SELECT\s+(?:MEAN\()?"([^"]+)"', q)
         if not m_meas or not m_fld:
@@ -1013,4 +1073,282 @@ async def test_mixed_normal_and_inverted_ventilation_sensor_map(hass) -> None:
     assert rt._active_rls().sample_count == 0
     assert rt.snapshot.coasting.accepted_count == 0
     await async_unload_entry(hass, entry)
+
+
+def _seed_switch_heat_cycle(
+    session: FakeInfluxSession,
+    start_dt: datetime,
+    *,
+    dev_meas: str,
+    dev_field: str = "value",
+    on_val: Any = 1,
+    off_val: Any = 0,
+    domain_tag: str | None = "switch",
+    entity_tag: str = "heat",
+) -> None:
+    """Seed one realistic heating cycle for switch.heat under an arbitrary measurement/field."""
+    session.add_point(
+        dev_meas,
+        entity_tag,
+        dev_field,
+        int((start_dt - timedelta(minutes=2)).timestamp() * 1000),
+        off_val,
+        domain_tag=domain_tag,
+    )
+    t = start_dt
+    temp = 19.0
+    for _ in range(25):
+        ts_ms = int(t.timestamp() * 1000)
+        session.add_point(dev_meas, entity_tag, dev_field, ts_ms, on_val, domain_tag=domain_tag)
+        session.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3), domain_tag="sensor")
+        temp += 0.08
+        t += timedelta(minutes=1)
+    for idx, d in enumerate([0.15, 0.25, 0.15, -0.05, -0.15, -0.15, -0.10]):
+        ts_ms = int(t.timestamp() * 1000)
+        if idx == 0:
+            session.add_point(dev_meas, entity_tag, dev_field, ts_ms, off_val, domain_tag=domain_tag)
+        temp += d
+        session.add_point("°C", "living_temp", "value", ts_ms, round(temp, 3), domain_tag="sensor")
+        t += timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_device_auto_discovery_entity_id_measurement_switch_heat(hass) -> None:
+    """switch.heat stored as measurement='switch.heat', field='value' auto-discovers and isolates domains."""
+    now = datetime(2026, 11, 24, 6, 0, 0, tzinfo=timezone.utc)
+    dt_util.set_utcnow(now)
+
+    entry = ConfigEntry(
+        entry_id="entry_switch_heat_eid",
+        title="Boiler Switch Heat",
+        data={
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_HEATER,
+            CONF_CONTROL_MODE: CONTROL_MODE_SWITCH_PWM,
+            CONF_INDOOR_SENSOR: "sensor.living_temp",
+            CONF_TARGET_DEVICE: "switch.heat",
+            CONF_INERTIA_PROFILE: "fast_air",
+            CONF_KP: 20.0,
+            CONF_KI: 0.5,
+            CONF_KE: 0.5,
+        },
+        version=2,
+    )
+    er.async_get(hass).async_register(
+        "climate.entry_switch_heat_eid",
+        entry.entry_id,
+        platform=Platform.CLIMATE,
+        unique_id=f"{entry.entry_id}_thermostat",
+    )
+    assert await async_setup_entry(hass, entry) is True
+
+    session = FakeInfluxSession()
+    hass._mock_http_session = session
+
+    t_start = now - timedelta(hours=3)
+    _seed_switch_heat_cycle(session, t_start, dev_meas="switch.heat", dev_field="value")
+    # Same short entity_id ('heat') under a different domain must NOT collide
+    session.add_point(
+        "switch.heat",
+        "heat",
+        "value",
+        int((t_start + timedelta(minutes=1)).timestamp() * 1000),
+        "wrong_domain_val",
+        domain_tag="sensor",
+    )
+
+    res = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_BOOTSTRAP_INFLUXDB,
+        {
+            "entity_id": "climate.entry_switch_heat_eid",
+            "days": 1,
+            "dry_run": True,
+        },
+        return_response=True,
+    )
+    dev = res["discovered_states"]["device"]
+    assert dev["entity_id"] == "switch.heat"
+    assert dev["measurement"] == "switch.heat"
+    assert dev["field"] == "value"
+    assert dev["unique_values"] == [0, 1]
+    assert res["accepted_cycles"] == 1
+    await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_device_auto_discovery_default_measurement_units(hass) -> None:
+    """switch.heat stored under default_measurement='units' auto-discovers cleanly."""
+    now = datetime(2026, 11, 24, 6, 0, 0, tzinfo=timezone.utc)
+    dt_util.set_utcnow(now)
+
+    entry = ConfigEntry(
+        entry_id="entry_switch_heat_units",
+        title="Boiler Units",
+        data={
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_HEATER,
+            CONF_CONTROL_MODE: CONTROL_MODE_SWITCH_PWM,
+            CONF_INDOOR_SENSOR: "sensor.living_temp",
+            CONF_TARGET_DEVICE: "switch.heat",
+            CONF_INERTIA_PROFILE: "fast_air",
+        },
+        version=2,
+    )
+    er.async_get(hass).async_register(
+        "climate.entry_switch_heat_units",
+        entry.entry_id,
+        platform=Platform.CLIMATE,
+        unique_id=f"{entry.entry_id}_thermostat",
+    )
+    assert await async_setup_entry(hass, entry) is True
+
+    session = FakeInfluxSession()
+    hass._mock_http_session = session
+    _seed_switch_heat_cycle(session, now - timedelta(hours=3), dev_meas="units", dev_field="value")
+
+    res = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_BOOTSTRAP_INFLUXDB,
+        {
+            "entity_id": "climate.entry_switch_heat_units",
+            "days": 1,
+            "dry_run": True,
+        },
+        return_response=True,
+    )
+    dev = res["discovered_states"]["device"]
+    assert dev["measurement"] == "units"
+    assert dev["field"] == "value"
+    assert dev["unique_values"] == [0, 1]
+    assert res["accepted_cycles"] == 1
+    await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_device_auto_discovery_show_series_and_field_keys_fallback(hass) -> None:
+    """Custom measurement & custom field fallback via SHOW SERIES + SHOW FIELD KEYS."""
+    now = datetime(2026, 11, 24, 6, 0, 0, tzinfo=timezone.utc)
+    dt_util.set_utcnow(now)
+
+    entry = ConfigEntry(
+        entry_id="entry_switch_heat_custom",
+        title="Boiler Custom",
+        data={
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_HEATER,
+            CONF_CONTROL_MODE: CONTROL_MODE_SWITCH_PWM,
+            CONF_INDOOR_SENSOR: "sensor.living_temp",
+            CONF_TARGET_DEVICE: "switch.heat",
+            CONF_INERTIA_PROFILE: "fast_air",
+        },
+        version=2,
+    )
+    er.async_get(hass).async_register(
+        "climate.entry_switch_heat_custom",
+        entry.entry_id,
+        platform=Platform.CLIMATE,
+        unique_id=f"{entry.entry_id}_thermostat",
+    )
+    assert await async_setup_entry(hass, entry) is True
+
+    session = FakeInfluxSession()
+    hass._mock_http_session = session
+    t_start = now - timedelta(hours=3)
+    _seed_switch_heat_cycle(
+        session,
+        t_start,
+        dev_meas="custom_boiler_state",
+        dev_field="state_str",
+        on_val="on",
+        off_val="off",
+        domain_tag="switch",
+    )
+    # Wrong-domain custom measurement with same short entity_id should be excluded
+    session.add_point(
+        "wrong_sensor_meas",
+        "heat",
+        "state_str",
+        int(t_start.timestamp() * 1000),
+        "on",
+        domain_tag="sensor",
+    )
+
+    res = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_BOOTSTRAP_INFLUXDB,
+        {
+            "entity_id": "climate.entry_switch_heat_custom",
+            "days": 1,
+            "dry_run": True,
+        },
+        return_response=True,
+    )
+    dev = res["discovered_states"]["device"]
+    assert dev["measurement"] == "custom_boiler_state"
+    assert dev["field"] == "state_str"
+    assert dev["unique_values"] == ["off", "on"]
+    assert res["accepted_cycles"] == 1
+
+    queries = [r["params"]["q"] for r in session.requests]
+    assert any(q.startswith("SHOW SERIES") for q in queries)
+    assert any(q.startswith('SHOW FIELD KEYS FROM "custom_boiler_state"') for q in queries)
+    await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_device_discovery_failure_logs_diagnostics_and_hint(hass, caplog) -> None:
+    """When SHOW SERIES finds a measurement outside query window, error & logs include diagnostics."""
+    now = datetime(2026, 11, 24, 6, 0, 0, tzinfo=timezone.utc)
+    dt_util.set_utcnow(now)
+
+    entry = ConfigEntry(
+        entry_id="entry_switch_heat_fail",
+        title="Boiler Missing Window",
+        data={
+            CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_HEATER,
+            CONF_CONTROL_MODE: CONTROL_MODE_SWITCH_PWM,
+            CONF_INDOOR_SENSOR: "sensor.living_temp",
+            CONF_TARGET_DEVICE: "switch.heat",
+        },
+        version=2,
+    )
+    er.async_get(hass).async_register(
+        "climate.entry_switch_heat_fail",
+        entry.entry_id,
+        platform=Platform.CLIMATE,
+        unique_id=f"{entry.entry_id}_thermostat",
+    )
+    assert await async_setup_entry(hass, entry) is True
+
+    session = FakeInfluxSession()
+    hass._mock_http_session = session
+    # Indoor sensor exists inside window, device exists only 400 days ago (outside 7-day window)
+    session.add_point("°C", "living_temp", "value", int((now - timedelta(hours=1)).timestamp() * 1000), 21.0)
+    session.add_point(
+        "custom_old_meas",
+        "heat",
+        "value",
+        int((now - timedelta(days=400)).timestamp() * 1000),
+        1,
+        domain_tag="switch",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_BOOTSTRAP_INFLUXDB,
+                {
+                    "entity_id": "climate.entry_switch_heat_fail",
+                    "days": 7,
+                    "dry_run": True,
+                },
+                return_response=True,
+            )
+
+    err_msg = str(exc_info.value)
+    assert "No historical device activity data found in InfluxDB for 'switch.heat' over the last 7 days" in err_msg
+    assert "custom_old_meas" in err_msg
+    assert "device_measurement" in err_msg
+    assert any("Failed to resolve InfluxDB series for 'switch.heat'" in r.message for r in caplog.records)
+    await async_unload_entry(hass, entry)
+
 
