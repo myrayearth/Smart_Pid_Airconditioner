@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 from typing import Any
 
@@ -12,6 +13,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import ConfigEntryError, HomeAssistantError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
+import homeassistant.util.dt as dt_util
 
 from .const import (
     CONF_KI,
@@ -140,6 +142,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the Smart PID Thermostat component."""
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault("owners", {})
+    hass.data[DOMAIN].setdefault("reload_off", {})
 
     async def _async_handle_reset_learning(call: ServiceCall) -> None:
         target_entry_id = call.data.get("entry_id")
@@ -238,6 +241,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Smart PID Thermostat from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     owners: dict[str, str] = hass.data[DOMAIN].setdefault("owners", {})
+    hass.data[DOMAIN].setdefault("reload_off", {})
     await async_setup(hass, {})
 
     target_devices = extract_target_devices(dict(entry.data), dict(entry.options))
@@ -276,6 +280,20 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     owners: dict[str, str] = domain_data.get("owners", {})
     for dev_id in [k for k, v in owners.items() if v == entry.entry_id]:
         owners.pop(dev_id, None)
+    reload_off = domain_data.get("reload_off")
+    if isinstance(reload_off, dict):
+        now = dt_util.utcnow()
+        for dev_id in [
+            k
+            for k, val in reload_off.items()
+            if not (
+                isinstance(val, tuple)
+                and len(val) == 2
+                and isinstance(val[1], datetime)
+                and val[1] > now
+            )
+        ]:
+            reload_off.pop(dev_id, None)
     return unload_ok
 
 

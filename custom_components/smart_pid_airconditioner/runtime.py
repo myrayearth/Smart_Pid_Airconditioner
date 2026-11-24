@@ -105,6 +105,7 @@ from .storage import LearningStateSnapshot, ModelStore
 from .ventilation import VentState, VentStatus
 
 _LOGGER = logging.getLogger(__name__)
+_MAX_OUTAGE_BUFFERED_TICKS = 10
 
 
 def _parse_time_value(value: Any, default: dt_time) -> dt_time:
@@ -204,6 +205,8 @@ class SmartPIDRuntime:
         self._obs_device_unavailable: bool = False
         self._obs_early_stop_active: bool = False
         self._device_unavailable_since: datetime | None = None
+        self._outage_buffered_ticks: list[dict[str, Any]] = []
+        self._outage_pre_active: bool | None = None
 
         # 5-minute RLS block accumulator
         self._block_minutes: int = 0
@@ -333,12 +336,48 @@ class SmartPIDRuntime:
         if device_unavailable:
             if self._device_unavailable_since is None:
                 self._device_unavailable_since = now
+                self._outage_pre_active = self._obs_is_active
+                self._outage_buffered_ticks.clear()
             unavailable_expired = (
                 (now - self._device_unavailable_since).total_seconds()
                 >= DEFAULT_DEVICE_UNAVAILABLE_GRACE_SEC
             )
+            if unavailable_expired:
+                self._outage_buffered_ticks.clear()
+                self._outage_pre_active = None
         else:
-            self._device_unavailable_since = None
+            if self._device_unavailable_since is not None:
+                elapsed = (now - self._device_unavailable_since).total_seconds()
+                was_in_grace = (
+                    not self._obs_device_unavailable
+                    and elapsed < DEFAULT_DEVICE_UNAVAILABLE_GRACE_SEC
+                )
+                pre_active = self._outage_pre_active
+                buffered = list(self._outage_buffered_ticks)
+                self._device_unavailable_since = None
+                self._outage_buffered_ticks.clear()
+                self._outage_pre_active = None
+
+                if was_in_grace and pre_active is not None and bool(is_active) == pre_active:
+                    for tick in buffered:
+                        self.snapshot.coasting.step_cycle(
+                            is_active=pre_active,
+                            u_effort=tick["u_effort"],
+                            value=tick["value"],
+                            is_heating=tick["is_heating"],
+                            dt_min=1.0,
+                            blocked_for_learning=tick["blocked"],
+                            block_reason=tick["block_reason"],
+                            target_val=tick["target_val"],
+                            solar_rising_active=tick["solar_rising_active"],
+                            outdoor_temp=tick["outdoor_temp"],
+                            now_ts=tick["now_ts"],
+                            early_stop_active=tick["early_stop_active"],
+                        )
+                        self._process_completed_coasting_cycle()
+                elif pre_active is not None:
+                    self.snapshot.coasting.mark_contaminated("device_unavailable")
+                    self._block_contaminated = True
             unavailable_expired = False
 
         # Preserve last known active state during brief unavailability grace period
@@ -432,6 +471,21 @@ class SmartPIDRuntime:
         """1-minute learning tick: step coasting cycle and accumulate 5-min RLS blocks."""
         await self.async_step_learning(now=now)
 
+    def _process_completed_coasting_cycle(self) -> None:
+        """Consume completed coasting cycle and feed MAE/safety tracking."""
+        completed = self.snapshot.coasting.consume_completed_cycle()
+        if completed is not None:
+            self.snapshot.safety.record_prediction_comparison(
+                predicted_coast=completed["predicted_coast"],
+                observed_coast=completed["observed_coast"],
+            )
+            self.record_cycle_performance(
+                cycle_mae=completed["coast_error"],
+                cycle_overshoot=completed["overshoot"],
+            )
+            self._dirty = True
+            self.store.async_delay_save(self.snapshot.to_dict, delay=600)
+
     async def async_step_learning(self, now: datetime | None = None) -> None:
         """Advance learning by 1 minute (public for deterministic testing)."""
         val_in, val_out, fb_reason = self._resolve_learning_values()
@@ -468,6 +522,41 @@ class SmartPIDRuntime:
                 except (ValueError, TypeError):
                     pass
 
+        solar_rising = self._is_solar_guard_active()
+        outdoor_for_cycle = None if self.is_humidity else self._obs_outdoor
+        now_ts = now.timestamp() if now is not None else time.time()
+
+        # Buffer ticks during brief <60s device unavailability grace period
+        if self._device_unavailable_since is not None and not self._obs_device_unavailable:
+            ref_now = now or dt_util.utcnow()
+            if (ref_now - self._device_unavailable_since).total_seconds() >= DEFAULT_DEVICE_UNAVAILABLE_GRACE_SEC:
+                self._obs_device_unavailable = True
+                self._obs_is_active = False
+                self._outage_buffered_ticks.clear()
+                self._outage_pre_active = None
+                self.snapshot.coasting.mark_contaminated("device_unavailable")
+                self._block_contaminated = True
+                blocked = True
+                block_reason = "device_unavailable"
+            else:
+                if len(self._outage_buffered_ticks) < _MAX_OUTAGE_BUFFERED_TICKS:
+                    self._outage_buffered_ticks.append(
+                        {
+                            "value": val_in,
+                            "outdoor_temp": outdoor_for_cycle,
+                            "target_val": target_for_cycle,
+                            "u_effort": self._obs_u_effort,
+                            "is_heating": self._obs_is_heating,
+                            "blocked": blocked,
+                            "block_reason": block_reason,
+                            "solar_rising_active": solar_rising,
+                            "early_stop_active": self._obs_early_stop_active,
+                            "now_ts": now_ts,
+                        }
+                    )
+                self._notify_subscribers()
+                return
+
         # 1. Step 4-phase DynamicCoastingLearner (1-minute resolution)
         self.snapshot.coasting.step_cycle(
             is_active=self._obs_is_active,
@@ -478,25 +567,14 @@ class SmartPIDRuntime:
             blocked_for_learning=blocked,
             block_reason=block_reason,
             target_val=target_for_cycle,
-            solar_rising_active=self._is_solar_guard_active(),
-            outdoor_temp=None if self.is_humidity else self._obs_outdoor,
-            now_ts=time.time(),
+            solar_rising_active=solar_rising,
+            outdoor_temp=outdoor_for_cycle,
+            now_ts=now_ts,
             early_stop_active=self._obs_early_stop_active,
         )
 
         # Feed real-world completed cycle error (MAE) & overshoot into TuningSafetyManager
-        completed = self.snapshot.coasting.consume_completed_cycle()
-        if completed is not None:
-            self.snapshot.safety.record_prediction_comparison(
-                predicted_coast=completed["predicted_coast"],
-                observed_coast=completed["observed_coast"],
-            )
-            self.record_cycle_performance(
-                cycle_mae=completed["coast_error"],
-                cycle_overshoot=completed["overshoot"],
-            )
-            self._dirty = True
-            self.store.async_delay_save(self.snapshot.to_dict, delay=600)
+        self._process_completed_coasting_cycle()
 
         # 2. Accumulate 5-minute block for HuberRLS
         if blocked:
@@ -840,6 +918,9 @@ class SmartPIDRuntime:
         self._block_out_diff_sum = 0.0
         self._block_aux_heat_sum = 0.0
         self._block_contaminated = False
+        self._outage_buffered_ticks.clear()
+        self._outage_pre_active = None
+        self._device_unavailable_since = None
         self._dirty = False
         await self.store.async_save(self.snapshot)
         self._notify_subscribers()
@@ -933,6 +1014,9 @@ class SmartPIDRuntime:
         self._block_out_diff_sum = 0.0
         self._block_aux_heat_sum = 0.0
         self._block_contaminated = False
+        self._outage_buffered_ticks.clear()
+        self._outage_pre_active = None
+        self._device_unavailable_since = None
         self._dirty = False
         await self.store.async_save(self.snapshot)
         self._notify_subscribers()

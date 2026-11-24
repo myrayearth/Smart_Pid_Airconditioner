@@ -983,6 +983,15 @@
     }
   },
   "entity": {
+    "climate": {
+      "smart_pid_airconditioner": {
+        "state_attributes": {
+          "overheat_latched": {
+            "name": "Overheat Safety Latch"
+          }
+        }
+      }
+    },
     "button": {
       "reset_learning": {
         "name": "Reset Self-Learning"

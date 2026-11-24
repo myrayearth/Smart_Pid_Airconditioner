@@ -983,6 +983,15 @@
     }
   },
   "entity": {
+    "climate": {
+      "smart_pid_airconditioner": {
+        "state_attributes": {
+          "overheat_latched": {
+            "name": "과열 안전 차단 래치"
+          }
+        }
+      }
+    },
     "button": {
       "reset_learning": {
         "name": "자가학습 초기화"

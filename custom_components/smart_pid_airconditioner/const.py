@@ -391,6 +391,10 @@ DEFAULT_SUNRISE_SAVING_END = "10:00:00"
 CONF_PREDICTIVE_ON_ENABLED = "predictive_on_enabled"
 DEFAULT_PREDICTIVE_ON_ENABLED = False
 
+# Stage 11: Absolute Overheat Safety Latch
+OVERHEAT_LATCH_TEMP_C = 35.0
+OVERHEAT_RESET_TEMP_C = 34.0
+
 
 def resolve_thermostat_type(entry: Any) -> str:
     """Resolve thermostat_type checking options (top & nested sections), then data, then default."""

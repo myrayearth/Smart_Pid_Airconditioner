@@ -23,7 +23,7 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -341,9 +341,10 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
 
         # Event tracking unsubscribers
         self._unsub_sensor_track: CALLBACK_TYPE | None = None
+        self._unsub_state_reported: CALLBACK_TYPE | None = None
         self._unsub_interval_tick: CALLBACK_TYPE | None = None
 
-        # Guard flags & Stage 4/5 runtime, manual override, watchdog
+        # Guard flags & Stage 4/5/11 runtime, manual override, watchdog, reload min-off
         self._runtime: Any = getattr(entry, "runtime_data", None)
         self._switch_guard = SwitchCommandGuard(hass)
         self._device_unavailable: bool = False
@@ -352,6 +353,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._continuous_run_start: datetime | None = None
         self._watchdog_rest_until: datetime | None = None
         self._is_dispatching: bool = False
+        self._reload_min_off_deadlines: dict[str, datetime] = {}
 
     def _run_async(self, coro) -> None:
         """Execute a coroutine safely on the Home Assistant event loop."""
@@ -727,6 +729,8 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 self._integral = float(extra_data.integral)
             self._last_run_duration_sec = max(0.0, float(extra_data.last_run_duration_sec))
 
+        self._restore_reload_off()
+
         # Track sensor changes
         sensors_to_track = [self._indoor_sensor_id]
         if self._outdoor_sensor_id:
@@ -743,6 +747,13 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         if valid_sensors:
             self._unsub_sensor_track = async_track_state_change_event(
                 self.hass, valid_sensors, self._async_entity_changed
+            )
+
+        bus = getattr(self.hass, "bus", None)
+        async_listen = getattr(bus, "async_listen", None)
+        if callable(async_listen) and (self._indoor_sensor_id or self._outdoor_sensor_id):
+            self._unsub_state_reported = async_listen(
+                "state_reported", self._async_state_reported
             )
 
         # Periodic interval tick
@@ -764,12 +775,16 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up timers and subscriptions."""
+        self._record_reload_off()
         if self._unsub_runtime is not None:
             self._unsub_runtime()
             self._unsub_runtime = None
         if self._unsub_sensor_track:
             self._unsub_sensor_track()
             self._unsub_sensor_track = None
+        if self._unsub_state_reported:
+            self._unsub_state_reported()
+            self._unsub_state_reported = None
         if self._unsub_interval_tick:
             self._unsub_interval_tick()
             self._unsub_interval_tick = None
@@ -777,7 +792,9 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             self._keep_alive_cancel()
             self._keep_alive_cancel = None
         self._cancel_pwm_timers()
-        await super().async_will_remove_from_hass()
+        parent_remove = getattr(super(), "async_will_remove_from_hass", None)
+        if callable(parent_remove):
+            await parent_remove()
 
     def _cancel_pwm_timers(self) -> None:
         """Cancel any running PWM cycle timers."""
@@ -857,6 +874,29 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         if unavail is not None:
             self._device_unavailable = unavail
         return self._device_unavailable
+
+    @callback
+    def _async_state_reported(self, event: Event) -> None:
+        """Refresh sensor timestamps and reset stale counter on state_reported heartbeats."""
+        data = event.data if isinstance(event.data, dict) else {}
+        entity_id = data.get(ATTR_ENTITY_ID)
+        if not entity_id or entity_id not in (self._indoor_sensor_id, self._outdoor_sensor_id):
+            return
+
+        new_state = data.get("new_state") or self.hass.states.get(entity_id)
+        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+
+        parsed = self._parse_humidity(new_state.state, entity_id)
+        if parsed is None:
+            return
+
+        now = dt_util.utcnow()
+        if entity_id == self._indoor_sensor_id:
+            self._last_indoor_update = now
+            self._sensor_stale_count = 0
+        elif entity_id == self._outdoor_sensor_id:
+            self._last_outdoor_update = now
 
     async def _async_entity_changed(self, event: Event[EventStateChangedData]) -> None:
         """Handle tracked entity state updates."""
@@ -1532,18 +1572,119 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         await self._async_calculate_and_control(now=now, force=True)
         self.async_write_ha_state()
 
+    def _pwm_device_ids(self) -> list[str]:
+        """Return unique PWM target device entity IDs configured on this humidifier."""
+        return [
+            d
+            for d in dict.fromkeys(
+                [
+                    self._target_device_id,
+                    self._target_device_humidity_id,
+                    self._target_device_dehumidity_id,
+                ]
+            )
+            if d
+        ]
+
+    def _compute_effective_min_off(self, run_duration_sec: float | None = None) -> float:
+        """Compute effective minimum OFF protection time in seconds."""
+        run_dur = (
+            self._last_run_duration_sec
+            if run_duration_sec is None
+            else max(0.0, float(run_duration_sec))
+        )
+        return compute_effective_min_off(
+            self._min_off_time,
+            run_dur,
+            self._dynamic_min_off_multiplier,
+        )
+
+    def _record_reload_off(self) -> None:
+        """Persist active or pending minimum OFF deadline across config entry reload."""
+        if self._control_mode != CONTROL_MODE_SWITCH_PWM:
+            return
+        reload_off = self.hass.data.setdefault(DOMAIN, {}).setdefault("reload_off", {})
+        now = dt_util.utcnow()
+        active_dev = self._active_target_device_id()
+        for dev_id in self._pwm_device_ids():
+            st = self.hass.states.get(dev_id)
+            is_running = (self._pwm_state and dev_id == active_dev) or (
+                st is not None and st.state == STATE_ON
+            )
+            if is_running:
+                last_on = self._last_switch_on_times.get(dev_id, self._last_switch_on_time)
+                run_dur = (
+                    max(0.0, (now - last_on).total_seconds())
+                    if last_on is not None
+                    else self._last_run_duration_sec
+                )
+                eff = self._compute_effective_min_off(run_dur)
+                if eff > 0:
+                    reload_off[dev_id] = (now, now + timedelta(seconds=eff))
+                continue
+
+            last_off = self._last_switch_off_times.get(
+                dev_id,
+                self._last_switch_off_time if dev_id == active_dev else None,
+            )
+            eff = self._compute_effective_min_off()
+            deadline = (
+                last_off + timedelta(seconds=eff)
+                if last_off is not None and eff > 0
+                else None
+            )
+            prev_deadline = self._reload_min_off_deadlines.get(dev_id)
+            if prev_deadline is not None and (deadline is None or prev_deadline > deadline):
+                deadline = prev_deadline
+            if deadline is not None and deadline > now:
+                reload_off[dev_id] = (last_off or now, deadline)
+
+    def _restore_reload_off(self) -> None:
+        """Inherit minimum OFF deadline recorded prior to config entry reload."""
+        domain_data = self.hass.data.get(DOMAIN)
+        if not isinstance(domain_data, dict):
+            return
+        reload_off = domain_data.get("reload_off")
+        if not isinstance(reload_off, dict):
+            return
+        now = dt_util.utcnow()
+        for dev_id in self._pwm_device_ids():
+            rec = reload_off.pop(dev_id, None)
+            if not (isinstance(rec, tuple) and len(rec) == 2):
+                continue
+            off_at_utc, deadline_utc = rec
+            if not (
+                isinstance(off_at_utc, datetime)
+                and isinstance(deadline_utc, datetime)
+                and deadline_utc > now
+            ):
+                continue
+            existing = self._last_switch_off_times.get(dev_id)
+            if existing is None or off_at_utc > existing:
+                self._last_switch_off_times[dev_id] = off_at_utc
+            if self._last_switch_off_time is None or off_at_utc > self._last_switch_off_time:
+                self._last_switch_off_time = off_at_utc
+            self._reload_min_off_deadlines[dev_id] = deadline_utc
+
     async def _async_turn_on_switch(self, device_id: str) -> None:
         """Turn on switch/input_boolean if currently off."""
         if not device_id:
             return
         now = dt_util.utcnow()
+        reload_deadline = self._reload_min_off_deadlines.get(device_id)
+        if reload_deadline is not None:
+            if now < reload_deadline:
+                _LOGGER.info(
+                    "Anti-short-cycling: switch %s ON blocked by reload carry-over (%.1fs remaining)",
+                    device_id,
+                    (reload_deadline - now).total_seconds(),
+                )
+                return
+            self._reload_min_off_deadlines.pop(device_id, None)
+
         last_off = self._last_switch_off_times.get(device_id, self._last_switch_off_time)
         if last_off is not None and self._dynamic_min_off_multiplier > 0.0:
-            effective_min_off = compute_effective_min_off(
-                self._min_off_time,
-                self._last_run_duration_sec,
-                self._dynamic_min_off_multiplier,
-            )
+            effective_min_off = self._compute_effective_min_off()
             elapsed_off = (now - last_off).total_seconds()
             if elapsed_off < effective_min_off:
                 _LOGGER.info(

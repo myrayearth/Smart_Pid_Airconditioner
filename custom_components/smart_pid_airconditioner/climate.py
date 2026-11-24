@@ -171,6 +171,8 @@ from .const import (
     MIN_DERIVATIVE_EVENT_DT,
     OFF_ACTION_SYNC_ONLY,
     OFF_ACTION_TURN_ON,
+    OVERHEAT_LATCH_TEMP_C,
+    OVERHEAT_RESET_TEMP_C,
     SUPPORTED_HVAC_MODES,
     THERMOSTAT_TYPE_COOLER,
     THERMOSTAT_TYPE_HEATER,
@@ -374,9 +376,10 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
         # Event tracking unsubscribers
         self._unsub_sensor_track: CALLBACK_TYPE | None = None
+        self._unsub_state_reported: CALLBACK_TYPE | None = None
         self._unsub_interval_tick: CALLBACK_TYPE | None = None
 
-        # Guard flags & Stage 4/5 runtime, manual override, watchdog
+        # Guard flags & Stage 4/5/11 runtime, manual override, watchdog, overheat latch
         self._runtime: Any = getattr(entry, "runtime_data", None)
         self._switch_guard = SwitchCommandGuard(hass)
         self._device_unavailable: bool = False
@@ -384,6 +387,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self._manual_override_until: datetime | None = None
         self._continuous_run_start: datetime | None = None
         self._watchdog_rest_until: datetime | None = None
+        self._overheat_latched: bool = False
+        self._reload_min_off_deadlines: dict[str, datetime] = {}
         self._is_dispatching: bool = False
         self._is_dispatching_hvac_mode: bool = False
         self._last_mode_change_time: datetime | None = None
@@ -845,6 +850,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             "indoor_humidity": self._indoor_humidity,
             "outdoor_humidity": self._outdoor_humidity,
             "fail_safe_active": self._fail_safe_active,
+            "overheat_latched": self._overheat_latched,
             "ventilation_state": self._vent_status.state.value,
             "ventilation_cooldown_remaining_sec": self._vent_status.cooldown_remaining_sec,
             "learning_blocked": self._vent_status.should_block_learning,
@@ -993,6 +999,9 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 self._integral = float(extra_data.integral)
             self._last_run_duration_sec = max(0.0, float(extra_data.last_run_duration_sec))
 
+        # Restore reload min-off carry-over before initial calculation
+        self._restore_reload_off()
+
         # Read initial sensor values
         self._update_sensor_values()
 
@@ -1018,6 +1027,14 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 self.hass, monitored_entities, self._async_entity_changed
             )
 
+        # Listen for HA state_reported events (unchanged sensor heartbeat updates)
+        bus = getattr(self.hass, "bus", None)
+        async_listen = getattr(bus, "async_listen", None)
+        if callable(async_listen) and (self._indoor_sensor_id or self._outdoor_sensor_id):
+            self._unsub_state_reported = async_listen(
+                "state_reported", self._async_state_reported
+            )
+
         # Periodic evaluation loop
         self._unsub_interval_tick = async_track_time_interval(
             self.hass,
@@ -1040,12 +1057,16 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from Home Assistant."""
+        self._record_reload_off()
         if self._unsub_runtime is not None:
             self._unsub_runtime()
             self._unsub_runtime = None
         if self._unsub_sensor_track:
             self._unsub_sensor_track()
             self._unsub_sensor_track = None
+        if self._unsub_state_reported:
+            self._unsub_state_reported()
+            self._unsub_state_reported = None
         if self._unsub_interval_tick:
             self._unsub_interval_tick()
             self._unsub_interval_tick = None
@@ -1053,7 +1074,9 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             self._keep_alive_cancel()
             self._keep_alive_cancel = None
         self._cancel_pwm_timers()
-        await super().async_will_remove_from_hass()
+        parent_remove = getattr(super(), "async_will_remove_from_hass", None)
+        if callable(parent_remove):
+            await parent_remove()
 
     def _cancel_pwm_timers(self) -> None:
         """Cancel PWM running timers."""
@@ -1157,6 +1180,30 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         if unavail is not None:
             self._device_unavailable = unavail
         return self._device_unavailable
+
+    @callback
+    def _async_state_reported(self, event: Event) -> None:
+        """Refresh sensor timestamps and reset stale counter on state_reported heartbeats."""
+        data = event.data if isinstance(event.data, dict) else {}
+        entity_id = data.get(ATTR_ENTITY_ID)
+        if not entity_id or entity_id not in (self._indoor_sensor_id, self._outdoor_sensor_id):
+            return
+
+        new_state = data.get("new_state") or self.hass.states.get(entity_id)
+        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+
+        is_hum = is_humidity_type(self._thermostat_type)
+        parsed = self._parse_humidity(new_state) if is_hum else self._parse_temperature(new_state)
+        if parsed is None:
+            return
+
+        now = dt_util.utcnow()
+        if entity_id == self._indoor_sensor_id:
+            self._last_indoor_update = now
+            self._sensor_stale_count = 0
+        elif entity_id == self._outdoor_sensor_id:
+            self._last_outdoor_update = now
 
     @callback
     def _async_entity_changed(self, event: Event) -> None:
@@ -1530,7 +1577,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     self._target_climate_id,
                 )
                 return
-            await self._async_set_slave_hvac_mode(HVACMode.HEAT)
+            if not self._overheat_latched:
+                await self._async_set_slave_hvac_mode(HVACMode.HEAT)
             await self._async_calculate_and_control(force=True)
             return
 
@@ -1538,9 +1586,11 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             if self._thermostat_type == THERMOSTAT_TYPE_HEAT_COOL:
                 if slave_modes_str and "auto" not in slave_modes_str:
                     target_slave = HVACMode.HEAT if getattr(self, "_is_heating", False) else HVACMode.COOL
-                    await self._async_set_slave_hvac_mode(target_slave)
+                    if not (self._overheat_latched and target_slave == HVACMode.HEAT):
+                        await self._async_set_slave_hvac_mode(target_slave)
                 else:
-                    await self._async_set_slave_hvac_mode(HVACMode.AUTO)
+                    if not (self._overheat_latched and getattr(self, "_is_heating", False)):
+                        await self._async_set_slave_hvac_mode(HVACMode.AUTO)
             elif self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
                 target_slave = MODE_HUMIDITY if getattr(self, "_is_heating", False) else MODE_DEHUMIDITY
                 await self._async_set_slave_hvac_mode(target_slave)
@@ -1939,6 +1989,46 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     self._pid_e = round(e_term, 2)
                     self._pid_output = round(final_output, 2)
 
+                # Stage 11: Absolute overheat safety latch for heating controllers
+                is_heating_direction = (not is_hum) and (
+                    self._thermostat_type == THERMOSTAT_TYPE_HEATER
+                    or (self._thermostat_type == THERMOSTAT_TYPE_HEAT_COOL and is_heating)
+                )
+                if not is_hum and indoor_val is not None:
+                    if self._overheat_latched and indoor_val <= OVERHEAT_RESET_TEMP_C:
+                        self._overheat_latched = False
+                        _LOGGER.info(
+                            "Overheat safety latch cleared on %s (indoor=%.1f°C <= %.1f°C)",
+                            self._entry.title,
+                            indoor_val,
+                            OVERHEAT_RESET_TEMP_C,
+                        )
+                    elif is_heating_direction and indoor_val >= OVERHEAT_LATCH_TEMP_C:
+                        if not self._overheat_latched:
+                            self._overheat_latched = True
+                            _LOGGER.critical(
+                                "Overheat safety latch triggered on %s (indoor=%.1f°C >= %.1f°C); forcing OFF",
+                                self._entry.title,
+                                indoor_val,
+                                OVERHEAT_LATCH_TEMP_C,
+                            )
+                            try:
+                                from homeassistant.components import persistent_notification
+
+                                persistent_notification.async_create(
+                                    self.hass,
+                                    (
+                                        f"{self._entry.title}: 실내 온도 {indoor_val:.1f}°C가 "
+                                        f"절대 과열 임계값({OVERHEAT_LATCH_TEMP_C:.1f}°C)에 도달하여 난방을 강제 정지했습니다. "
+                                        f"{OVERHEAT_RESET_TEMP_C:.1f}°C 이하로 내려가면 차단 래치가 해제됩니다."
+                                    ),
+                                    title="Smart PID 과열 안전 차단 알림",
+                                    notification_id=f"{DOMAIN}_overheat_{self._entry.entry_id}",
+                                )
+                            except Exception:
+                                pass
+                overheat_blocking = self._overheat_latched and is_heating_direction
+
                 # Stage 5: Manual Override & Safety Watchdog evaluation
                 manual_override_active = (
                     self._manual_override_until is not None
@@ -1957,6 +2047,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
                 is_currently_running = (
                     self._is_active_hvac_mode
+                    and not overheat_blocking
                     and not self._vent_status.should_pause_control
                     and not watchdog_resting
                     and final_output > 0.0
@@ -2006,6 +2097,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     if (
                         self._runtime is not None
                         and not is_currently_running
+                        and not overheat_blocking
                         and not early_stop_triggered
                         and not watchdog_resting
                         and not self._vent_status.should_pause_control
@@ -2034,6 +2126,19 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                             device_unavailable=self._is_target_device_unavailable(),
                             early_stop_active=early_stop_triggered,
                         )
+
+                if overheat_blocking:
+                    final_output = 0.0
+                    self._pid_output = 0.0
+                    if self._control_mode == CONTROL_MODE_SWITCH_PWM:
+                        await self._async_stop_pwm()
+                    else:
+                        self._active_section = 0
+                        self._last_dispatched_section = 0
+                        self._pwm_state = False
+                        await self._async_set_slave_hvac_mode(HVACMode.OFF)
+                    _report_obs(False, 0.0)
+                    return
 
                 # Branch for switch PWM mode (no climate sections / delta / fan)
                 if self._control_mode == CONTROL_MODE_SWITCH_PWM:
@@ -2662,6 +2767,107 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------
     # Switch PWM Control Methods
     # ------------------------------------------------------------------
+    def _pwm_device_ids(self) -> list[str]:
+        """Return unique PWM target device entity IDs configured on this entity."""
+        return [
+            d
+            for d in dict.fromkeys(
+                [
+                    self._target_device_id,
+                    self._target_device_cool_id,
+                    self._target_device_heat_id,
+                    self._target_device_dehumidity_id,
+                    self._target_device_humidity_id,
+                ]
+            )
+            if d
+        ]
+
+    def _compute_effective_min_off(self, run_duration_sec: float | None = None) -> float:
+        """Compute effective minimum OFF protection time in seconds."""
+        pwm_dur = (
+            float(self._pwm_duration)
+            if self._pwm_duration > 0
+            else float(DEFAULT_PWM_DURATION_SWITCH)
+        )
+        run_dur = self._last_run_duration_sec if run_duration_sec is None else max(0.0, float(run_duration_sec))
+        base_min_off = compute_effective_min_off(
+            self._min_off_time,
+            run_dur,
+            self._dynamic_min_off_multiplier,
+        )
+        if base_min_off > float(self._min_off_time):
+            return base_min_off
+        if (float(self._min_on_time) + float(self._min_off_time)) >= pwm_dur:
+            return min(float(self._min_off_time), max(1.0, pwm_dur * 0.05))
+        return base_min_off
+
+    def _record_reload_off(self) -> None:
+        """Persist active or pending minimum OFF deadline across config entry reload."""
+        if self._control_mode != CONTROL_MODE_SWITCH_PWM:
+            return
+        reload_off = self.hass.data.setdefault(DOMAIN, {}).setdefault("reload_off", {})
+        now = dt_util.utcnow()
+        for dev_id in self._pwm_device_ids():
+            st = self.hass.states.get(dev_id)
+            is_running = (self._pwm_state and dev_id == self._active_target_device_id) or (
+                st is not None and st.state == STATE_ON
+            )
+            if is_running:
+                last_on = self._last_switch_on_times.get(dev_id, self._last_switch_on_time)
+                run_dur = (
+                    max(0.0, (now - last_on).total_seconds())
+                    if last_on is not None
+                    else self._last_run_duration_sec
+                )
+                eff = self._compute_effective_min_off(run_dur)
+                if eff > 0:
+                    reload_off[dev_id] = (now, now + timedelta(seconds=eff))
+                continue
+
+            last_off = self._last_switch_off_times.get(
+                dev_id,
+                self._last_switch_off_time if dev_id == self._active_target_device_id else None,
+            )
+            eff = self._compute_effective_min_off()
+            deadline = (
+                last_off + timedelta(seconds=eff)
+                if last_off is not None and eff > 0
+                else None
+            )
+            prev_deadline = self._reload_min_off_deadlines.get(dev_id)
+            if prev_deadline is not None and (deadline is None or prev_deadline > deadline):
+                deadline = prev_deadline
+            if deadline is not None and deadline > now:
+                reload_off[dev_id] = (last_off or now, deadline)
+
+    def _restore_reload_off(self) -> None:
+        """Inherit minimum OFF deadline recorded prior to config entry reload."""
+        domain_data = self.hass.data.get(DOMAIN)
+        if not isinstance(domain_data, dict):
+            return
+        reload_off = domain_data.get("reload_off")
+        if not isinstance(reload_off, dict):
+            return
+        now = dt_util.utcnow()
+        for dev_id in self._pwm_device_ids():
+            rec = reload_off.pop(dev_id, None)
+            if not (isinstance(rec, tuple) and len(rec) == 2):
+                continue
+            off_at_utc, deadline_utc = rec
+            if not (
+                isinstance(off_at_utc, datetime)
+                and isinstance(deadline_utc, datetime)
+                and deadline_utc > now
+            ):
+                continue
+            existing = self._last_switch_off_times.get(dev_id)
+            if existing is None or off_at_utc > existing:
+                self._last_switch_off_times[dev_id] = off_at_utc
+            if self._last_switch_off_time is None or off_at_utc > self._last_switch_off_time:
+                self._last_switch_off_time = off_at_utc
+            self._reload_min_off_deadlines[dev_id] = deadline_utc
+
     async def _async_turn_off_specific_device(self, entity_id: str) -> None:
         """Turn off a specific switch entity immediately via SwitchCommandGuard."""
         if not entity_id:
@@ -2676,37 +2882,36 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
         now = dt_util.utcnow()
         last_off = self._last_switch_off_times.get(active_dev, self._last_switch_off_time)
-        pwm_dur = float(self._pwm_duration) if self._pwm_duration > 0 else float(DEFAULT_PWM_DURATION_SWITCH)
-        base_min_off = compute_effective_min_off(
-            self._min_off_time,
-            self._last_run_duration_sec,
-            self._dynamic_min_off_multiplier,
-        )
-        if base_min_off > float(self._min_off_time):
-            effective_min_off = base_min_off
-        elif (float(self._min_on_time) + float(self._min_off_time)) >= pwm_dur:
-            effective_min_off = min(float(self._min_off_time), max(1.0, pwm_dur * 0.05))
-        else:
-            effective_min_off = base_min_off
+        effective_min_off = self._compute_effective_min_off()
 
+        remaining_off = 0.0
         if not force and last_off is not None:
             elapsed_off = (now - last_off).total_seconds()
             if elapsed_off < effective_min_off:
-                remaining_off = effective_min_off - elapsed_off
-                _LOGGER.info(
-                    "Anti-short-cycling: switch %s ON delayed by %.1fs (min_off_time: %.1fs)",
-                    active_dev,
-                    remaining_off,
-                    effective_min_off,
-                )
-                if self._pwm_turn_on_cancel is not None:
-                    self._pwm_turn_on_cancel()
-                self._pwm_turn_on_cancel = async_call_later(
-                    self.hass,
-                    remaining_off,
-                    lambda _: self._run_async(self._async_turn_on_switch(force=True)),
-                )
-                return
+                remaining_off = max(remaining_off, effective_min_off - elapsed_off)
+
+        reload_deadline = self._reload_min_off_deadlines.get(active_dev)
+        if reload_deadline is not None:
+            if now >= reload_deadline:
+                self._reload_min_off_deadlines.pop(active_dev, None)
+            elif not force:
+                remaining_off = max(remaining_off, (reload_deadline - now).total_seconds())
+
+        if not force and remaining_off > 0.0:
+            _LOGGER.info(
+                "Anti-short-cycling: switch %s ON delayed by %.1fs (min_off_time: %.1fs)",
+                active_dev,
+                remaining_off,
+                effective_min_off,
+            )
+            if self._pwm_turn_on_cancel is not None:
+                self._pwm_turn_on_cancel()
+            self._pwm_turn_on_cancel = async_call_later(
+                self.hass,
+                remaining_off,
+                lambda _: self._run_async(self._async_turn_on_switch(force=True)),
+            )
+            return
 
         if self._pwm_turn_on_cancel is not None:
             self._pwm_turn_on_cancel()
