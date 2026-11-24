@@ -21,6 +21,14 @@ _TAU_C_FACTORS = {
     "comfort": 1.0,
 }
 
+PEAK_CONFIRM_EPSILON = 1e-5
+LOW_SLOPE_DELAYED_THRESHOLD = 0.002
+COAST_CONFIDENCE_ABSTAIN_THRESHOLD = 0.25
+OUTDOOR_BAND_WIDTH_C = 5.0
+OUTDOOR_BAND_MIN_SAMPLES = 3
+OUTDOOR_COAST_CORRECTION_CLAMP = 0.3
+
+
 
 class CyclePhase(str, Enum):
     """4-phase thermal/moisture cycle tracker."""
@@ -251,6 +259,7 @@ class DynamicCoastingLearner:
         self._stop_charge: float = 0.0
         self._predicted_coast_at_stop: float = 0.0
         self._stop_target: float | None = None
+        self._stop_outdoor: float | None = None
         self._reversal_step: int = 0
         self._reversal_anchor: float | None = None
         self._cycle_direction_heating: bool = False
@@ -295,6 +304,7 @@ class DynamicCoastingLearner:
         self._stop_charge = 0.0
         self._predicted_coast_at_stop = 0.0
         self._stop_target = None
+        self._stop_outdoor = None
         self._reversal_step = 0
         self._reversal_anchor = None
         self._cycle_contaminated = False
@@ -322,6 +332,7 @@ class DynamicCoastingLearner:
         block_reason: str = "ventilation_contamination",
         target_val: float | None = None,
         solar_rising_active: bool = False,
+        outdoor_temp: float | None = None,
     ) -> CyclePhase:
         """Advance cycle state by dt_min (typically 1.0 min) and learn coasting upon completion."""
         dt = max(0.01, float(dt_min))
@@ -370,7 +381,11 @@ class DynamicCoastingLearner:
                     self._stop_value = value
                     self._peak_coast_value = value
                     self._stop_target = float(target_val) if target_val is not None else None
-                    self._predicted_coast_at_stop = self.predict_coast(abs_slope=slope)
+                    self._stop_outdoor = float(outdoor_temp) if outdoor_temp is not None else None
+                    self._predicted_coast_at_stop = self.predict_coast(
+                        abs_slope=slope,
+                        outdoor_temp=self._stop_outdoor,
+                    )
                     self._reversal_step = 0
                     self._reversal_anchor = None
                     self._coast_minutes = 0.0
@@ -391,16 +406,25 @@ class DynamicCoastingLearner:
                 self.phase = CyclePhase.PASSIVE_DRIFT
             else:
                 self._coast_minutes += dt
-                # Guard against solar daytime temperature surge corrupting heating afterglow peak
+                # Guard against solar daytime temperature surge corrupting heating afterglow peak.
+                # Once coasting is learned, only reject when value exceeds expected_peak + 0.5°C.
                 if (
                     solar_rising_active
                     and self._cycle_direction_heating
                     and self._stop_value is not None
-                    and (value - self._stop_value) > max(0.5, self._predicted_coast_at_stop + 0.5)
                 ):
-                    self._reject_cycle("solar_gain_contamination")
-                    self.phase = CyclePhase.PASSIVE_DRIFT
-                    return self.phase
+                    has_learned_pred = (
+                        self.accepted_count > 0 and self._predicted_coast_at_stop > 0.0
+                    )
+                    if has_learned_pred:
+                        expected_peak = self._stop_value + self._predicted_coast_at_stop
+                        solar_exceeded = value > (expected_peak + 0.5)
+                    else:
+                        solar_exceeded = (value - self._stop_value) > 0.5
+                    if solar_exceeded:
+                        self._reject_cycle("solar_gain_contamination")
+                        self.phase = CyclePhase.PASSIVE_DRIFT
+                        return self.phase
 
                 if self._peak_coast_value is None:
                     self._peak_coast_value = value
@@ -422,7 +446,7 @@ class DynamicCoastingLearner:
                         else (value - self._peak_coast_value)
                     )
                     if self._reversal_step == 0:
-                        if drop >= self.peak_confirm_delta:
+                        if drop + PEAK_CONFIRM_EPSILON >= self.peak_confirm_delta:
                             self._reversal_step = 1
                             self._reversal_anchor = value
                     elif self._reversal_anchor is not None:
@@ -431,7 +455,7 @@ class DynamicCoastingLearner:
                             if self._cycle_direction_heating
                             else (value - self._reversal_anchor)
                         )
-                        if step_drop >= self.peak_confirm_delta:
+                        if step_drop + PEAK_CONFIRM_EPSILON >= self.peak_confirm_delta:
                             peak_confirmed = True
                         elif drop < self.peak_confirm_delta * 0.5:
                             self._reversal_step = 0
@@ -498,10 +522,24 @@ class DynamicCoastingLearner:
             self.k_afterglow = (1.0 - self.ewma_alpha) * self.k_afterglow + self.ewma_alpha * sample_k
         else:
             if self._stop_slope < self.min_slope:
-                self._reject_cycle("low_slope_or_charge")
-                return
-            sample_tau = max(0.0, min(30.0, obs_coast / self._stop_slope))
-            self.tau_coast = (1.0 - self.ewma_alpha) * self.tau_coast + self.ewma_alpha * sample_tau
+                if (
+                    self._stop_slope <= LOW_SLOPE_DELAYED_THRESHOLD
+                    and self._stop_charge >= self.min_charge
+                    and self._active_minutes >= self.min_run_min
+                    and obs_coast > 0.0
+                ):
+                    # Delayed heating with near-zero stop slope: learn via emitter_charge safely
+                    sample_k = max(0.0, min(10.0, obs_coast / self._stop_charge))
+                    self.k_afterglow = (
+                        (1.0 - self.ewma_alpha) * self.k_afterglow
+                        + self.ewma_alpha * sample_k
+                    )
+                else:
+                    self._reject_cycle("low_slope_or_charge")
+                    return
+            else:
+                sample_tau = max(0.0, min(30.0, obs_coast / self._stop_slope))
+                self.tau_coast = (1.0 - self.ewma_alpha) * self.tau_coast + self.ewma_alpha * sample_tau
 
         pred_coast = float(self._predicted_coast_at_stop)
         coast_error = abs(obs_coast - pred_coast)
@@ -523,6 +561,9 @@ class DynamicCoastingLearner:
                 "tau_coast": round(self.tau_coast, 4),
                 "k_afterglow": round(self.k_afterglow, 4),
                 "interrupted": interrupted,
+                "outdoor_at_stop": (
+                    round(self._stop_outdoor, 2) if self._stop_outdoor is not None else None
+                ),
             }
         )
         self._last_completed_cycle = {
@@ -537,18 +578,68 @@ class DynamicCoastingLearner:
             "interrupted": interrupted,
         }
 
-    def predict_coast(self, abs_slope: float | None = None) -> float:
-        """Predict coasting excursion after stopping."""
+    def get_coast_confidence(self) -> float:
+        """Return coasting confidence in [0.0, 1.0] based on sample count and obs_coast std."""
+        vals = [float(h.get("obs_coast", 0.0)) for h in self.history]
+        n = len(vals)
+        if n == 0:
+            return 0.0
+        mean_val = sum(vals) / n
+        variance = sum((v - mean_val) ** 2 for v in vals) / n
+        std = math.sqrt(variance)
+        return round(min(n / 8.0, 1.0) / (1.0 + std / 0.5), 4)
+
+    def get_outdoor_coast_correction(
+        self, outdoor_temp: float | None
+    ) -> tuple[float, str]:
+        """Return (correction_delta, status) using 5°C outdoor temperature bands."""
+        if outdoor_temp is None:
+            return 0.0, "missing"
+        target_band = math.floor(float(outdoor_temp) / OUTDOOR_BAND_WIDTH_C) * int(OUTDOOR_BAND_WIDTH_C)
+        all_vals: list[float] = []
+        band_vals: list[float] = []
+        for h in self.history:
+            obs = float(h.get("obs_coast", 0.0))
+            all_vals.append(obs)
+            h_out = h.get("outdoor_at_stop")
+            if h_out is not None:
+                try:
+                    h_band = math.floor(float(h_out) / OUTDOOR_BAND_WIDTH_C) * int(OUTDOOR_BAND_WIDTH_C)
+                    if h_band == target_band:
+                        band_vals.append(obs)
+                except (TypeError, ValueError):
+                    continue
+        if len(band_vals) < OUTDOOR_BAND_MIN_SAMPLES or not all_vals:
+            return 0.0, "untrained"
+        band_avg = sum(band_vals) / len(band_vals)
+        overall_avg = sum(all_vals) / len(all_vals)
+        correction = max(
+            -OUTDOOR_COAST_CORRECTION_CLAMP,
+            min(OUTDOOR_COAST_CORRECTION_CLAMP, band_avg - overall_avg),
+        )
+        return round(correction, 4), "learned"
+
+    def predict_coast(
+        self,
+        abs_slope: float | None = None,
+        outdoor_temp: float | None = None,
+    ) -> float:
+        """Predict coasting excursion after stopping, with optional 5°C outdoor band correction."""
         if self.inertia_profile in (INERTIA_HIGH_INERTIA, INERTIA_CUSTOM):
-            return min(self.max_pred, max(0.0, self.k_afterglow * self.emitter_charge))
-        if abs_slope is None:
-            if len(self._recent_values) >= 2:
-                abs_slope = abs(self._recent_values[-1] - self._recent_values[0]) / max(
-                    1.0, float(len(self._recent_values) - 1)
-                )
-            else:
-                abs_slope = self._stop_slope
-        return min(self.max_pred, max(0.0, self.tau_coast * max(0.0, float(abs_slope))))
+            base_pred = max(0.0, self.k_afterglow * self.emitter_charge)
+        else:
+            if abs_slope is None:
+                if len(self._recent_values) >= 2:
+                    abs_slope = abs(self._recent_values[-1] - self._recent_values[0]) / max(
+                        1.0, float(len(self._recent_values) - 1)
+                    )
+                else:
+                    abs_slope = self._stop_slope
+            base_pred = max(0.0, self.tau_coast * max(0.0, float(abs_slope)))
+        if base_pred <= 0.0:
+            return 0.0
+        correction, _ = self.get_outdoor_coast_correction(outdoor_temp)
+        return min(self.max_pred, max(0.0, base_pred + correction))
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -1031,6 +1031,7 @@ async def async_bootstrap_from_influxdb(
                 block_reason=block_reason,
                 target_val=None,
                 solar_rising_active=False,
+                outdoor_temp=None if is_humidity else out_now,
             )
             completed = coasting.consume_completed_cycle()
             if completed is not None:

@@ -108,6 +108,7 @@ from .const import (
     CONF_TEMP_STEP,
     CONF_THERMOSTAT_TYPE,
     CONF_CONTROL_MODE,
+    CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
     CONF_KEEP_ALIVE,
     CONF_MIN_OFF_TIME,
     CONF_MIN_ON_TIME,
@@ -118,6 +119,7 @@ from .const import (
     DEFAULT_AVAILABLE_FAN_MODES,
     DEFAULT_AVAILABLE_HVAC_MODES,
     DEFAULT_AVAILABLE_HUMIDITY_MODES,
+    DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
     DEFAULT_CONTROL_MODE,
     DEFAULT_INITIAL_TARGET_TEMP,
     DEFAULT_INITIAL_TARGET_HUMIDITY,
@@ -282,6 +284,7 @@ class SmartPIDExtraStoredData(ExtraStoredData):
     last_switch_off_times: dict[str, str]
     active_section: int
     integral: float
+    last_run_duration_sec: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         """Return a dict representation of the extra data."""
@@ -290,6 +293,7 @@ class SmartPIDExtraStoredData(ExtraStoredData):
             "last_switch_off_times": dict(self.last_switch_off_times),
             "active_section": self.active_section,
             "integral": self.integral,
+            "last_run_duration_sec": self.last_run_duration_sec,
         }
 
     @classmethod
@@ -310,11 +314,13 @@ class SmartPIDExtraStoredData(ExtraStoredData):
             }
             active_sec = int(data.get("active_section", 1))
             integral = float(data.get("integral", 0.0))
+            last_run_dur = max(0.0, float(data.get("last_run_duration_sec", 0.0)))
             return cls(
                 last_switch_on_times=on_times,
                 last_switch_off_times=off_times,
                 active_section=active_sec,
                 integral=integral,
+                last_run_duration_sec=last_run_dur,
             )
         except (ValueError, TypeError):
             return None
@@ -548,6 +554,19 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             self._get_setting(CONF_MIN_OFF_TIME, DEFAULT_MIN_OFF_TIME),
             DEFAULT_MIN_OFF_TIME,
         )
+        self._dynamic_min_off_multiplier: float = max(
+            0.0,
+            min(
+                3.0,
+                float(
+                    self._get_setting(
+                        CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
+                        DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
+                    )
+                ),
+            ),
+        )
+        self._last_run_duration_sec: float = 0.0
         self._keep_alive: int = duration_to_seconds(
             self._get_setting(CONF_KEEP_ALIVE, DEFAULT_KEEP_ALIVE),
             DEFAULT_KEEP_ALIVE,
@@ -1083,6 +1102,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             },
             active_section=self._active_section,
             integral=self._integral,
+            last_run_duration_sec=self._last_run_duration_sec,
         )
 
     async def async_added_to_hass(self) -> None:
@@ -1143,6 +1163,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                 self._active_section = extra_data.active_section
             if self._is_active_hvac_mode:
                 self._integral = float(extra_data.integral)
+            self._last_run_duration_sec = max(0.0, float(extra_data.last_run_duration_sec))
 
         # Read initial sensor values
         self._update_sensor_values()
@@ -2397,10 +2418,19 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     if self._runtime is not None
                     else 0.0
                 )
+                sunrise_saving_active = (
+                    self._runtime.is_sunrise_saving_active()
+                    if self._runtime is not None and self._is_heating
+                    else False
+                )
                 early_stop_triggered = (
                     early_stop_pred > 0.0
                     and self._pid_error is not None
                     and self._pid_error <= early_stop_pred
+                ) or (
+                    sunrise_saving_active
+                    and self._pid_error is not None
+                    and self._pid_error <= max(0.0, early_stop_pred)
                 )
 
                 def _report_obs(is_act: bool, u_eff: float) -> None:
@@ -3056,10 +3086,18 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         now = dt_util.utcnow()
         last_off = self._last_switch_off_times.get(active_dev, self._last_switch_off_time)
         pwm_dur = float(self._pwm_duration) if self._pwm_duration > 0 else float(DEFAULT_PWM_DURATION_SWITCH)
-        if (float(self._min_on_time) + float(self._min_off_time)) >= pwm_dur:
+        dynamic_min_off = (
+            float(self._last_run_duration_sec) * float(self._dynamic_min_off_multiplier)
+            if self._dynamic_min_off_multiplier > 0.0
+            else 0.0
+        )
+        base_min_off = max(float(self._min_off_time), dynamic_min_off)
+        if self._dynamic_min_off_multiplier > 0.0 and dynamic_min_off > float(self._min_off_time):
+            effective_min_off = base_min_off
+        elif (float(self._min_on_time) + float(self._min_off_time)) >= pwm_dur:
             effective_min_off = min(float(self._min_off_time), max(1.0, pwm_dur * 0.05))
         else:
-            effective_min_off = float(self._min_off_time)
+            effective_min_off = base_min_off
 
         if not force and last_off is not None:
             elapsed_off = (now - last_off).total_seconds()
@@ -3122,6 +3160,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
         now = dt_util.utcnow()
         last_on = self._last_switch_on_times.get(active_dev, self._last_switch_on_time)
+        last_off = self._last_switch_off_times.get(active_dev, self._last_switch_off_time)
         pwm_dur = float(self._pwm_duration) if self._pwm_duration > 0 else float(DEFAULT_PWM_DURATION_SWITCH)
         if (float(self._min_on_time) + float(self._min_off_time)) >= pwm_dur:
             effective_min_on = min(float(self._min_on_time), max(1.0, pwm_dur * 0.05))
@@ -3154,6 +3193,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self._pwm_state = False
         _LOGGER.info("Turning OFF switch %s", active_dev)
         if await self._switch_guard.async_turn_off(active_dev, confirm=True):
+            if last_on is not None and (last_off is None or last_on > last_off):
+                self._last_run_duration_sec = max(0.0, (now - last_on).total_seconds())
             self._last_switch_off_time = now
             self._last_switch_off_times[active_dev] = now
         self.async_write_ha_state()

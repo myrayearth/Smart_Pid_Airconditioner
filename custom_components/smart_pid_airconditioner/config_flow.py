@@ -33,6 +33,7 @@ from .const import (
     CONF_AVAILABLE_FAN_MODES,
     CONF_AVAILABLE_HVAC_MODES,
     CONF_CONTROL_MODE,
+    CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
     CONF_INITIAL_TARGET_TEMP,
     CONF_KEEP_ALIVE,
     CONF_MIN_OFF_TIME,
@@ -110,6 +111,7 @@ from .const import (
     DEFAULT_AVAILABLE_FAN_MODES,
     DEFAULT_AVAILABLE_HVAC_MODES,
     DEFAULT_CONTROL_MODE,
+    DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
     DEFAULT_INITIAL_TARGET_TEMP,
     DEFAULT_KEEP_ALIVE,
     DEFAULT_MIN_OFF_TIME,
@@ -1151,6 +1153,18 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             pwm_dur = duration_to_seconds(user_input.get(CONF_PWM_DURATION), DEFAULT_PWM_DURATION_SWITCH)
             min_on = duration_to_seconds(user_input.get(CONF_MIN_ON_TIME), DEFAULT_MIN_ON_TIME)
             min_off = duration_to_seconds(user_input.get(CONF_MIN_OFF_TIME), DEFAULT_MIN_OFF_TIME)
+            dynamic_min_off_mult = max(
+                0.0,
+                min(
+                    3.0,
+                    float(
+                        user_input.get(
+                            CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
+                            DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
+                        )
+                    ),
+                ),
+            )
             keep_alive = duration_to_seconds(user_input.get(CONF_KEEP_ALIVE), DEFAULT_KEEP_ALIVE)
             output_safety = float(user_input.get(CONF_OUTPUT_SAFETY, DEFAULT_OUTPUT_SAFETY))
 
@@ -1163,6 +1177,7 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_PWM_DURATION: pwm_dur,
                     CONF_MIN_ON_TIME: min_on,
                     CONF_MIN_OFF_TIME: min_off,
+                    CONF_DYNAMIC_MIN_OFF_MULTIPLIER: dynamic_min_off_mult,
                     CONF_KEEP_ALIVE: keep_alive,
                     CONF_OUTPUT_SAFETY: output_safety,
                 }
@@ -1218,6 +1233,17 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     default=seconds_to_duration_dict(DEFAULT_MIN_OFF_TIME),
                 ): DurationSelector(
                     DurationSelectorConfig(enable_day=False)
+                ),
+                vol.Optional(
+                    CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
+                    default=DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=0.0,
+                        max=3.0,
+                        step=0.5,
+                        mode=NumberSelectorMode.BOX,
+                    )
                 ),
                 vol.Required(
                     CONF_KEEP_ALIVE,
@@ -2132,6 +2158,18 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlowWithReload):
             pwm_dur = duration_to_seconds(user_input.get(CONF_PWM_DURATION), DEFAULT_PWM_DURATION_SWITCH)
             min_on = duration_to_seconds(user_input.get(CONF_MIN_ON_TIME), DEFAULT_MIN_ON_TIME)
             min_off = duration_to_seconds(user_input.get(CONF_MIN_OFF_TIME), DEFAULT_MIN_OFF_TIME)
+            dynamic_min_off_mult = max(
+                0.0,
+                min(
+                    3.0,
+                    float(
+                        user_input.get(
+                            CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
+                            DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
+                        )
+                    ),
+                ),
+            )
             keep_alive = duration_to_seconds(user_input.get(CONF_KEEP_ALIVE), DEFAULT_KEEP_ALIVE)
             output_safety = float(user_input.get(CONF_OUTPUT_SAFETY, DEFAULT_OUTPUT_SAFETY))
 
@@ -2144,6 +2182,7 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlowWithReload):
                     CONF_PWM_DURATION: pwm_dur,
                     CONF_MIN_ON_TIME: min_on,
                     CONF_MIN_OFF_TIME: min_off,
+                    CONF_DYNAMIC_MIN_OFF_MULTIPLIER: dynamic_min_off_mult,
                     CONF_KEEP_ALIVE: keep_alive,
                     CONF_OUTPUT_SAFETY: output_safety,
                 }
@@ -2179,6 +2218,20 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlowWithReload):
                     ),
                 ): DurationSelector(
                     DurationSelectorConfig(enable_day=False)
+                ),
+                vol.Optional(
+                    CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
+                    default=self._get_val(
+                        CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
+                        DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
+                    ),
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=0.0,
+                        max=3.0,
+                        step=0.5,
+                        mode=NumberSelectorMode.BOX,
+                    )
                 ),
                 vol.Required(
                     CONF_KEEP_ALIVE,

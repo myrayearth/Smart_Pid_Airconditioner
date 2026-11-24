@@ -41,6 +41,8 @@ from .const import (
     ALL_FAN_MODES,
     CONF_AVAILABLE_FAN_MODES,
     CONF_AVAILABLE_HVAC_MODES,
+    CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
+    DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
     CONF_INITIAL_TARGET_TEMP,
     CONF_MIN_TEMP,
     CONF_MAX_TEMP,
@@ -466,6 +468,19 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._min_off_time: int = duration_to_seconds(
             self._get_setting(CONF_MIN_OFF_TIME, DEFAULT_MIN_OFF_TIME), DEFAULT_MIN_OFF_TIME
         )
+        self._dynamic_min_off_multiplier: float = max(
+            0.0,
+            min(
+                3.0,
+                float(
+                    self._get_setting(
+                        CONF_DYNAMIC_MIN_OFF_MULTIPLIER,
+                        DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER,
+                    )
+                ),
+            ),
+        )
+        self._last_run_duration_sec: float = 0.0
         self._keep_alive: int = duration_to_seconds(
             self._get_setting(CONF_KEEP_ALIVE, DEFAULT_KEEP_ALIVE), DEFAULT_KEEP_ALIVE
         )
@@ -814,6 +829,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             },
             active_section=self._active_section,
             integral=self._integral,
+            last_run_duration_sec=self._last_run_duration_sec,
         )
 
     async def async_added_to_hass(self) -> None:
@@ -866,6 +882,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 self._active_section = extra_data.active_section
             if self._is_on:
                 self._integral = float(extra_data.integral)
+            self._last_run_duration_sec = max(0.0, float(extra_data.last_run_duration_sec))
 
         # Track sensor changes
         sensors_to_track = [self._indoor_sensor_id]
@@ -1800,12 +1817,28 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         """Turn on switch/input_boolean if currently off."""
         if not device_id:
             return
+        now = dt_util.utcnow()
+        last_off = self._last_switch_off_times.get(device_id, self._last_switch_off_time)
+        if last_off is not None and self._dynamic_min_off_multiplier > 0.0:
+            effective_min_off = max(
+                float(self._min_off_time),
+                float(self._last_run_duration_sec) * float(self._dynamic_min_off_multiplier),
+            )
+            elapsed_off = (now - last_off).total_seconds()
+            if elapsed_off < effective_min_off:
+                _LOGGER.info(
+                    "Anti-short-cycling: switch %s ON blocked (%.1fs < dynamic min_off %.1fs)",
+                    device_id,
+                    elapsed_off,
+                    effective_min_off,
+                )
+                return
         st = self.hass.states.get(device_id)
         if st and st.state != STATE_ON:
             _LOGGER.info("Turning ON switch %s", device_id)
             if await self._switch_guard.async_turn_on(device_id, confirm=False):
-                self._last_switch_on_time = dt_util.utcnow()
-                self._last_switch_on_times[device_id] = self._last_switch_on_time
+                self._last_switch_on_time = now
+                self._last_switch_on_times[device_id] = now
 
     async def _async_turn_off_switch(self, device_id: str) -> None:
         """Turn off switch/input_boolean if currently on."""
@@ -1814,9 +1847,14 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         st = self.hass.states.get(device_id)
         if st and st.state != STATE_OFF:
             _LOGGER.info("Turning OFF switch %s", device_id)
+            now = dt_util.utcnow()
+            last_on = self._last_switch_on_times.get(device_id, self._last_switch_on_time)
+            last_off = self._last_switch_off_times.get(device_id, self._last_switch_off_time)
             if await self._switch_guard.async_turn_off(device_id, confirm=True):
-                self._last_switch_off_time = dt_util.utcnow()
-                self._last_switch_off_times[device_id] = self._last_switch_off_time
+                if last_on is not None and (last_off is None or last_on > last_off):
+                    self._last_run_duration_sec = max(0.0, (now - last_on).total_seconds())
+                self._last_switch_off_time = now
+                self._last_switch_off_times[device_id] = now
 
     async def _async_turn_off_specific_device(self, device_id: str) -> None:
         """Turn off a specific target device regardless of domain."""

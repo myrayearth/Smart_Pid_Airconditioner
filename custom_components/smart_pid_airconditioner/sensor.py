@@ -145,7 +145,16 @@ class SmartPIDPredictedCoastSensor(_BaseSmartPIDDiagnosticSensor):
 
     @property
     def native_value(self) -> float:
-        return round(self._runtime.snapshot.coasting.predict_coast(), 3)
+        return round(self._runtime.get_predicted_coast(), 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        corr, status = self._runtime.get_outdoor_coast_status()
+        return {
+            "outdoor_coast_correction": corr,
+            "outdoor_band_status": status,
+            "coast_confidence": self._runtime.snapshot.coasting.get_coast_confidence(),
+        }
 
 
 class SmartPIDRecommendedTuningSensor(_BaseSmartPIDDiagnosticSensor):

@@ -13,6 +13,8 @@ PLATFORMS = [
     Platform.SENSOR,
     Platform.BUTTON,
     Platform.SELECT,
+    Platform.SWITCH,
+    Platform.TIME,
 ]
 
 # Config & Option Keys - Step 1: Base settings
@@ -373,7 +375,17 @@ DEFAULT_DEVICE_UNAVAILABLE_GRACE_SEC = 60
 DEFAULT_SWITCH_CONFIRM_TIMEOUT = 1.5
 DEFAULT_SWITCH_OFF_RETRY_DELAYS = (0.3, 0.7)
 
+# Stage 7: High-Inertia Boiler Accuracy & Sunrise Saving
+CONF_DYNAMIC_MIN_OFF_MULTIPLIER = "dynamic_min_off_multiplier"
+DEFAULT_DYNAMIC_MIN_OFF_MULTIPLIER = 0.0
 
+CONF_SUNRISE_SAVING_ENABLED = "sunrise_saving_enabled"
+CONF_SUNRISE_SAVING_START = "sunrise_saving_start"
+CONF_SUNRISE_SAVING_END = "sunrise_saving_end"
+
+DEFAULT_SUNRISE_SAVING_ENABLED = False
+DEFAULT_SUNRISE_SAVING_START = "06:00:00"
+DEFAULT_SUNRISE_SAVING_END = "10:00:00"
 
 
 def resolve_thermostat_type(entry: Any) -> str:
@@ -389,6 +401,14 @@ def resolve_thermostat_type(entry: Any) -> str:
             if isinstance(sec_dict, dict) and sec_dict.get(CONF_THERMOSTAT_TYPE) is not None:
                 return str(sec_dict[CONF_THERMOSTAT_TYPE])
     return DEFAULT_THERMOSTAT_TYPE
+
+
+def is_heating_type(controller_type: str | None) -> bool:
+    """Return True if controller type supports heating (heater or heat_cool)."""
+    return controller_type in (
+        THERMOSTAT_TYPE_HEATER,
+        THERMOSTAT_TYPE_HEAT_COOL,
+    )
 
 
 def is_humidity_type(controller_type: str | None) -> bool:

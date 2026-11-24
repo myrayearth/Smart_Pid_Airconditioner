@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 import logging
 from typing import Any, Callable
 
@@ -32,6 +32,9 @@ from .const import (
     CONF_RECORDER_BOOTSTRAP,
     CONF_SAFETY_REST_MIN,
     CONF_SOLAR_GUARD,
+    CONF_SUNRISE_SAVING_ENABLED,
+    CONF_SUNRISE_SAVING_END,
+    CONF_SUNRISE_SAVING_START,
     CONF_TARGET_CLIMATE,
     CONF_TARGET_DEVICE,
     CONF_TARGET_DEVICE_COOL,
@@ -62,6 +65,9 @@ from .const import (
     DEFAULT_RECORDER_BOOTSTRAP,
     DEFAULT_SAFETY_REST_MIN,
     DEFAULT_SOLAR_GUARD,
+    DEFAULT_SUNRISE_SAVING_ENABLED,
+    DEFAULT_SUNRISE_SAVING_END,
+    DEFAULT_SUNRISE_SAVING_START,
     DEFAULT_THERMOSTAT_TYPE,
     DEFAULT_TUNING_MODE,
     DEFAULT_VENT_COOLDOWN_MIN,
@@ -77,9 +83,11 @@ from .const import (
     TUNING_MODE_AUTO,
     TUNING_MODE_SHADOW,
     duration_to_seconds,
+    is_heating_type,
     is_humidity_type,
 )
 from .learner import (
+    COAST_CONFIDENCE_ABSTAIN_THRESHOLD,
     ConfidenceStage,
     CyclePhase,
     INERTIA_CUSTOM,
@@ -93,6 +101,22 @@ from .storage import LearningStateSnapshot, ModelStore
 from .ventilation import VentState, VentStatus
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _parse_time_value(value: Any, default: dt_time) -> dt_time:
+    """Parse HH:MM[:SS] string or datetime.time into datetime.time."""
+    if isinstance(value, dt_time):
+        return value
+    if isinstance(value, str):
+        parts = value.strip().split(":")
+        try:
+            if len(parts) == 2:
+                return dt_time(int(parts[0]), int(parts[1]), 0)
+            if len(parts) >= 3:
+                return dt_time(int(parts[0]), int(parts[1]), int(parts[2]))
+        except (ValueError, TypeError):
+            pass
+    return default
 
 
 class SmartPIDRuntime:
@@ -121,6 +145,17 @@ class SmartPIDRuntime:
         )
         self.solar_guard_enabled: bool = bool(
             self._get_setting(CONF_SOLAR_GUARD, DEFAULT_SOLAR_GUARD)
+        )
+        self.sunrise_saving_enabled: bool = bool(
+            self._get_setting(CONF_SUNRISE_SAVING_ENABLED, DEFAULT_SUNRISE_SAVING_ENABLED)
+        )
+        self.sunrise_saving_start: dt_time = _parse_time_value(
+            self._get_setting(CONF_SUNRISE_SAVING_START, DEFAULT_SUNRISE_SAVING_START),
+            dt_time(6, 0, 0),
+        )
+        self.sunrise_saving_end: dt_time = _parse_time_value(
+            self._get_setting(CONF_SUNRISE_SAVING_END, DEFAULT_SUNRISE_SAVING_END),
+            dt_time(10, 0, 0),
         )
         self.aux_temp_sensor: str | None = self._get_setting(CONF_AUX_TEMP_SENSOR, None) or None
         self.thermostat_type: str = str(self._get_setting(CONF_THERMOSTAT_TYPE, DEFAULT_THERMOSTAT_TYPE))
@@ -441,6 +476,7 @@ class SmartPIDRuntime:
             block_reason=block_reason,
             target_val=target_for_cycle,
             solar_rising_active=self._is_solar_guard_active(),
+            outdoor_temp=None if self.is_humidity else self._obs_outdoor,
         )
 
         # Feed real-world completed cycle error (MAE) & overshoot into TuningSafetyManager
@@ -548,6 +584,17 @@ class SmartPIDRuntime:
             None,
         )
 
+    def get_outdoor_coast_status(self) -> tuple[float, str]:
+        """Return (outdoor_coast_correction, outdoor_band_status) for current outdoor temp."""
+        if self.is_humidity:
+            return 0.0, "missing"
+        return self.snapshot.coasting.get_outdoor_coast_correction(self._obs_outdoor)
+
+    def get_predicted_coast(self) -> float:
+        """Return current coasting prediction including outdoor band correction."""
+        outdoor = None if self.is_humidity else self._obs_outdoor
+        return self.snapshot.coasting.predict_coast(outdoor_temp=outdoor)
+
     def get_early_stop_prediction(self) -> float:
         """Return predicted coasting amount when adaptive_auto is active and tuned."""
         if self.tuning_mode != TUNING_MODE_AUTO:
@@ -555,7 +602,68 @@ class SmartPIDRuntime:
         stage, _ = self.get_confidence()
         if stage in (ConfidenceStage.COLLECTING, ConfidenceStage.STABLE):
             return 0.0
-        return self.snapshot.coasting.predict_coast()
+        if (
+            len(self.snapshot.coasting.history) > 0
+            and self.snapshot.coasting.get_coast_confidence() < COAST_CONFIDENCE_ABSTAIN_THRESHOLD
+        ):
+            self.fallback_reason = "high_coast_variance"
+            return 0.0
+        return self.get_predicted_coast()
+
+    def is_sunrise_saving_active(self, now: datetime | None = None) -> bool:
+        """Return True when sunrise saving is enabled and within schedule OR sun above horizon."""
+        if not is_heating_type(self.thermostat_type) or not self.sunrise_saving_enabled:
+            return False
+
+        # Sun entity check (sun.sun == above_horizon)
+        st = self.hass.states.get("sun.sun")
+        if st is not None and str(st.state) == "above_horizon":
+            return True
+
+        # Time window check (supports midnight wrap, e.g. 22:00 -> 07:00)
+        ref_dt = now or dt_util.utcnow()
+        if hasattr(dt_util, "as_local"):
+            try:
+                ref_dt = dt_util.as_local(ref_dt)
+            except Exception:
+                pass
+        cur_t = ref_dt.time()
+        start_t = self.sunrise_saving_start
+        end_t = self.sunrise_saving_end
+        if start_t <= end_t:
+            return start_t <= cur_t <= end_t
+        return cur_t >= start_t or cur_t <= end_t
+
+    async def async_set_sunrise_saving_enabled(self, enabled: bool) -> None:
+        """Toggle sunrise saving live without full config entry reload."""
+        val = bool(enabled)
+        if val == self.sunrise_saving_enabled:
+            return
+        self.sunrise_saving_enabled = val
+        new_options = dict(self.entry.options)
+        new_options[CONF_SUNRISE_SAVING_ENABLED] = val
+        self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+        self._notify_subscribers()
+
+    async def async_set_sunrise_saving_start(self, value: dt_time) -> None:
+        """Update sunrise saving start time live without full config entry reload."""
+        if value == self.sunrise_saving_start:
+            return
+        self.sunrise_saving_start = value
+        new_options = dict(self.entry.options)
+        new_options[CONF_SUNRISE_SAVING_START] = value.strftime("%H:%M:%S")
+        self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+        self._notify_subscribers()
+
+    async def async_set_sunrise_saving_end(self, value: dt_time) -> None:
+        """Update sunrise saving end time live without full config entry reload."""
+        if value == self.sunrise_saving_end:
+            return
+        self.sunrise_saving_end = value
+        new_options = dict(self.entry.options)
+        new_options[CONF_SUNRISE_SAVING_END] = value.strftime("%H:%M:%S")
+        self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+        self._notify_subscribers()
 
     def record_cycle_performance(self, cycle_mae: float, cycle_overshoot: float) -> bool:
         """Evaluate post-apply performance; returns True if auto-rollback occurred."""
@@ -626,6 +734,7 @@ class SmartPIDRuntime:
         """Return structured diagnostics snapshot for HA Download Diagnostics."""
         stage, pct = self.get_confidence()
         tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
+        outdoor_corr, outdoor_status = self.get_outdoor_coast_status()
         return {
             "entry": {
                 "entry_id": self.entry.entry_id,
@@ -642,6 +751,10 @@ class SmartPIDRuntime:
                 "max_coast_window_min": coast_win,
                 "peak_confirm_delta": peak_delta,
                 "solar_guard_enabled": self.solar_guard_enabled,
+                "sunrise_saving_enabled": self.sunrise_saving_enabled,
+                "sunrise_saving_active": self.is_sunrise_saving_active(),
+                "sunrise_saving_start": self.sunrise_saving_start.strftime("%H:%M:%S"),
+                "sunrise_saving_end": self.sunrise_saving_end.strftime("%H:%M:%S"),
                 "aux_temp_sensor": self.aux_temp_sensor,
                 "coupled_dehumidifier": self.coupled_dehumidifier,
                 "coupled_ac": self.coupled_ac,
@@ -649,7 +762,13 @@ class SmartPIDRuntime:
                 "max_run_min": self.max_run_min,
                 "safety_rest_min": self.safety_rest_min,
             },
-            "confidence": {"stage": stage.value, "percent": pct},
+            "confidence": {
+                "stage": stage.value,
+                "percent": pct,
+                "coast_confidence": self.snapshot.coasting.get_coast_confidence(),
+            },
+            "outdoor_coast_correction": outdoor_corr,
+            "outdoor_band_status": outdoor_status,
             "recommended": self.recommended.to_dict(),
             "applied_auto_params": (
                 self._applied_auto_params.to_dict() if self._applied_auto_params is not None else None

@@ -382,7 +382,8 @@
           "min_on_time": "최소 가동 시간 (시:분:초)",
           "min_off_time": "최소 정지 시간 (압축기 보호, 시:분:초)",
           "keep_alive": "상태 재전송 주기 (시:분:초)",
-          "output_safety": "센서 고장 시 안전 출력 (%)"
+          "output_safety": "센서 고장 시 안전 출력 (%)",
+          "dynamic_min_off_multiplier": "가동시간 비례 동적 최소 정지 배수 (0=미사용, 0.5~3.0)"
         }
       }
     }
@@ -762,7 +763,8 @@
           "min_on_time": "최소 가동 시간 (시:분:초)",
           "min_off_time": "최소 정지 시간 (압축기 보호, 시:분:초)",
           "keep_alive": "상태 재전송 주기 (시:분:초)",
-          "output_safety": "센서 고장 시 안전 출력 (%)"
+          "output_safety": "센서 고장 시 안전 출력 (%)",
+          "dynamic_min_off_multiplier": "가동시간 비례 동적 최소 정지 배수 (0=미사용, 0.5~3.0)"
         }
       }
     }
@@ -1068,7 +1070,23 @@
         }
       },
       "predicted_coast": {
-        "name": "예측 코스팅량"
+        "name": "예측 코스팅량",
+        "state_attributes": {
+          "outdoor_coast_correction": {
+            "name": "외기 온도 코스팅 보정"
+          },
+          "outdoor_band_status": {
+            "name": "외기 밴드 학습 상태",
+            "state": {
+              "learned": "학습 완료",
+              "untrained": "표본 부족",
+              "missing": "외기 센서 미연결"
+            }
+          },
+          "coast_confidence": {
+            "name": "코스팅 신뢰도"
+          }
+        }
       },
       "recommended_tuning": {
         "name": "자동 추천 제어 파라미터"
@@ -1081,6 +1099,19 @@
           "ventilating": "환기 중 (제어 일시정지)",
           "post_close_cooldown": "닫힘 후 학습 안정화"
         }
+      }
+    },
+    "switch": {
+      "sunrise_saving": {
+        "name": "일출 절약 모드"
+      }
+    },
+    "time": {
+      "sunrise_saving_start": {
+        "name": "일출 절약 시작 시각"
+      },
+      "sunrise_saving_end": {
+        "name": "일출 절약 종료 시각"
       }
     }
   },

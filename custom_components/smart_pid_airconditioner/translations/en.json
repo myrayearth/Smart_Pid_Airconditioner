@@ -382,7 +382,8 @@
           "min_on_time": "최소 가동 시간 (시:분:초)",
           "min_off_time": "최소 정지 시간 (압축기 보호, 시:분:초)",
           "keep_alive": "상태 재전송 주기 (시:분:초)",
-          "output_safety": "센서 고장 시 안전 출력 (%)"
+          "output_safety": "센서 고장 시 안전 출력 (%)",
+          "dynamic_min_off_multiplier": "Dynamic Min Off Multiplier (0=disabled, 0.5~3.0x last run)"
         }
       }
     }
@@ -762,7 +763,8 @@
           "min_on_time": "최소 가동 시간 (시:분:초)",
           "min_off_time": "최소 정지 시간 (압축기 보호, 시:분:초)",
           "keep_alive": "상태 재전송 주기 (시:분:초)",
-          "output_safety": "센서 고장 시 안전 출력 (%)"
+          "output_safety": "센서 고장 시 안전 출력 (%)",
+          "dynamic_min_off_multiplier": "Dynamic Min Off Multiplier (0=disabled, 0.5~3.0x last run)"
         }
       }
     }
@@ -1068,7 +1070,23 @@
         }
       },
       "predicted_coast": {
-        "name": "Predicted Coast"
+        "name": "Predicted Coast",
+        "state_attributes": {
+          "outdoor_coast_correction": {
+            "name": "Outdoor Coast Correction"
+          },
+          "outdoor_band_status": {
+            "name": "Outdoor Band Status",
+            "state": {
+              "learned": "Learned",
+              "untrained": "Untrained",
+              "missing": "Missing Outdoor Sensor"
+            }
+          },
+          "coast_confidence": {
+            "name": "Coast Confidence"
+          }
+        }
       },
       "recommended_tuning": {
         "name": "Recommended Tuning"
@@ -1081,6 +1099,19 @@
           "ventilating": "Ventilating (control paused)",
           "post_close_cooldown": "Post-close cooldown"
         }
+      }
+    },
+    "switch": {
+      "sunrise_saving": {
+        "name": "Sunrise Saving Mode"
+      }
+    },
+    "time": {
+      "sunrise_saving_start": {
+        "name": "Sunrise Saving Start Time"
+      },
+      "sunrise_saving_end": {
+        "name": "Sunrise Saving End Time"
       }
     }
   },
