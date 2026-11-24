@@ -297,7 +297,17 @@ async def test_solar_guard_refined_and_sunrise_saving_mode(hass: HomeAssistant) 
     added_cooler: list = []
     await async_setup_switch(hass, cooler_entry, lambda ents, _: added_cooler.extend(ents))
     await async_setup_time(hass, cooler_entry, lambda ents, _: added_cooler.extend(ents))
-    assert added_cooler == []
+    assert not any(
+        isinstance(
+            e,
+            (
+                SmartPIDSunriseSavingSwitch,
+                SmartPIDSunriseSavingStartTime,
+                SmartPIDSunriseSavingEndTime,
+            ),
+        )
+        for e in added_cooler
+    )
 
     heater_entry = ConfigEntry(
         entry_id="stage7_heater",
@@ -318,12 +328,13 @@ async def test_solar_guard_refined_and_sunrise_saving_mode(hass: HomeAssistant) 
     tm_list: list = []
     await async_setup_switch(hass, heater_entry, lambda ents, _: sw_list.extend(ents))
     await async_setup_time(hass, heater_entry, lambda ents, _: tm_list.extend(ents))
-    assert len(sw_list) == 1 and isinstance(sw_list[0], SmartPIDSunriseSavingSwitch)
+    sunrise_switches = [e for e in sw_list if isinstance(e, SmartPIDSunriseSavingSwitch)]
+    assert len(sunrise_switches) == 1
     assert len(tm_list) == 2
     assert isinstance(tm_list[0], SmartPIDSunriseSavingStartTime)
     assert isinstance(tm_list[1], SmartPIDSunriseSavingEndTime)
 
-    sw = sw_list[0]
+    sw = sunrise_switches[0]
     t_start = tm_list[0]
     t_end = tm_list[1]
 

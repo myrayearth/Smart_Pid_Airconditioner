@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, time as dt_time, timedelta
 import logging
+import time
 from typing import Any, Callable
 
 from homeassistant.config_entries import ConfigEntry
@@ -29,6 +30,7 @@ from .const import (
     CONF_MAX_RUN_MIN,
     CONF_OUTDOOR_SENSOR,
     CONF_PREDICTION_MODE,
+    CONF_PREDICTIVE_ON_ENABLED,
     CONF_RECORDER_BOOTSTRAP,
     CONF_SAFETY_REST_MIN,
     CONF_SOLAR_GUARD,
@@ -62,6 +64,7 @@ from .const import (
     DEFAULT_MANUAL_OVERRIDE_MIN,
     DEFAULT_MAX_RUN_MIN,
     DEFAULT_PREDICTION_MODE,
+    DEFAULT_PREDICTIVE_ON_ENABLED,
     DEFAULT_RECORDER_BOOTSTRAP,
     DEFAULT_SAFETY_REST_MIN,
     DEFAULT_SOLAR_GUARD,
@@ -158,6 +161,9 @@ class SmartPIDRuntime:
             self._get_setting(CONF_SUNRISE_SAVING_END, DEFAULT_SUNRISE_SAVING_END),
             dt_time(10, 0, 0),
         )
+        self.predictive_on_enabled: bool = bool(
+            self._get_setting(CONF_PREDICTIVE_ON_ENABLED, DEFAULT_PREDICTIVE_ON_ENABLED)
+        )
         self.aux_temp_sensor: str | None = self._get_setting(CONF_AUX_TEMP_SENSOR, None) or None
         self.thermostat_type: str = str(self._get_setting(CONF_THERMOSTAT_TYPE, DEFAULT_THERMOSTAT_TYPE))
         self.is_humidity: bool = is_humidity_type(self.thermostat_type)
@@ -184,11 +190,7 @@ class SmartPIDRuntime:
             ki=float(self._get_setting(CONF_KI, DEFAULT_KI)),
             ke=float(self._get_setting(CONF_KE, DEFAULT_KE)),
         )
-        self.recommended: TuningParameters = self.tuner.compute(
-            self._active_rls(),
-            prediction_mode=self.prediction_mode,
-            baseline=self.baseline,
-        )
+        self.recommended: TuningParameters = self._recompute_recommended()
 
         # Latest observation from climate / humidifier entity
         self._obs_indoor: float | None = None
@@ -200,6 +202,7 @@ class SmartPIDRuntime:
         self._obs_vent_status: VentStatus = VentStatus(VentState.NORMAL, False, False, 0, False)
         self._obs_manual_override: bool = False
         self._obs_device_unavailable: bool = False
+        self._obs_early_stop_active: bool = False
         self._device_unavailable_since: datetime | None = None
 
         # 5-minute RLS block accumulator
@@ -237,6 +240,14 @@ class SmartPIDRuntime:
 
     def _active_rls(self):
         return self.snapshot.hum_rls if self.is_humidity else self.snapshot.temp_rls
+
+    def _recompute_recommended(self, rls: Any | None = None) -> TuningParameters:
+        return self.tuner.compute(
+            self._active_rls() if rls is None else rls,
+            prediction_mode=self.prediction_mode,
+            dead_time_min=self.snapshot.coasting.get_effective_dead_time(),
+            baseline=self.baseline,
+        )
 
     def subscribe(self, cb: Callable[[], None]) -> Callable[[], None]:
         """Subscribe to runtime diagnostic/state updates."""
@@ -278,11 +289,7 @@ class SmartPIDRuntime:
             max_coast_window_min=coast_win,
             peak_confirm_delta=peak_delta,
         )
-        self.recommended = self.tuner.compute(
-            self._active_rls(),
-            prediction_mode=self.prediction_mode,
-            baseline=self.baseline,
-        )
+        self.recommended = self._recompute_recommended()
         self._unsub_tick = async_track_time_interval(
             self.hass,
             self._async_learning_tick,
@@ -319,6 +326,7 @@ class SmartPIDRuntime:
         vent_status: VentStatus,
         manual_override: bool = False,
         device_unavailable: bool = False,
+        early_stop_active: bool = False,
     ) -> None:
         """Receive latest state observation from climate/humidifier entity."""
         now = dt_util.utcnow()
@@ -345,6 +353,7 @@ class SmartPIDRuntime:
         self._obs_vent_status = vent_status
         self._obs_manual_override = bool(manual_override)
         self._obs_device_unavailable = bool(unavailable_expired)
+        self._obs_early_stop_active = bool(early_stop_active)
 
         if vent_status.should_block_learning or manual_override or unavailable_expired:
             reason = (
@@ -471,6 +480,8 @@ class SmartPIDRuntime:
             target_val=target_for_cycle,
             solar_rising_active=self._is_solar_guard_active(),
             outdoor_temp=None if self.is_humidity else self._obs_outdoor,
+            now_ts=time.time(),
+            early_stop_active=self._obs_early_stop_active,
         )
 
         # Feed real-world completed cycle error (MAE) & overshoot into TuningSafetyManager
@@ -513,11 +524,7 @@ class SmartPIDRuntime:
                 else:
                     rls.update([u_avg, -diff_avg, aux_avg], dy_per_min)
 
-                self.recommended = self.tuner.compute(
-                    rls,
-                    prediction_mode=self.prediction_mode,
-                    baseline=self.baseline,
-                )
+                self.recommended = self._recompute_recommended(rls)
                 self._dirty = True
                 self.store.async_delay_save(self.snapshot.to_dict, delay=600)
 
@@ -585,9 +592,13 @@ class SmartPIDRuntime:
         return self.snapshot.coasting.get_outdoor_coast_correction(self._obs_outdoor)
 
     def get_predicted_coast(self) -> float:
-        """Return current coasting prediction including outdoor band correction."""
+        """Return current coasting prediction including outdoor band and signed bias correction."""
         outdoor = None if self.is_humidity else self._obs_outdoor
-        return self.snapshot.coasting.predict_coast(outdoor_temp=outdoor)
+        return self.snapshot.coasting.predict_coast(
+            outdoor_temp=outdoor,
+            apply_bias=True,
+            apply_shortfall_scale=False,
+        )
 
     def get_early_stop_prediction(self) -> float:
         """Return predicted coasting amount when adaptive_auto is active and tuned."""
@@ -602,7 +613,12 @@ class SmartPIDRuntime:
         ):
             self.fallback_reason = "high_coast_variance"
             return 0.0
-        return self.get_predicted_coast()
+        outdoor = None if self.is_humidity else self._obs_outdoor
+        return self.snapshot.coasting.predict_coast(
+            outdoor_temp=outdoor,
+            apply_bias=True,
+            apply_shortfall_scale=True,
+        )
 
     def is_sunrise_saving_active(self, now: datetime | None = None) -> bool:
         """Return True when sunrise saving is enabled and within schedule OR sun above horizon."""
@@ -659,6 +675,26 @@ class SmartPIDRuntime:
         self.hass.config_entries.async_update_entry(self.entry, options=new_options)
         self._notify_subscribers()
 
+    async def async_set_predictive_on_enabled(self, enabled: bool) -> None:
+        """Toggle Predictive ON live without full config entry reload."""
+        val = bool(enabled)
+        if val == self.predictive_on_enabled:
+            return
+        self.predictive_on_enabled = val
+        new_options = dict(self.entry.options)
+        new_options[CONF_PREDICTIVE_ON_ENABLED] = val
+        self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+        self._notify_subscribers()
+
+    def get_predictive_on_margin(self) -> float:
+        """Return predicted drop during dead time when Predictive ON is active and tuned."""
+        if self.tuning_mode != TUNING_MODE_AUTO or not self.predictive_on_enabled or self.is_humidity:
+            return 0.0
+        stage, _ = self.get_confidence()
+        if stage not in (ConfidenceStage.TUNED, ConfidenceStage.OPTIMIZED):
+            return 0.0
+        return self.snapshot.coasting.predict_preheat_drop(self._obs_outdoor)
+
     def record_cycle_performance(self, cycle_mae: float, cycle_overshoot: float) -> bool:
         """Evaluate post-apply performance; returns True if auto-rollback occurred."""
         rolled_back = self.snapshot.safety.record_post_apply_cycle(
@@ -711,11 +747,7 @@ class SmartPIDRuntime:
         if mode == self.prediction_mode:
             return
         self.prediction_mode = mode
-        self.recommended = self.tuner.compute(
-            self._active_rls(),
-            prediction_mode=self.prediction_mode,
-            baseline=self.baseline,
-        )
+        self.recommended = self._recompute_recommended()
         new_options = dict(self.entry.options)
         new_options[CONF_PREDICTION_MODE] = mode
         al_sec = new_options.get("adaptive_learning")
@@ -729,6 +761,7 @@ class SmartPIDRuntime:
         stage, pct = self.get_confidence()
         tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
         outdoor_corr, outdoor_status = self.get_outdoor_coast_status()
+        coasting = self.snapshot.coasting
         return {
             "entry": {
                 "entry_id": self.entry.entry_id,
@@ -749,6 +782,7 @@ class SmartPIDRuntime:
                 "sunrise_saving_active": self.is_sunrise_saving_active(),
                 "sunrise_saving_start": self.sunrise_saving_start.strftime("%H:%M:%S"),
                 "sunrise_saving_end": self.sunrise_saving_end.strftime("%H:%M:%S"),
+                "predictive_on_enabled": self.predictive_on_enabled,
                 "aux_temp_sensor": self.aux_temp_sensor,
                 "coupled_dehumidifier": self.coupled_dehumidifier,
                 "coupled_ac": self.coupled_ac,
@@ -759,16 +793,31 @@ class SmartPIDRuntime:
             "confidence": {
                 "stage": stage.value,
                 "percent": pct,
-                "coast_confidence": self.snapshot.coasting.get_coast_confidence(),
+                "coast_confidence": coasting.get_coast_confidence(),
             },
             "outdoor_coast_correction": outdoor_corr,
             "outdoor_band_status": outdoor_status,
+            "response_delay_min": (
+                round(coasting.response_delay_min, 2)
+                if coasting.response_delay_min is not None
+                else None
+            ),
+            "response_delay_samples": coasting.response_delay_samples,
+            "passive_drift_rate": round(coasting.passive_drift_rate, 5),
+            "predictive_on_enabled": self.predictive_on_enabled,
+            "predictive_on_margin": self.get_predictive_on_margin(),
+            "dual_layer_memory": coasting.get_memory_summary(time.time()),
+            "coast_bias": round(coasting.coast_bias, 4),
+            "coast_bias_samples": coasting.coast_bias_samples,
+            "shortfall_margin_scale": round(coasting.shortfall_margin_scale, 4),
+            "consecutive_shortfalls": coasting.consecutive_shortfalls,
             "recommended": self.recommended.to_dict(),
             "applied_auto_params": (
                 self._applied_auto_params.to_dict() if self._applied_auto_params is not None else None
             ),
             "fallback_reason": self.fallback_reason,
             "mean_absolute_error": self.snapshot.safety.mean_absolute_error,
+            "last_signed_coast_error": self.snapshot.safety.last_signed_coast_error,
             "snapshot": self.snapshot.to_dict(),
         }
 
@@ -781,11 +830,7 @@ class SmartPIDRuntime:
             max_coast_window_min=coast_win,
             peak_confirm_delta=peak_delta,
         )
-        self.recommended = self.tuner.compute(
-            self._active_rls(),
-            prediction_mode=self.prediction_mode,
-            baseline=self.baseline,
-        )
+        self.recommended = self._recompute_recommended()
         self._applied_auto_params = None
         self.fallback_reason = None
         self._block_minutes = 0
@@ -878,11 +923,7 @@ class SmartPIDRuntime:
             peak_confirm_delta=peak_delta,
         )
         self.snapshot = snapshot
-        self.recommended = self.tuner.compute(
-            self._active_rls(),
-            prediction_mode=self.prediction_mode,
-            baseline=self.baseline,
-        )
+        self.recommended = self._recompute_recommended()
         self._applied_auto_params = None
         self.fallback_reason = None
         self._block_minutes = 0
@@ -941,10 +982,6 @@ class SmartPIDRuntime:
             except (ValueError, TypeError, AttributeError):
                 continue
 
-        self.recommended = self.tuner.compute(
-            rls,
-            prediction_mode=self.prediction_mode,
-            baseline=self.baseline,
-        )
+        self.recommended = self._recompute_recommended(rls)
         self._dirty = True
         self._notify_subscribers()

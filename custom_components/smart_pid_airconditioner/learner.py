@@ -5,9 +5,13 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+import logging
 import math
 from statistics import median
+import time
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 INERTIA_FAST_AIR = "fast_air"
 INERTIA_HIGH_INERTIA = "high_inertia"
@@ -27,6 +31,260 @@ COAST_CONFIDENCE_ABSTAIN_THRESHOLD = 0.25
 OUTDOOR_BAND_WIDTH_C = 5.0
 OUTDOOR_BAND_MIN_SAMPLES = 3
 OUTDOOR_COAST_CORRECTION_CLAMP = 0.3
+
+# Stage 9: Dual-layer memory (Current short-term / Long-term promotion & freshness decay)
+MEMORY_CURRENT_ALPHA = 0.2
+MEMORY_LONG_TERM_ALPHA = 0.02
+MEMORY_CURRENT_MAX_AGE_SEC = 30 * 86400.0
+MEMORY_MIN_PROMOTION_SAMPLES = 5
+MEMORY_PROMOTION_CONFIDENCE = 0.7
+MEMORY_MIN_PREDICTION_CONFIDENCE = 0.25
+
+# Stage 10: Signed coast bias correction & early-stop shortfall defense
+COAST_BIAS_ALPHA = 0.2
+COAST_BIAS_CLAMP = 0.3
+SHORTFALL_TOLERANCE = 0.15
+SHORTFALL_DECAY_FACTOR = 0.85
+SHORTFALL_RECOVERY_STEP = 0.05
+SHORTFALL_MIN_SCALE = 0.5
+
+
+@dataclass
+class StatBucket:
+    """Single-layer EWMA mean/variance bucket with freshness decay and promotion."""
+
+    mean: float
+    variance: float | None = None
+    samples: int = 0
+    updated_at: float = 0.0
+    promotions: int = 0
+
+    def update(self, value: float, now_ts: float) -> None:
+        """Update short-term bucket with dormancy reset after 30 days."""
+        val = float(value)
+        ts = float(now_ts)
+        if not math.isfinite(val) or not math.isfinite(ts):
+            return
+
+        if self.samples > 0 and (ts - self.updated_at) >= MEMORY_CURRENT_MAX_AGE_SEC:
+            self.mean = val
+            self.variance = 0.0
+            self.samples = 1
+            self.updated_at = ts
+            return
+
+        alpha = MEMORY_CURRENT_ALPHA
+        if self.samples == 0:
+            self.mean = (1.0 - alpha) * self.mean + alpha * val
+            self.variance = 0.0
+            self.samples = 1
+        else:
+            delta = val - self.mean
+            self.mean += alpha * delta
+            self.variance = (1.0 - alpha) * ((self.variance or 0.0) + alpha * delta * delta)
+            self.samples += 1
+        self.updated_at = ts
+
+    def confidence(self, now_ts: float, *, long_term: bool = False, scale: float = 0.3) -> float:
+        """Compute bucket confidence in [0.0, 1.0] with 30-day linear freshness decay for current."""
+        if self.variance is None or self.samples < 3:
+            return 0.0
+        freshness = (
+            1.0
+            if long_term
+            else max(
+                0.0,
+                1.0 - max(0.0, float(now_ts) - self.updated_at) / MEMORY_CURRENT_MAX_AGE_SEC,
+            )
+        )
+        var = max(0.0, float(self.variance))
+        sc = max(1e-6, float(scale))
+        return min(self.samples / 8.0, 1.0) / (1.0 + math.sqrt(var) / sc) * freshness
+
+    def stable(self, now_ts: float, *, scale: float = 0.3) -> bool:
+        """Return True when bucket has enough low-variance samples to promote to long-term."""
+        return (
+            self.samples >= MEMORY_MIN_PROMOTION_SAMPLES
+            and self.confidence(now_ts, scale=scale) >= MEMORY_PROMOTION_CONFIDENCE
+        )
+
+    def promote(self, current: StatBucket, now_ts: float) -> None:
+        """Blend a stable current bucket into this long-term bucket."""
+        if self.promotions == 0:
+            self.mean = current.mean
+            self.variance = current.variance
+        else:
+            alpha = MEMORY_LONG_TERM_ALPHA
+            self.mean = (1.0 - alpha) * self.mean + alpha * current.mean
+            if current.variance is not None:
+                prev_v = 0.0 if self.variance is None else self.variance
+                self.variance = (1.0 - alpha) * prev_v + alpha * current.variance
+        self.samples = max(self.samples, current.samples)
+        self.updated_at = float(now_ts)
+        self.promotions += 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mean": round(float(self.mean), 6),
+            "variance": round(float(self.variance), 6) if self.variance is not None else None,
+            "samples": int(self.samples),
+            "updated_at": float(self.updated_at),
+            "promotions": int(self.promotions),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StatBucket:
+        if not isinstance(data, dict):
+            raise ValueError("StatBucket payload must be a dict")
+        mean = float(data["mean"])
+        if not math.isfinite(mean):
+            raise ValueError("StatBucket mean is not finite")
+        raw_var = data.get("variance")
+        if raw_var is None:
+            variance: float | None = None
+        else:
+            variance = float(raw_var)
+            if not math.isfinite(variance) or variance < 0.0:
+                raise ValueError("StatBucket variance must be finite and >= 0")
+        samples = int(data.get("samples", 0))
+        if samples < 0:
+            raise ValueError("StatBucket samples must be >= 0")
+        updated_at = float(data.get("updated_at", 0.0))
+        if not math.isfinite(updated_at):
+            raise ValueError("StatBucket updated_at is not finite")
+        promotions = int(data.get("promotions", 0))
+        if promotions < 0:
+            raise ValueError("StatBucket promotions must be >= 0")
+        return cls(
+            mean=mean,
+            variance=variance,
+            samples=samples,
+            updated_at=updated_at,
+            promotions=promotions,
+        )
+
+
+class DualLayerMemory:
+    """Two-tier memory blending fast-adapting current stats with promoted long-term baseline."""
+
+    def __init__(
+        self,
+        *,
+        scale: float = 0.3,
+        current_weight_limit: float = 1.0,
+        current: StatBucket | None = None,
+        long_term: StatBucket | None = None,
+    ) -> None:
+        self.scale = max(1e-6, float(scale))
+        self.current_weight_limit = max(0.0, min(1.0, float(current_weight_limit)))
+        self.current: StatBucket | None = current
+        self.long_term: StatBucket | None = long_term
+
+    def learn(self, value: float, now_ts: float) -> bool:
+        """Update current bucket and promote into long-term when stable. Returns True if promoted."""
+        val = float(value)
+        ts = float(now_ts)
+        if not math.isfinite(val) or not math.isfinite(ts):
+            return False
+
+        if self.current is None:
+            self.current = StatBucket(mean=val, variance=0.0, samples=1, updated_at=ts)
+        else:
+            self.current.update(val, ts)
+
+        if self.current.stable(ts, scale=self.scale):
+            if self.long_term is None:
+                self.long_term = StatBucket(
+                    mean=self.current.mean,
+                    variance=self.current.variance,
+                    samples=0,
+                    updated_at=ts,
+                    promotions=0,
+                )
+            self.long_term.promote(self.current, ts)
+            return True
+        return False
+
+    def estimate(self, now_ts: float) -> tuple[float, float, str, float] | None:
+        """Return (mean, confidence, source, current_weight) or None if neither layer is ready."""
+        ts = float(now_ts)
+        c_conf = (
+            self.current.confidence(ts, long_term=False, scale=self.scale)
+            if self.current is not None
+            else 0.0
+        )
+        l_conf = (
+            self.long_term.confidence(ts, long_term=True, scale=self.scale)
+            if self.long_term is not None
+            else 0.0
+        )
+        c_ok = self.current is not None and c_conf >= MEMORY_MIN_PREDICTION_CONFIDENCE
+        l_ok = self.long_term is not None and l_conf >= MEMORY_MIN_PREDICTION_CONFIDENCE
+
+        if c_ok and l_ok:
+            assert self.current is not None and self.long_term is not None
+            weight = min(c_conf, self.current_weight_limit)
+            mean = weight * self.current.mean + (1.0 - weight) * self.long_term.mean
+            conf = weight * c_conf + (1.0 - weight) * l_conf
+            return mean, conf, "blended", round(weight, 4)
+        if c_ok:
+            assert self.current is not None
+            return self.current.mean, c_conf, "current", 1.0
+        if l_ok:
+            assert self.long_term is not None
+            return self.long_term.mean, l_conf, "long_term", 0.0
+        return None
+
+    def summary(self, now_ts: float) -> dict[str, Any]:
+        """Return compact diagnostics summary of both layers."""
+        ts = float(now_ts)
+        def _layer_info(bucket: StatBucket | None, is_lt: bool) -> dict[str, Any] | None:
+            if bucket is None:
+                return None
+            return {
+                "mean": round(bucket.mean, 4),
+                "samples": bucket.samples,
+                "promotions": bucket.promotions,
+                "confidence": round(bucket.confidence(ts, long_term=is_lt, scale=self.scale), 4),
+            }
+        return {
+            "current": _layer_info(self.current, False),
+            "long_term": _layer_info(self.long_term, True),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scale": self.scale,
+            "current_weight_limit": self.current_weight_limit,
+            "current": self.current.to_dict() if self.current is not None else None,
+            "long_term": self.long_term.to_dict() if self.long_term is not None else None,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Any,
+        *,
+        scale: float = 0.3,
+        current_weight_limit: float = 1.0,
+    ) -> DualLayerMemory:
+        mem = cls(scale=scale, current_weight_limit=current_weight_limit)
+        if not isinstance(data, dict):
+            _LOGGER.warning("Discarding corrupted DualLayerMemory payload (expected dict)")
+            return mem
+        raw_cur = data.get("current")
+        if raw_cur is not None:
+            try:
+                mem.current = StatBucket.from_dict(raw_cur)
+            except (ValueError, TypeError, KeyError) as err:
+                _LOGGER.warning("Discarding corrupted current StatBucket: %s", err)
+        raw_lt = data.get("long_term")
+        if raw_lt is not None:
+            try:
+                mem.long_term = StatBucket.from_dict(raw_lt)
+            except (ValueError, TypeError, KeyError) as err:
+                _LOGGER.warning("Discarding corrupted long_term StatBucket: %s", err)
+        return mem
 
 
 
@@ -236,11 +494,33 @@ class DynamicCoastingLearner:
         self.min_slope = float(min_slope)
         self.min_charge = float(min_charge)
         self.peak_confirm_delta = max(0.01, float(peak_confirm_delta))
+        self.response_threshold: float = 0.1
 
         self.phase: CyclePhase = CyclePhase.IDLE
         self.tau_coast: float = 3.0 if self.inertia_profile == INERTIA_FAST_AIR else 1.5
         self.k_afterglow: float = 1.0
         self.emitter_charge: float = 0.0
+
+        # Stage 8: Measured response delay (Dead Time θ) & passive drift learning
+        self.response_delay_min: float | None = None
+        self.response_delay_samples: int = 0
+        self.passive_drift_rate: float = 0.0
+        self.passive_drift_samples: int = 0
+        self.passive_drift_by_band: dict[str, dict[str, float]] = {}
+
+        # Stage 9: Dual-layer memory (current / long_term)
+        self.k_afterglow_memory = DualLayerMemory(scale=0.35)
+        self.tau_coast_memory = DualLayerMemory(scale=1.5)
+        self.response_delay_memory = DualLayerMemory(scale=5.0)
+        self.outdoor_band_memories: dict[str, DualLayerMemory] = {}
+        self.last_memory_source: str = "legacy"
+        self.last_memory_current_weight: float = 0.0
+
+        # Stage 10: Signed coast bias & early-stop shortfall defense
+        self.coast_bias: float = 0.0
+        self.coast_bias_samples: int = 0
+        self.shortfall_margin_scale: float = 1.0
+        self.consecutive_shortfalls: int = 0
 
         self.accepted_count: int = 0
         self.rejected_counts: dict[str, int] = {}
@@ -253,11 +533,19 @@ class DynamicCoastingLearner:
         self._active_minutes: float = 0.0
         self._coast_minutes: float = 0.0
         self._recent_values: deque[float] = deque(maxlen=5)
+        self._active_start_value: float | None = None
+        self._response_detected: bool = False
+        self._passive_start_value: float | None = None
+        self._passive_elapsed_min: float = 0.0
+        self._passive_outdoor_sum: float = 0.0
+        self._passive_outdoor_count: int = 0
         self._stop_value: float | None = None
         self._peak_coast_value: float | None = None
         self._stop_slope: float = 0.0
         self._stop_charge: float = 0.0
         self._predicted_coast_at_stop: float = 0.0
+        self._raw_predicted_coast_at_stop: float = 0.0
+        self._stopped_by_early_stop: bool = False
         self._stop_target: float | None = None
         self._stop_outdoor: float | None = None
         self._reversal_step: int = 0
@@ -291,6 +579,126 @@ class DynamicCoastingLearner:
         self._last_completed_cycle = None
         return res
 
+    def _reset_passive_drift_window(self, start_value: float | None = None) -> None:
+        self._passive_start_value = start_value
+        self._passive_elapsed_min = 0.0
+        self._passive_outdoor_sum = 0.0
+        self._passive_outdoor_count = 0
+        self._passive_sample_recorded = False
+
+    def _start_active_cycle(
+        self, value: float, dt: float, is_heating: bool, blocked_for_learning: bool
+    ) -> None:
+        self.phase = CyclePhase.ACTIVE
+        self._active_minutes = dt
+        self._cycle_direction_heating = is_heating
+        self._cycle_contaminated = blocked_for_learning
+        self._active_start_value = value
+        self._response_detected = False
+        self._reset_passive_drift_window(None)
+        self._recent_values.clear()
+        self._recent_values.append(value)
+
+    def _enter_passive_drift(
+        self, value: float, blocked_for_learning: bool, solar_rising_active: bool
+    ) -> None:
+        self.phase = CyclePhase.PASSIVE_DRIFT
+        if blocked_for_learning or solar_rising_active:
+            self._reset_passive_drift_window(None)
+        else:
+            self._reset_passive_drift_window(value)
+
+    def _record_passive_drift_sample(
+        self, value: float, outdoor_temp: float | None
+    ) -> bool:
+        """Evaluate accumulated PASSIVE_DRIFT window and update drift EWMA if valid."""
+        if self._passive_start_value is None or self._passive_elapsed_min < 15.0:
+            return False
+        drift_delta = (
+            (self._passive_start_value - value)
+            if self._cycle_direction_heating
+            else (value - self._passive_start_value)
+        )
+        if drift_delta + PEAK_CONFIRM_EPSILON < 0.15:
+            return False
+
+        rate = min(0.2, max(0.0, abs(drift_delta) / self._passive_elapsed_min))
+        if self.passive_drift_samples == 0:
+            self.passive_drift_rate = rate
+        else:
+            self.passive_drift_rate = (
+                (1.0 - self.ewma_alpha) * self.passive_drift_rate + self.ewma_alpha * rate
+            )
+        self.passive_drift_samples += 1
+
+        avg_out: float | None = None
+        if self._passive_outdoor_count > 0:
+            avg_out = self._passive_outdoor_sum / self._passive_outdoor_count
+        elif outdoor_temp is not None:
+            avg_out = float(outdoor_temp)
+
+        if avg_out is not None:
+            band_key = str(
+                math.floor(avg_out / OUTDOOR_BAND_WIDTH_C) * int(OUTDOOR_BAND_WIDTH_C)
+            )
+            entry = self.passive_drift_by_band.get(band_key)
+            if not isinstance(entry, dict) or int(entry.get("samples", 0)) == 0:
+                self.passive_drift_by_band[band_key] = {"rate": rate, "samples": 1}
+            else:
+                prev_rate = float(entry.get("rate", rate))
+                prev_n = int(entry.get("samples", 0))
+                new_rate = (1.0 - self.ewma_alpha) * prev_rate + self.ewma_alpha * rate
+                self.passive_drift_by_band[band_key] = {
+                    "rate": new_rate,
+                    "samples": prev_n + 1,
+                }
+
+        self._reset_passive_drift_window(value)
+        return True
+
+    def get_effective_dead_time(
+        self, default: float = 2.0, now_ts: float | None = None
+    ) -> float:
+        """Return learned response delay (dead time θ) in minutes using dual-layer memory or legacy."""
+        ts = time.time() if now_ts is None else float(now_ts)
+        est = self.response_delay_memory.estimate(ts)
+        if est is not None:
+            return max(0.5, min(60.0, float(est[0])))
+        if self.response_delay_samples >= 3 and self.response_delay_min is not None:
+            return max(0.5, min(60.0, float(self.response_delay_min)))
+        return float(default)
+
+    def predict_preheat_drop(
+        self, outdoor_temp: float | None = None, now_ts: float | None = None
+    ) -> float:
+        """Predict temperature drop during dead time using outdoor-band or overall passive drift."""
+        ts = time.time() if now_ts is None else float(now_ts)
+        has_delay = (
+            self.response_delay_samples >= 3
+            or self.response_delay_memory.estimate(ts) is not None
+        )
+        if not has_delay:
+            return 0.0
+        rate = 0.0
+        if outdoor_temp is not None:
+            band_key = str(
+                math.floor(float(outdoor_temp) / OUTDOOR_BAND_WIDTH_C)
+                * int(OUTDOOR_BAND_WIDTH_C)
+            )
+            band_entry = self.passive_drift_by_band.get(band_key)
+            if (
+                isinstance(band_entry, dict)
+                and int(band_entry.get("samples", 0)) >= OUTDOOR_BAND_MIN_SAMPLES
+            ):
+                rate = float(band_entry.get("rate", 0.0))
+        if rate <= 0.0 and self.passive_drift_samples >= 3:
+            rate = float(self.passive_drift_rate)
+        if rate <= 0.0:
+            return 0.0
+        return round(
+            min(1.5, max(0.0, rate * self.get_effective_dead_time(now_ts=ts))), 4
+        )
+
     def abort_cycle_to_idle(self) -> None:
         """Abort any in-progress cycle cleanly to IDLE while keeping learned history/factors."""
         self.phase = CyclePhase.IDLE
@@ -298,11 +706,16 @@ class DynamicCoastingLearner:
         self._active_minutes = 0.0
         self._coast_minutes = 0.0
         self._recent_values.clear()
+        self._active_start_value = None
+        self._response_detected = False
+        self._reset_passive_drift_window(None)
         self._stop_value = None
         self._peak_coast_value = None
         self._stop_slope = 0.0
         self._stop_charge = 0.0
         self._predicted_coast_at_stop = 0.0
+        self._raw_predicted_coast_at_stop = 0.0
+        self._stopped_by_early_stop = False
         self._stop_target = None
         self._stop_outdoor = None
         self._reversal_step = 0
@@ -333,8 +746,12 @@ class DynamicCoastingLearner:
         target_val: float | None = None,
         solar_rising_active: bool = False,
         outdoor_temp: float | None = None,
+        response_threshold: float | None = None,
+        now_ts: float | None = None,
+        early_stop_active: bool = False,
     ) -> CyclePhase:
         """Advance cycle state by dt_min (typically 1.0 min) and learn coasting upon completion."""
+        ts = time.time() if now_ts is None else float(now_ts)
         dt = max(0.01, float(dt_min))
         u = max(0.0, min(1.0, float(u_effort)))
 
@@ -349,25 +766,47 @@ class DynamicCoastingLearner:
         if self.phase == CyclePhase.IDLE:
             self._recent_values.append(value)
             if is_active:
-                self.phase = CyclePhase.ACTIVE
-                self._active_minutes = dt
-                self._cycle_direction_heating = is_heating
-                self._cycle_contaminated = blocked_for_learning
-                self._recent_values.clear()
-                self._recent_values.append(value)
+                self._start_active_cycle(value, dt, is_heating, blocked_for_learning)
 
         elif self.phase == CyclePhase.ACTIVE:
             self._recent_values.append(value)
             if is_active:
                 self._active_minutes += dt
+                if (
+                    not self._response_detected
+                    and not self._cycle_contaminated
+                    and self._active_start_value is not None
+                ):
+                    progress = (
+                        (value - self._active_start_value)
+                        if self._cycle_direction_heating
+                        else (self._active_start_value - value)
+                    )
+                    thresh = (
+                        self.response_threshold
+                        if response_threshold is None
+                        else max(0.01, float(response_threshold))
+                    )
+                    if progress + PEAK_CONFIRM_EPSILON >= thresh:
+                        obs_delay = max(0.5, min(120.0, self._active_minutes))
+                        if self.response_delay_samples == 0 or self.response_delay_min is None:
+                            self.response_delay_min = obs_delay
+                        else:
+                            self.response_delay_min = (
+                                (1.0 - self.ewma_alpha) * self.response_delay_min
+                                + self.ewma_alpha * obs_delay
+                            )
+                        self.response_delay_samples += 1
+                        self.response_delay_memory.learn(obs_delay, ts)
+                        self._response_detected = True
             else:
                 # Transition ACTIVE -> POST_STOP_COAST
                 if self._cycle_contaminated:
                     self._reject_cycle(self.last_quality_reason or "ventilation_contamination")
-                    self.phase = CyclePhase.PASSIVE_DRIFT
+                    self._enter_passive_drift(value, blocked_for_learning, solar_rising_active)
                 elif self._active_minutes < self.min_run_min:
                     self._reject_cycle("short_run")
-                    self.phase = CyclePhase.PASSIVE_DRIFT
+                    self._enter_passive_drift(value, blocked_for_learning, solar_rising_active)
                 else:
                     # Compute 4-5 min smoothed slope
                     if len(self._recent_values) >= 2:
@@ -382,9 +821,20 @@ class DynamicCoastingLearner:
                     self._peak_coast_value = value
                     self._stop_target = float(target_val) if target_val is not None else None
                     self._stop_outdoor = float(outdoor_temp) if outdoor_temp is not None else None
+                    self._stopped_by_early_stop = bool(early_stop_active)
+                    self._raw_predicted_coast_at_stop = self.predict_coast(
+                        abs_slope=slope,
+                        outdoor_temp=self._stop_outdoor,
+                        now_ts=ts,
+                        apply_bias=False,
+                        apply_shortfall_scale=False,
+                    )
                     self._predicted_coast_at_stop = self.predict_coast(
                         abs_slope=slope,
                         outdoor_temp=self._stop_outdoor,
+                        now_ts=ts,
+                        apply_bias=True,
+                        apply_shortfall_scale=False,
                     )
                     self._reversal_step = 0
                     self._reversal_anchor = None
@@ -394,16 +844,11 @@ class DynamicCoastingLearner:
         elif self.phase == CyclePhase.POST_STOP_COAST:
             if is_active:
                 # Re-started before coasting finished
-                self._finalize_coast(interrupted=True)
-                self.phase = CyclePhase.ACTIVE
-                self._active_minutes = dt
-                self._cycle_direction_heating = is_heating
-                self._cycle_contaminated = blocked_for_learning
-                self._recent_values.clear()
-                self._recent_values.append(value)
+                self._finalize_coast(interrupted=True, now_ts=ts)
+                self._start_active_cycle(value, dt, is_heating, blocked_for_learning)
             elif self._cycle_contaminated:
                 self._reject_cycle(self.last_quality_reason or "ventilation_contamination")
-                self.phase = CyclePhase.PASSIVE_DRIFT
+                self._enter_passive_drift(value, blocked_for_learning, solar_rising_active)
             else:
                 self._coast_minutes += dt
                 # Guard against solar daytime temperature surge corrupting heating afterglow peak.
@@ -423,7 +868,7 @@ class DynamicCoastingLearner:
                         solar_exceeded = (value - self._stop_value) > 0.5
                     if solar_exceeded:
                         self._reject_cycle("solar_gain_contamination")
-                        self.phase = CyclePhase.PASSIVE_DRIFT
+                        self._enter_passive_drift(value, blocked_for_learning, solar_rising_active)
                         return self.phase
 
                 if self._peak_coast_value is None:
@@ -464,24 +909,41 @@ class DynamicCoastingLearner:
                 if (peak_confirmed and self._coast_minutes >= 2.0) or (
                     self._coast_minutes >= self.max_coast_window_min
                 ):
-                    self._finalize_coast(interrupted=False)
-                    self.phase = CyclePhase.PASSIVE_DRIFT
+                    self._finalize_coast(interrupted=False, now_ts=ts)
+                    self._enter_passive_drift(value, blocked_for_learning, solar_rising_active)
 
         elif self.phase == CyclePhase.PASSIVE_DRIFT:
             self._recent_values.append(value)
             if is_active:
-                self.phase = CyclePhase.ACTIVE
-                self._active_minutes = dt
-                self._cycle_direction_heating = is_heating
-                self._cycle_contaminated = blocked_for_learning
-                self._recent_values.clear()
-                self._recent_values.append(value)
-            elif self.emitter_charge < 0.05:
-                self.phase = CyclePhase.IDLE
+                if not blocked_for_learning and not solar_rising_active:
+                    self._record_passive_drift_sample(value, outdoor_temp)
+                self._start_active_cycle(value, dt, is_heating, blocked_for_learning)
+            else:
+                recorded = False
+                if blocked_for_learning or solar_rising_active:
+                    self._reset_passive_drift_window(None)
+                else:
+                    if self._passive_start_value is None:
+                        self._reset_passive_drift_window(value)
+                    else:
+                        self._passive_elapsed_min += dt
+                        if outdoor_temp is not None:
+                            self._passive_outdoor_sum += float(outdoor_temp)
+                            self._passive_outdoor_count += 1
+                        recorded = self._record_passive_drift_sample(value, outdoor_temp)
+
+                if self.emitter_charge < 0.05 and (
+                    recorded
+                    or blocked_for_learning
+                    or solar_rising_active
+                    or self._passive_elapsed_min >= 30.0
+                ):
+                    self.phase = CyclePhase.IDLE
 
         return self.phase
 
-    def _finalize_coast(self, interrupted: bool = False) -> None:
+    def _finalize_coast(self, interrupted: bool = False, now_ts: float | None = None) -> None:
+        ts = time.time() if now_ts is None else float(now_ts)
         if self._stop_value is None or self._peak_coast_value is None:
             self._reject_cycle("invalid_duration")
             return
@@ -520,6 +982,7 @@ class DynamicCoastingLearner:
                 return
             sample_k = max(0.0, min(10.0, obs_coast / self._stop_charge))
             self.k_afterglow = (1.0 - self.ewma_alpha) * self.k_afterglow + self.ewma_alpha * sample_k
+            self.k_afterglow_memory.learn(sample_k, ts)
         else:
             if self._stop_slope < self.min_slope:
                 if (
@@ -534,21 +997,63 @@ class DynamicCoastingLearner:
                         (1.0 - self.ewma_alpha) * self.k_afterglow
                         + self.ewma_alpha * sample_k
                     )
+                    self.k_afterglow_memory.learn(sample_k, ts)
                 else:
                     self._reject_cycle("low_slope_or_charge")
                     return
             else:
                 sample_tau = max(0.0, min(30.0, obs_coast / self._stop_slope))
                 self.tau_coast = (1.0 - self.ewma_alpha) * self.tau_coast + self.ewma_alpha * sample_tau
+                self.tau_coast_memory.learn(sample_tau, ts)
+
+        if self._stop_outdoor is not None:
+            band_key = str(
+                math.floor(float(self._stop_outdoor) / OUTDOOR_BAND_WIDTH_C)
+                * int(OUTDOOR_BAND_WIDTH_C)
+            )
+            band_mem = self.outdoor_band_memories.get(band_key)
+            if band_mem is None:
+                band_mem = DualLayerMemory(scale=0.3, current_weight_limit=0.5)
+                self.outdoor_band_memories[band_key] = band_mem
+            band_mem.learn(obs_coast, ts)
 
         pred_coast = float(self._predicted_coast_at_stop)
+        raw_pred_coast = float(self._raw_predicted_coast_at_stop)
         coast_error = abs(obs_coast - pred_coast)
+        signed_err = obs_coast - raw_pred_coast
         overshoot = 0.0
+        shortfall = 0.0
         if self._stop_target is not None:
             if self._cycle_direction_heating:
                 overshoot = max(0.0, self._peak_coast_value - self._stop_target)
+                shortfall = max(0.0, self._stop_target - self._peak_coast_value)
             else:
                 overshoot = max(0.0, self._stop_target - self._peak_coast_value)
+                shortfall = max(0.0, self._peak_coast_value - self._stop_target)
+
+        if not interrupted:
+            # Update signed coast bias EWMA against raw (unbiased) model prediction
+            if self.coast_bias_samples == 0:
+                raw_bias = COAST_BIAS_ALPHA * signed_err
+            else:
+                raw_bias = (1.0 - COAST_BIAS_ALPHA) * self.coast_bias + COAST_BIAS_ALPHA * signed_err
+            self.coast_bias = max(-COAST_BIAS_CLAMP, min(COAST_BIAS_CLAMP, raw_bias))
+            self.coast_bias_samples += 1
+
+            # Shortfall defense for early-stop cycles
+            if self._stop_target is not None:
+                if self._stopped_by_early_stop and shortfall > SHORTFALL_TOLERANCE:
+                    self.consecutive_shortfalls += 1
+                    self.shortfall_margin_scale = round(
+                        max(SHORTFALL_MIN_SCALE, self.shortfall_margin_scale * SHORTFALL_DECAY_FACTOR),
+                        4,
+                    )
+                elif shortfall <= SHORTFALL_TOLERANCE:
+                    self.consecutive_shortfalls = 0
+                    self.shortfall_margin_scale = round(
+                        min(1.0, self.shortfall_margin_scale + SHORTFALL_RECOVERY_STEP),
+                        4,
+                    )
 
         self.accepted_count += 1
         self.last_quality_reason = "accepted"
@@ -570,7 +1075,10 @@ class DynamicCoastingLearner:
             "predicted_coast": round(pred_coast, 4),
             "observed_coast": round(obs_coast, 4),
             "coast_error": round(coast_error, 4),
+            "signed_coast_error": round(obs_coast - pred_coast, 4),
             "overshoot": round(overshoot, 4),
+            "shortfall": round(shortfall, 4),
+            "stopped_by_early_stop": self._stopped_by_early_stop,
             "coast_minutes": round(self._coast_minutes, 1),
             "peak_value": round(self._peak_coast_value, 4),
             "stop_value": round(self._stop_value, 4),
@@ -590,11 +1098,12 @@ class DynamicCoastingLearner:
         return round(min(n / 8.0, 1.0) / (1.0 + std / 0.5), 4)
 
     def get_outdoor_coast_correction(
-        self, outdoor_temp: float | None
+        self, outdoor_temp: float | None, now_ts: float | None = None
     ) -> tuple[float, str]:
         """Return (correction_delta, status) using 5°C outdoor temperature bands."""
         if outdoor_temp is None:
             return 0.0, "missing"
+        ts = time.time() if now_ts is None else float(now_ts)
         target_band = math.floor(float(outdoor_temp) / OUTDOOR_BAND_WIDTH_C) * int(OUTDOOR_BAND_WIDTH_C)
         all_vals: list[float] = []
         band_vals: list[float] = []
@@ -609,10 +1118,21 @@ class DynamicCoastingLearner:
                         band_vals.append(obs)
                 except (TypeError, ValueError):
                     continue
-        if len(band_vals) < OUTDOOR_BAND_MIN_SAMPLES or not all_vals:
+
+        overall_avg = (sum(all_vals) / len(all_vals)) if all_vals else None
+        band_mem = self.outdoor_band_memories.get(str(target_band))
+        if band_mem is not None and overall_avg is not None:
+            est = band_mem.estimate(ts)
+            if est is not None:
+                correction = max(
+                    -OUTDOOR_COAST_CORRECTION_CLAMP,
+                    min(OUTDOOR_COAST_CORRECTION_CLAMP, est[0] - overall_avg),
+                )
+                return round(correction, 4), "learned"
+
+        if len(band_vals) < OUTDOOR_BAND_MIN_SAMPLES or overall_avg is None:
             return 0.0, "untrained"
         band_avg = sum(band_vals) / len(band_vals)
-        overall_avg = sum(all_vals) / len(all_vals)
         correction = max(
             -OUTDOOR_COAST_CORRECTION_CLAMP,
             min(OUTDOOR_COAST_CORRECTION_CLAMP, band_avg - overall_avg),
@@ -623,10 +1143,24 @@ class DynamicCoastingLearner:
         self,
         abs_slope: float | None = None,
         outdoor_temp: float | None = None,
+        now_ts: float | None = None,
+        *,
+        apply_bias: bool = True,
+        apply_shortfall_scale: bool = False,
     ) -> float:
-        """Predict coasting excursion after stopping, with optional 5°C outdoor band correction."""
+        """Predict coasting excursion using dual-layer memory, outdoor band, signed bias & shortfall scale."""
+        ts = time.time() if now_ts is None else float(now_ts)
         if self.inertia_profile in (INERTIA_HIGH_INERTIA, INERTIA_CUSTOM):
-            base_pred = max(0.0, self.k_afterglow * self.emitter_charge)
+            est = self.k_afterglow_memory.estimate(ts)
+            if est is not None:
+                k_val = est[0]
+                self.last_memory_source = est[2]
+                self.last_memory_current_weight = est[3]
+            else:
+                k_val = self.k_afterglow
+                self.last_memory_source = "legacy"
+                self.last_memory_current_weight = 0.0
+            base_pred = max(0.0, k_val * self.emitter_charge)
         else:
             if abs_slope is None:
                 if len(self._recent_values) >= 2:
@@ -635,11 +1169,40 @@ class DynamicCoastingLearner:
                     )
                 else:
                     abs_slope = self._stop_slope
-            base_pred = max(0.0, self.tau_coast * max(0.0, float(abs_slope)))
+            est = self.tau_coast_memory.estimate(ts)
+            if est is not None:
+                tau_val = est[0]
+                self.last_memory_source = est[2]
+                self.last_memory_current_weight = est[3]
+            else:
+                tau_val = self.tau_coast
+                self.last_memory_source = "legacy"
+                self.last_memory_current_weight = 0.0
+            base_pred = max(0.0, tau_val * max(0.0, float(abs_slope)))
         if base_pred <= 0.0:
             return 0.0
-        correction, _ = self.get_outdoor_coast_correction(outdoor_temp)
-        return min(self.max_pred, max(0.0, base_pred + correction))
+        correction, _ = self.get_outdoor_coast_correction(outdoor_temp, now_ts=ts)
+        bias_adj = self.coast_bias if (apply_bias and self.coast_bias_samples >= 3) else 0.0
+        if bias_adj < 0.0:
+            bias_adj = max(-0.8 * base_pred, bias_adj)
+        pred = min(self.max_pred, max(0.0, base_pred + correction + bias_adj))
+        if apply_shortfall_scale:
+            pred *= self.shortfall_margin_scale
+        return pred
+
+    def get_memory_summary(self, now_ts: float | None = None) -> dict[str, Any]:
+        """Return diagnostics summary of all dual-layer memories."""
+        ts = time.time() if now_ts is None else float(now_ts)
+        return {
+            "k_afterglow": self.k_afterglow_memory.summary(ts),
+            "tau_coast": self.tau_coast_memory.summary(ts),
+            "response_delay": self.response_delay_memory.summary(ts),
+            "outdoor_bands": {
+                k: m.summary(ts) for k, m in self.outdoor_band_memories.items()
+            },
+            "last_memory_source": self.last_memory_source,
+            "last_memory_current_weight": round(self.last_memory_current_weight, 4),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -651,6 +1214,28 @@ class DynamicCoastingLearner:
             "tau_coast": self.tau_coast,
             "k_afterglow": self.k_afterglow,
             "emitter_charge": self.emitter_charge,
+            "response_delay_min": self.response_delay_min,
+            "response_delay_samples": self.response_delay_samples,
+            "passive_drift_rate": self.passive_drift_rate,
+            "passive_drift_samples": self.passive_drift_samples,
+            "passive_drift_by_band": {
+                str(k): {
+                    "rate": float(v.get("rate", 0.0)),
+                    "samples": int(v.get("samples", 0)),
+                }
+                for k, v in self.passive_drift_by_band.items()
+                if isinstance(v, dict)
+            },
+            "k_afterglow_memory": self.k_afterglow_memory.to_dict(),
+            "tau_coast_memory": self.tau_coast_memory.to_dict(),
+            "response_delay_memory": self.response_delay_memory.to_dict(),
+            "outdoor_band_memories": {
+                str(k): m.to_dict() for k, m in self.outdoor_band_memories.items()
+            },
+            "coast_bias": round(self.coast_bias, 6),
+            "coast_bias_samples": self.coast_bias_samples,
+            "shortfall_margin_scale": round(self.shortfall_margin_scale, 4),
+            "consecutive_shortfalls": self.consecutive_shortfalls,
             "accepted_count": self.accepted_count,
             "rejected_counts": dict(self.rejected_counts),
             "last_quality_reason": self.last_quality_reason,
@@ -676,6 +1261,67 @@ class DynamicCoastingLearner:
         obj.tau_coast = float(data.get("tau_coast", obj.tau_coast))
         obj.k_afterglow = float(data.get("k_afterglow", obj.k_afterglow))
         obj.emitter_charge = float(data.get("emitter_charge", 0.0))
+        raw_delay = data.get("response_delay_min")
+        obj.response_delay_min = float(raw_delay) if raw_delay is not None else None
+        obj.response_delay_samples = int(data.get("response_delay_samples", 0))
+        obj.passive_drift_rate = max(0.0, float(data.get("passive_drift_rate", 0.0)))
+        obj.passive_drift_samples = int(data.get("passive_drift_samples", 0))
+        raw_bands = data.get("passive_drift_by_band")
+        if isinstance(raw_bands, dict):
+            obj.passive_drift_by_band = {
+                str(k): {
+                    "rate": max(0.0, float(v.get("rate", 0.0))),
+                    "samples": int(v.get("samples", 0)),
+                }
+                for k, v in raw_bands.items()
+                if isinstance(v, dict)
+            }
+        if "k_afterglow_memory" in data and data["k_afterglow_memory"] is not None:
+            obj.k_afterglow_memory = DualLayerMemory.from_dict(
+                data["k_afterglow_memory"], scale=0.35
+            )
+        if "tau_coast_memory" in data and data["tau_coast_memory"] is not None:
+            obj.tau_coast_memory = DualLayerMemory.from_dict(
+                data["tau_coast_memory"], scale=1.5
+            )
+        if "response_delay_memory" in data and data["response_delay_memory"] is not None:
+            obj.response_delay_memory = DualLayerMemory.from_dict(
+                data["response_delay_memory"], scale=5.0
+            )
+        raw_out_mems = data.get("outdoor_band_memories")
+        if isinstance(raw_out_mems, dict):
+            for k, v in raw_out_mems.items():
+                obj.outdoor_band_memories[str(k)] = DualLayerMemory.from_dict(
+                    v, scale=0.3, current_weight_limit=0.5
+                )
+        elif raw_out_mems is not None:
+            _LOGGER.warning("Discarding corrupted outdoor_band_memories payload")
+        try:
+            raw_bias = float(data.get("coast_bias", 0.0))
+            obj.coast_bias = (
+                max(-COAST_BIAS_CLAMP, min(COAST_BIAS_CLAMP, raw_bias))
+                if math.isfinite(raw_bias)
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            obj.coast_bias = 0.0
+        try:
+            obj.coast_bias_samples = max(0, int(data.get("coast_bias_samples", 0)))
+        except (TypeError, ValueError):
+            obj.coast_bias_samples = 0
+        try:
+            raw_scale = float(data.get("shortfall_margin_scale", 1.0))
+            obj.shortfall_margin_scale = (
+                max(SHORTFALL_MIN_SCALE, min(1.0, raw_scale))
+                if math.isfinite(raw_scale)
+                else 1.0
+            )
+        except (TypeError, ValueError):
+            obj.shortfall_margin_scale = 1.0
+        try:
+            obj.consecutive_shortfalls = max(0, int(data.get("consecutive_shortfalls", 0)))
+        except (TypeError, ValueError):
+            obj.consecutive_shortfalls = 0
         obj.accepted_count = int(data.get("accepted_count", 0))
         obj.rejected_counts = {
             str(k): int(v) for k, v in (data.get("rejected_counts") or {}).items()
@@ -693,6 +1339,7 @@ class TuningParameters:
     ti_min: float = 0.0
     learned_rate: float = 0.0
     learned_loss: float = 0.0
+    dead_time_min: float = 2.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -702,6 +1349,7 @@ class TuningParameters:
             "ti_min": self.ti_min,
             "learned_rate": self.learned_rate,
             "learned_loss": self.learned_loss,
+            "dead_time_min": self.dead_time_min,
         }
 
     @classmethod
@@ -713,6 +1361,7 @@ class TuningParameters:
             ti_min=float(data.get("ti_min", 0.0)),
             learned_rate=float(data.get("learned_rate", 0.0)),
             learned_loss=float(data.get("learned_loss", 0.0)),
+            dead_time_min=float(data.get("dead_time_min", 2.0)),
         )
 
 
@@ -758,6 +1407,7 @@ class SimcAutoTuner:
             ti_min=round(ti_min, 2),
             learned_rate=round(rate, 5),
             learned_loss=round(loss, 5),
+            dead_time_min=round(theta, 2),
         )
 
 
@@ -821,6 +1471,7 @@ class TuningSafetyManager:
         self.last_predicted_coast: float | None = None
         self.last_observed_coast: float | None = None
         self.last_coast_error: float | None = None
+        self.last_signed_coast_error: float | None = None
 
     @property
     def mean_absolute_error(self) -> float | None:
@@ -831,15 +1482,17 @@ class TuningSafetyManager:
     def record_prediction_comparison(
         self, predicted_coast: float, observed_coast: float
     ) -> float:
-        """Accumulate real-world post-stop coast prediction error (MAE)."""
+        """Accumulate real-world post-stop coast prediction error (MAE) and signed error."""
         pred = float(predicted_coast)
         obs = float(observed_coast)
-        err = abs(obs - pred)
+        signed_err = obs - pred
+        err = abs(signed_err)
         self.accuracy_count += 1
         self.accuracy_abs_err_sum += err
         self.last_predicted_coast = round(pred, 4)
         self.last_observed_coast = round(obs, 4)
         self.last_coast_error = round(err, 4)
+        self.last_signed_coast_error = round(signed_err, 4)
         return self.last_coast_error
 
     def get_confidence_stage(
@@ -925,6 +1578,7 @@ class TuningSafetyManager:
             "last_predicted_coast": self.last_predicted_coast,
             "last_observed_coast": self.last_observed_coast,
             "last_coast_error": self.last_coast_error,
+            "last_signed_coast_error": self.last_signed_coast_error,
             "active_snapshot": (
                 self.active_snapshot.to_dict() if self.active_snapshot is not None else None
             ),
@@ -952,6 +1606,11 @@ class TuningSafetyManager:
         obj.last_coast_error = (
             float(data["last_coast_error"])
             if data.get("last_coast_error") is not None
+            else None
+        )
+        obj.last_signed_coast_error = (
+            float(data["last_signed_coast_error"])
+            if data.get("last_signed_coast_error") is not None
             else None
         )
         snap_raw = data.get("active_snapshot")

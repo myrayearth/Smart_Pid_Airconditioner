@@ -387,6 +387,10 @@ DEFAULT_SUNRISE_SAVING_ENABLED = False
 DEFAULT_SUNRISE_SAVING_START = "06:00:00"
 DEFAULT_SUNRISE_SAVING_END = "10:00:00"
 
+# Stage 8: Measured Dead Time & Predictive ON
+CONF_PREDICTIVE_ON_ENABLED = "predictive_on_enabled"
+DEFAULT_PREDICTIVE_ON_ENABLED = False
+
 
 def resolve_thermostat_type(entry: Any) -> str:
     """Resolve thermostat_type checking options (top & nested sections), then data, then default."""

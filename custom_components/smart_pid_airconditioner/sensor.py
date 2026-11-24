@@ -76,6 +76,7 @@ class SmartPIDConfidenceSensor(_BaseSmartPIDDiagnosticSensor):
             "last_predicted_coast": safety.last_predicted_coast,
             "last_observed_coast": safety.last_observed_coast,
             "last_coast_error": safety.last_coast_error,
+            "last_signed_coast_error": safety.last_signed_coast_error,
         }
 
 
@@ -103,6 +104,10 @@ class SmartPIDCyclePhaseSensor(_BaseSmartPIDDiagnosticSensor):
             "inertia_profile": c.inertia_profile,
             "tau_em_min": tau_em,
             "max_coast_window_min": coast_win,
+            "response_delay_min": (
+                round(c.response_delay_min, 2) if c.response_delay_min is not None else None
+            ),
+            "response_delay_samples": c.response_delay_samples,
         }
 
 
@@ -125,10 +130,16 @@ class SmartPIDPredictedCoastSensor(_BaseSmartPIDDiagnosticSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         corr, status = self._runtime.get_outdoor_coast_status()
+        coasting = self._runtime.snapshot.coasting
         return {
             "outdoor_coast_correction": corr,
             "outdoor_band_status": status,
-            "coast_confidence": self._runtime.snapshot.coasting.get_coast_confidence(),
+            "coast_confidence": coasting.get_coast_confidence(),
+            "coast_memory_source": coasting.last_memory_source,
+            "coast_current_weight": round(coasting.last_memory_current_weight, 4),
+            "coast_bias": round(coasting.coast_bias, 4),
+            "shortfall_margin_scale": round(coasting.shortfall_margin_scale, 4),
+            "consecutive_shortfalls": coasting.consecutive_shortfalls,
         }
 
 
@@ -153,6 +164,7 @@ class SmartPIDRecommendedTuningSensor(_BaseSmartPIDDiagnosticSensor):
             "recommended_ke": rec.ke,
             "learned_rate": rec.learned_rate,
             "learned_loss": rec.learned_loss,
+            "learned_dead_time_min": rec.dead_time_min,
             "fallback_reason": self._runtime.fallback_reason,
         }
 

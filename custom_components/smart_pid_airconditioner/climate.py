@@ -2001,6 +2001,25 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     and self._pid_error <= max(0.0, early_stop_pred)
                 )
 
+                preheat_margin = (
+                    self._runtime.get_predictive_on_margin()
+                    if (
+                        self._runtime is not None
+                        and not is_currently_running
+                        and not early_stop_triggered
+                        and not watchdog_resting
+                        and not self._vent_status.should_pause_control
+                        and not manual_override_active
+                        and not sunrise_saving_active
+                    )
+                    else 0.0
+                )
+                predictive_on_triggered = (
+                    preheat_margin > 0.0
+                    and self._pid_error is not None
+                    and (self._pid_error + preheat_margin) > 0.0
+                )
+
                 def _report_obs(is_act: bool, u_eff: float) -> None:
                     if self._runtime is not None:
                         self._runtime.update_observation(
@@ -2013,6 +2032,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                             vent_status=self._vent_status,
                             manual_override=manual_override_active,
                             device_unavailable=self._is_target_device_unavailable(),
+                            early_stop_active=early_stop_triggered,
                         )
 
                 # Branch for switch PWM mode (no climate sections / delta / fan)
@@ -2027,7 +2047,10 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                         and not watchdog_resting
                         and not early_stop_triggered
                     ):
-                        await self._async_start_pwm_cycle(force=force)
+                        await self._async_start_pwm_cycle(
+                            force=force,
+                            predictive_on_boost=predictive_on_triggered,
+                        )
                     else:
                         await self._async_stop_pwm()
                     _report_obs(self._pwm_state, self._pid_output / 100.0 if self._pwm_state else 0.0)
@@ -2799,7 +2822,9 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     await self._async_turn_off_specific_device(self._target_device_humidity_id)
         await self._async_turn_off_switch(force=True)
 
-    async def _async_start_pwm_cycle(self, force: bool = False) -> None:
+    async def _async_start_pwm_cycle(
+        self, force: bool = False, *, predictive_on_boost: bool = False
+    ) -> None:
         """Manage and start/update PWM cycle based on the current PID output."""
         if not self._is_active_hvac_mode:
             await self._async_stop_pwm()
@@ -2826,7 +2851,7 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             guard_min_off = float(self._min_off_time)
 
         if output <= 0.0 or calc_on_time < guard_min_on:
-            effective_on_time = 0.0
+            effective_on_time = guard_min_on if predictive_on_boost else 0.0
         elif output >= 100.0 or calc_off_time < guard_min_off:
             effective_on_time = pwm_duration
         else:

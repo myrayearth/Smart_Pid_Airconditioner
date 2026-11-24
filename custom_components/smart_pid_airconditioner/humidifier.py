@@ -1265,6 +1265,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                             vent_status=self._vent_status,
                             manual_override=manual_override_active,
                             device_unavailable=self._is_target_device_unavailable(),
+                            early_stop_active=early_stop_triggered,
                         )
 
                 if manual_override_active:

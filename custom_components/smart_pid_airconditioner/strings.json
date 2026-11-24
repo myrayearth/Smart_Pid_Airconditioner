@@ -1041,6 +1041,9 @@
           },
           "last_coast_error": {
             "name": "직전 코스팅 예측 오차"
+          },
+          "last_signed_coast_error": {
+            "name": "최근 부호 코스팅 오차"
           }
         }
       },
@@ -1066,6 +1069,12 @@
           },
           "max_coast_window_min": {
             "name": "코스팅 관찰 최대 창 (분)"
+          },
+          "response_delay_min": {
+            "name": "실측 반응 지연 (분)"
+          },
+          "response_delay_samples": {
+            "name": "반응 지연 표본 수"
           }
         }
       },
@@ -1085,11 +1094,37 @@
           },
           "coast_confidence": {
             "name": "코스팅 신뢰도"
+          },
+          "coast_memory_source": {
+            "name": "코스팅 메모리 계층",
+            "state": {
+              "blended": "단기·장기 혼합",
+              "current": "단기 메모리",
+              "long_term": "장기 메모리",
+              "legacy": "기본 폴백"
+            }
+          },
+          "coast_current_weight": {
+            "name": "단기 메모리 가중치"
+          },
+          "coast_bias": {
+            "name": "코스팅 예측 편향 보정"
+          },
+          "shortfall_margin_scale": {
+            "name": "조기 종료 미달 보정 배수"
+          },
+          "consecutive_shortfalls": {
+            "name": "연속 목표 미달 횟수"
           }
         }
       },
       "recommended_tuning": {
-        "name": "자동 추천 제어 파라미터"
+        "name": "자동 추천 제어 파라미터",
+        "state_attributes": {
+          "learned_dead_time_min": {
+            "name": "학습된 반응 지연 θ (분)"
+          }
+        }
       },
       "ventilation_state": {
         "name": "환기 상태",
@@ -1104,6 +1139,17 @@
     "switch": {
       "sunrise_saving": {
         "name": "일출 절약 모드"
+      },
+      "predictive_on": {
+        "name": "선행 가동 (Predictive ON)",
+        "state_attributes": {
+          "predicted_preheat_drop": {
+            "name": "예측 지연 구간 하강량"
+          },
+          "effective_dead_time_min": {
+            "name": "유효 반응 지연 θ (분)"
+          }
+        }
       }
     },
     "time": {

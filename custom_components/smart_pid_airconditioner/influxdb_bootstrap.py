@@ -1032,6 +1032,7 @@ async def async_bootstrap_from_influxdb(
                 target_val=None,
                 solar_rising_active=False,
                 outdoor_temp=None if is_humidity else out_now,
+                now_ts=cur_dt.timestamp(),
             )
             completed = coasting.consume_completed_cycle()
             if completed is not None:
@@ -1076,6 +1077,7 @@ async def async_bootstrap_from_influxdb(
     recommended = runtime.tuner.compute(
         rls,
         prediction_mode=runtime.prediction_mode,
+        dead_time_min=coasting.get_effective_dead_time(now_ts=end_dt.timestamp()),
         baseline=runtime.baseline,
     )
     stage, _ = safety.get_confidence_stage(
