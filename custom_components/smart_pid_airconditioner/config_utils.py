@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,24 +56,24 @@ def get_entry_setting(
 ) -> Any:
     """Resolve a setting from entry.options first, then entry.data, checking nested sections."""
     target_sec: str | None = None
-    for i in range(1, 5):
+    for i in range(0, 5):
         if key.startswith(f"sec{i}_"):
             target_sec = f"section_{i}"
             break
 
     for source in (getattr(entry, "options", None), getattr(entry, "data", None)):
-        if not isinstance(source, dict):
+        if not isinstance(source, Mapping):
             continue
         if target_sec and target_sec in source:
             sec_dict = source[target_sec]
-            if isinstance(sec_dict, dict) and key in sec_dict and sec_dict[key] is not None:
+            if isinstance(sec_dict, Mapping) and key in sec_dict and sec_dict[key] is not None:
                 return sec_dict[key]
         val = source.get(key)
         if val is not None:
             return val
         for sec in sections:
             sec_dict = source.get(sec)
-            if isinstance(sec_dict, dict):
+            if isinstance(sec_dict, Mapping):
                 sec_val = sec_dict.get(key)
                 if sec_val is not None:
                     return sec_val
@@ -271,9 +272,9 @@ class SmartPIDExtraStoredData(ExtraStoredData):
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> SmartPIDExtraStoredData | None:
-        """Initialize extra stored data from a dict."""
-        if not isinstance(data, dict):
+    def from_dict(cls, data: Mapping[str, Any] | None) -> SmartPIDExtraStoredData | None:
+        """Initialize extra stored data from a mapping."""
+        if not isinstance(data, Mapping):
             return None
         try:
             on_times = {

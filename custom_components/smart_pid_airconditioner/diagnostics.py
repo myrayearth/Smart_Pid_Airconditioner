@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -12,13 +13,13 @@ from .runtime import SmartPIDRuntime
 REDACT_KEYS = {"unique_id"}
 
 
-def _redact_mapping(data: dict[str, Any]) -> dict[str, Any]:
-    """Redact sensitive keys recursively from entry configuration dicts."""
+def _redact_mapping(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Redact sensitive keys recursively from entry configuration mappings."""
     redacted: dict[str, Any] = {}
     for key, value in data.items():
         if key in REDACT_KEYS:
             redacted[key] = "**REDACTED**"
-        elif isinstance(value, dict):
+        elif isinstance(value, Mapping):
             redacted[key] = _redact_mapping(value)
         else:
             redacted[key] = value

@@ -1,5 +1,6 @@
 """Constants for the Smart PID Thermostat integration."""
 
+from collections.abc import Mapping
 from typing import Any
 
 from homeassistant.components.climate import HVACMode
@@ -399,14 +400,14 @@ OVERHEAT_RESET_TEMP_C = 34.0
 def resolve_thermostat_type(entry: Any) -> str:
     """Resolve thermostat_type checking options (top & nested sections), then data, then default."""
     for source in (getattr(entry, "options", None), getattr(entry, "data", None)):
-        if not isinstance(source, dict):
+        if not isinstance(source, Mapping):
             continue
         val = source.get(CONF_THERMOSTAT_TYPE)
         if val is not None:
             return str(val)
         for sec in ("adaptive_learning", "ki_group", "ventilation", "section_0"):
             sec_dict = source.get(sec)
-            if isinstance(sec_dict, dict) and sec_dict.get(CONF_THERMOSTAT_TYPE) is not None:
+            if isinstance(sec_dict, Mapping) and sec_dict.get(CONF_THERMOSTAT_TYPE) is not None:
                 return str(sec_dict[CONF_THERMOSTAT_TYPE])
     return DEFAULT_THERMOSTAT_TYPE
 
@@ -439,10 +440,10 @@ def is_dual_controller(controller_type: str | None) -> bool:
 
 
 def duration_to_seconds(value: Any, default: int = 0) -> int:
-    """Convert DurationSelector output (dict, timedelta, or int/float) to integer seconds."""
+    """Convert DurationSelector output (mapping, timedelta, or int/float) to integer seconds."""
     if value is None:
         return default
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         days = int(value.get("days", 0) or 0)
         hours = int(value.get("hours", 0) or 0)
         minutes = int(value.get("minutes", 0) or 0)

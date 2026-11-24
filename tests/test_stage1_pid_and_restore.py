@@ -103,10 +103,14 @@ async def test_humidity_type_does_not_overwrite_temp_variables(hass) -> None:
     hass.states.async_set("sensor.room_hum", "65.0")
     hass.states.async_set("sensor.out_hum", "75.0")
 
-    entry = _make_climate_entry(thermostat_type=THERMOSTAT_TYPE_DEHUMIDIFIER)
-    entry.data[CONF_INDOOR_SENSOR] = "sensor.room_hum"
-    entry.data[CONF_OUTDOOR_SENSOR] = "sensor.out_hum"
-    entry.data[CONF_INITIAL_TARGET_TEMP] = 50.0
+    entry = _make_climate_entry(
+        thermostat_type=THERMOSTAT_TYPE_DEHUMIDIFIER,
+        extra_data={
+            CONF_INDOOR_SENSOR: "sensor.room_hum",
+            CONF_OUTDOOR_SENSOR: "sensor.out_hum",
+            CONF_INITIAL_TARGET_TEMP: 50.0,
+        },
+    )
 
     entity = SmartPIDThermostatEntity(hass, entry)
     entity.hass = hass

@@ -158,7 +158,9 @@ def _install_ha_stubs() -> None:
             )
             for entities, cb in list(self._listeners):
                 if entity_id in entities:
-                    cb(ev)
+                    res = cb(ev)
+                    if asyncio.iscoroutine(res):
+                        res.close()
 
         def async_entity_ids(self, domain: str | None = None) -> list[str]:
             if domain is None:
@@ -247,9 +249,9 @@ def _install_ha_stubs() -> None:
             self, entry: Any, *, data: dict | None = None, options: dict | None = None, version: int | None = None
         ) -> None:
             if data is not None:
-                entry.data = dict(data)
+                entry.data = types.MappingProxyType(dict(data))
             if options is not None:
-                entry.options = dict(options)
+                entry.options = types.MappingProxyType(dict(options))
             if version is not None:
                 entry.version = version
 
@@ -328,8 +330,8 @@ def _install_ha_stubs() -> None:
         ) -> None:
             self.entry_id = entry_id
             self.title = title
-            self.data = dict(data or {})
-            self.options = dict(options or {})
+            self.data = types.MappingProxyType(dict(data or {}))
+            self.options = types.MappingProxyType(dict(options or {}))
             self.version = version
             self.minor_version = minor_version
             self.domain = domain

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Callable
 
 import voluptuous as vol
@@ -257,9 +258,9 @@ def find_duplicate_target_device(
                 if isinstance(val, str) and val.strip() in cands:
                     return val.strip()
     owners = (
-        hass.data.get(DOMAIN, {}) if isinstance(getattr(hass, "data", None), dict) else {}
+        hass.data.get(DOMAIN, {}) if isinstance(getattr(hass, "data", None), Mapping) else {}
     ).get("owners", {})
-    if isinstance(owners, dict):
+    if isinstance(owners, Mapping):
         for dev_id in cands:
             owner_id = owners.get(dev_id)
             if owner_id and owner_id != exclude_entry_id:
@@ -377,8 +378,8 @@ class KiGridSelector(Selector):
         }
 
     def __call__(self, data: Any) -> dict[str, float]:
-        """Validate the submitted ki_group dictionary."""
-        if not isinstance(data, dict):
+        """Validate the submitted ki_group mapping."""
+        if not isinstance(data, Mapping):
             raise vol.Invalid("Expected a dictionary for ki_group")
         try:
             ki_raw = data.get(CONF_KI, self._ki_default)
@@ -393,17 +394,42 @@ class KiGridSelector(Selector):
         }
 
 
-def flatten_sections_input(data: dict[str, Any] | None) -> dict[str, Any]:
-    """Flatten nested section dictionary into top-level key-values."""
+def flatten_sections_input(data: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Flatten nested section mapping into top-level key-values."""
     if not data:
         return {}
     flat: dict[str, Any] = {}
     for key, value in data.items():
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             flat.update(value)
         else:
             flat[key] = value
     return flat
+
+
+def _opt_entity_key(key: str, val: Any) -> vol.Optional:
+    """Build vol.Optional key with suggested_value only when val is a non-empty string."""
+    if isinstance(val, str) and val.strip():
+        return vol.Optional(key, description={"suggested_value": val.strip()})
+    return vol.Optional(key)
+
+
+def _normalize_step_value(
+    raw_val: Any, step_options: list[str], fallback: str
+) -> str:
+    """Normalize stored temp/humidity step (e.g. float 0.5 -> '0.5') to match SelectSelector options."""
+    if raw_val is None or raw_val == "":
+        return fallback
+    s = str(raw_val).strip()
+    if s in step_options:
+        return s
+    try:
+        formatted = f"{float(s):.1f}"
+        if formatted in step_options:
+            return formatted
+    except (ValueError, TypeError):
+        pass
+    return fallback
 
 
 def default_hvac_modes_for_type(thermostat_type: str) -> list[str]:
@@ -443,10 +469,7 @@ def build_ventilation_section(get_val: Callable[[str, Any], Any]) -> dict[Any, A
                 mode=SelectSelectorMode.DROPDOWN,
             )
         ),
-        vol.Optional(
-            CONF_VENT_SWITCH,
-            description={"suggested_value": get_val(CONF_VENT_SWITCH, None)},
-        ): EntitySelector(
+        _opt_entity_key(CONF_VENT_SWITCH, get_val(CONF_VENT_SWITCH, None)): EntitySelector(
             EntitySelectorConfig(domain=["switch", "input_boolean"], multiple=False)
         ),
         vol.Optional(
@@ -522,23 +545,14 @@ def build_adaptive_learning_section(
     }
     if is_hum:
         al_schema[
-            vol.Optional(
-                CONF_AUX_TEMP_SENSOR,
-                description={"suggested_value": get_val(CONF_AUX_TEMP_SENSOR, None)},
-            )
+            _opt_entity_key(CONF_AUX_TEMP_SENSOR, get_val(CONF_AUX_TEMP_SENSOR, None))
         ] = EntitySelector(EntitySelectorConfig(domain="sensor", device_class="temperature"))
         al_schema[
-            vol.Optional(
-                CONF_COUPLED_AC,
-                description={"suggested_value": get_val(CONF_COUPLED_AC, None)},
-            )
+            _opt_entity_key(CONF_COUPLED_AC, get_val(CONF_COUPLED_AC, None))
         ] = EntitySelector(EntitySelectorConfig(domain="climate"))
     else:
         al_schema[
-            vol.Optional(
-                CONF_COUPLED_DEHUMIDIFIER,
-                description={"suggested_value": get_val(CONF_COUPLED_DEHUMIDIFIER, None)},
-            )
+            _opt_entity_key(CONF_COUPLED_DEHUMIDIFIER, get_val(CONF_COUPLED_DEHUMIDIFIER, None))
         ] = EntitySelector(EntitySelectorConfig(domain=["humidifier", "switch"]))
         al_schema[
             vol.Optional(
@@ -813,9 +827,11 @@ def build_device_sensor_schema(
             )
         )
 
-    def _req_entity(key: str, fallback: Any = None) -> Any:
+    def _req_entity(key: str, fallback: Any = None) -> vol.Required:
         if is_options:
-            return vol.Required(key, default=get_val(key, fallback))
+            val = get_val(key, fallback)
+            if isinstance(val, str) and val.strip():
+                return vol.Required(key, default=val.strip())
         return vol.Required(key)
 
     if is_dual_heat_cool_pwm:
@@ -838,10 +854,11 @@ def build_device_sensor_schema(
         else:
             domain_choice = ["switch", "input_boolean"]
         if is_options:
-            target_key = vol.Required(
-                CONF_TARGET_DEVICE,
-                default=get_val(CONF_TARGET_DEVICE, get_val(CONF_TARGET_CLIMATE, "")),
-            )
+            target_val = get_val(CONF_TARGET_DEVICE, get_val(CONF_TARGET_CLIMATE, ""))
+            if isinstance(target_val, str) and target_val.strip():
+                target_key = vol.Required(CONF_TARGET_DEVICE, default=target_val.strip())
+            else:
+                target_key = vol.Required(CONF_TARGET_DEVICE)
         else:
             target_key = vol.Required(CONF_TARGET_DEVICE)
         schema_dict[target_key] = EntitySelector(EntitySelectorConfig(domain=domain_choice))
@@ -862,15 +879,14 @@ def build_device_sensor_schema(
     )
 
     if is_options:
-        outdoor_val = get_val(CONF_OUTDOOR_SENSOR, "")
-        outdoor_field = (
-            vol.Optional(CONF_OUTDOOR_SENSOR, description={"suggested_value": outdoor_val})
-            if outdoor_val
-            else vol.Optional(CONF_OUTDOOR_SENSOR)
+        indoor_val = get_val(CONF_INDOOR_SENSOR, "")
+        indoor_field = (
+            vol.Required(CONF_INDOOR_SENSOR, default=indoor_val.strip())
+            if isinstance(indoor_val, str) and indoor_val.strip()
+            else vol.Required(CONF_INDOOR_SENSOR)
         )
-        schema_dict[vol.Required(CONF_INDOOR_SENSOR, default=get_val(CONF_INDOOR_SENSOR, ""))] = (
-            indoor_selector
-        )
+        outdoor_field = _opt_entity_key(CONF_OUTDOOR_SENSOR, get_val(CONF_OUTDOOR_SENSOR, ""))
+        schema_dict[indoor_field] = indoor_selector
         schema_dict[outdoor_field] = outdoor_selector
     else:
         schema_dict[vol.Required(CONF_INDOOR_SENSOR)] = indoor_selector
@@ -959,7 +975,14 @@ def build_device_sensor_schema(
                 )
             ),
             vol.Required(
-                CONF_TEMP_STEP, default=get_val(CONF_TEMP_STEP, step_default) if is_options else step_default
+                CONF_TEMP_STEP,
+                default=(
+                    _normalize_step_value(
+                        get_val(CONF_TEMP_STEP, step_default), step_options, step_default
+                    )
+                    if is_options
+                    else step_default
+                ),
             ): SelectSelector(
                 SelectSelectorConfig(options=step_options, mode=SelectSelectorMode.DROPDOWN)
             ),
@@ -1121,9 +1144,9 @@ def validate_and_prepare_climate_sections(
         flat_input[f"sec{i}_apply_delta"] = apply_temp_val
 
     nested_sections: dict[str, Any] = {}
-    if isinstance(user_input, dict):
+    if isinstance(user_input, Mapping):
         for sec in ("section_1", "section_2", "section_3", "section_4"):
-            if sec in user_input and isinstance(user_input[sec], dict):
+            if sec in user_input and isinstance(user_input[sec], Mapping):
                 sec_copy = dict(user_input[sec])
                 sec_idx = sec.split("_")[1]
                 sec_copy[f"sec{sec_idx}_apply_delta"] = sec_copy.get(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 import logging
 import math
@@ -707,7 +708,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             extra_data = raw_extra
         elif raw_extra is not None and hasattr(raw_extra, "as_dict"):
             extra_data = SmartPIDExtraStoredData.from_dict(raw_extra.as_dict())
-        elif isinstance(raw_extra, dict):
+        elif isinstance(raw_extra, Mapping):
             extra_data = SmartPIDExtraStoredData.from_dict(raw_extra)
 
         if extra_data is not None:
@@ -878,7 +879,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
     @callback
     def _async_state_reported(self, event: Event) -> None:
         """Refresh sensor timestamps and reset stale counter on state_reported heartbeats."""
-        data = event.data if isinstance(event.data, dict) else {}
+        data = event.data if isinstance(event.data, Mapping) else {}
         entity_id = data.get(ATTR_ENTITY_ID)
         if not entity_id or entity_id not in (self._indoor_sensor_id, self._outdoor_sensor_id):
             return
@@ -1642,10 +1643,10 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
     def _restore_reload_off(self) -> None:
         """Inherit minimum OFF deadline recorded prior to config entry reload."""
         domain_data = self.hass.data.get(DOMAIN)
-        if not isinstance(domain_data, dict):
+        if not isinstance(domain_data, Mapping):
             return
         reload_off = domain_data.get("reload_off")
-        if not isinstance(reload_off, dict):
+        if not isinstance(reload_off, Mapping):
             return
         now = dt_util.utcnow()
         for dev_id in self._pwm_device_ids():

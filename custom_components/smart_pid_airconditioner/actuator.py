@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import logging
 
 from homeassistant.const import (
@@ -98,7 +99,7 @@ class SwitchCommandGuard:
 
         @callback
         def _on_change(ev: Event) -> None:
-            new_st = ev.data.get("new_state") if isinstance(ev.data, dict) else None
+            new_st = ev.data.get("new_state") if isinstance(ev.data, Mapping) else None
             if new_st is not None and new_st.state == desired_state:
                 event.set()
 

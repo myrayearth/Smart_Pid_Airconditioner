@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, time as dt_time, timedelta
 import logging
 import time
@@ -416,7 +417,7 @@ class SmartPIDRuntime:
         st = self.hass.states.get("sun.sun")
         if st is None:
             return False
-        elevation = st.attributes.get("elevation") if isinstance(st.attributes, dict) else None
+        elevation = st.attributes.get("elevation") if isinstance(st.attributes, Mapping) else None
         if isinstance(elevation, (int, float)):
             return str(st.state) == "above_horizon" and float(elevation) > 0.0
         return str(st.state) == "above_horizon"
@@ -813,7 +814,7 @@ class SmartPIDRuntime:
         new_options = dict(self.entry.options)
         new_options[CONF_TUNING_MODE] = mode
         al_sec = new_options.get("adaptive_learning")
-        if isinstance(al_sec, dict):
+        if isinstance(al_sec, Mapping):
             new_options["adaptive_learning"] = {**al_sec, CONF_TUNING_MODE: mode}
         self.hass.config_entries.async_update_entry(self.entry, options=new_options)
         self._notify_subscribers()
@@ -829,7 +830,7 @@ class SmartPIDRuntime:
         new_options = dict(self.entry.options)
         new_options[CONF_PREDICTION_MODE] = mode
         al_sec = new_options.get("adaptive_learning")
-        if isinstance(al_sec, dict):
+        if isinstance(al_sec, Mapping):
             new_options["adaptive_learning"] = {**al_sec, CONF_PREDICTION_MODE: mode}
         self.hass.config_entries.async_update_entry(self.entry, options=new_options)
         self._notify_subscribers()
@@ -961,7 +962,7 @@ class SmartPIDRuntime:
         )
 
         raw_cooldown = self._get_setting(CONF_VENT_COOLDOWN_MIN, DEFAULT_VENT_COOLDOWN_MIN)
-        if isinstance(raw_cooldown, dict):
+        if isinstance(raw_cooldown, Mapping):
             vent_cooldown_min = max(
                 0, duration_to_seconds(raw_cooldown, DEFAULT_VENT_COOLDOWN_MIN * 60) // 60
             )
@@ -1049,7 +1050,7 @@ class SmartPIDRuntime:
             _LOGGER.debug("Recorder bootstrap skipped safely: %s", err)
             return
 
-        states = (history or {}).get(indoor_id, []) if isinstance(history, dict) else []
+        states = (history or {}).get(indoor_id, []) if isinstance(history, Mapping) else []
         if len(states) < 2:
             return
 

@@ -7,6 +7,17 @@
 
 ---
 
+## [0.6.2] - 2026-11-24
+
+### 수정 (Fixed)
+- **Home Assistant Core `ConfigEntry.data`/`options` `MappingProxyType` 미인식 치명적 버그 수정**:
+  - `config_utils.py`(`get_entry_setting`, `SmartPIDExtraStoredData`), `const.py`(`resolve_thermostat_type`, `duration_to_seconds`), `__init__.py`, `runtime.py`, `diagnostics.py`, `climate.py`, `humidifier.py`, `actuator.py`, `flow_schemas.py` 전반의 `isinstance(..., dict)` 검사를 `collections.abc.Mapping`으로 전환
+  - 실제 HA 환경에서 OptionsFlow 진입 시 기존 설정이 빈칸/기본값으로 보이던 문제 및 난방(`heater`) 엔트리의 `thermostat_type`이 `"cooler"`로 오인되어 `일출 절약 모드 / 시작 / 종료` 엔티티가 `unavailable`되던 문제 해결
+  - `flow_schemas.py`에서 빈 선택적 `EntitySelector` 필드의 `default`/`suggested_value` 생략 및 숫자형 `temp_step`(`0.5` → `"0.5"`) 문자열 정규화 보강
+  - `tests/conftest.py`의 Mock `ConfigEntry`를 `MappingProxyType`으로 현실화하고 `tests/test_mapping_proxy_options.py` 회귀 테스트 추가
+
+---
+
 ## [0.6.1] - 2026-11-24
 
 ### 수정 및 개선 (Fixed & Improved)

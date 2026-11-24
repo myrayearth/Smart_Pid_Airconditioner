@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 import logging
 from typing import Any
@@ -218,8 +219,10 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                         d[CONF_KI] = round(min(100.0, float(d[CONF_KI]) * 60.0), 4)
                     except (ValueError, TypeError):
                         pass
-                ki_group = d.get("ki_group")
-                if isinstance(ki_group, dict) and CONF_KI in ki_group and ki_group[CONF_KI] is not None:
+                raw_ki_group = d.get("ki_group")
+                if isinstance(raw_ki_group, Mapping) and CONF_KI in raw_ki_group and raw_ki_group[CONF_KI] is not None:
+                    ki_group = dict(raw_ki_group)
+                    d["ki_group"] = ki_group
                     try:
                         ki_group[CONF_KI] = round(min(100.0, float(ki_group[CONF_KI]) * 60.0), 4)
                     except (ValueError, TypeError):
@@ -281,7 +284,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     for dev_id in [k for k, v in owners.items() if v == entry.entry_id]:
         owners.pop(dev_id, None)
     reload_off = domain_data.get("reload_off")
-    if isinstance(reload_off, dict):
+    if isinstance(reload_off, Mapping):
         now = dt_util.utcnow()
         for dev_id in [
             k
