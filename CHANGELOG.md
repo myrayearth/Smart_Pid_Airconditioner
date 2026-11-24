@@ -7,6 +7,34 @@
 
 ---
 
+## [0.5.0] - 2026-11-24
+
+### 추가 (Added)
+- **고관성 보일러 코스팅 예측 정밀도 고도화 (`learner.py`, `runtime.py`, `sensor.py`, `diagnostics.py`, `influxdb_bootstrap.py`)**:
+  - 2단계 코스팅 정점 확정 비교에 부동소수점 허용 오차(`PEAK_CONFIRM_EPSILON = 1e-5`) 적용
+  - 정지 시점 기울기 `<= 0.002°C/min`인 지연 난방 사이클도 `emitter_charge` 기반 실측 잔열 상승폭(`k_afterglow`)으로 안정 학습
+  - 코스팅 신뢰도(`coast_confidence = min(n / 8.0, 1.0) / (1.0 + std / 0.5)`) 도입: `< 0.25`일 때 조기 종료를 자동 기권하고 `fallback_reason = "high_coast_variance"` 노출
+  - **외기 5°C 밴드 코스팅 보정**: 코스팅 완료 이력에 `outdoor_at_stop` 기록, 5°C 밴드 내 표본 3건 이상 시 `(밴드 평균 - 전체 평균)`을 `[-0.3, +0.3]°C` 클램핑 가산; 진단 센서(`predicted_coast`) 속성 및 `Diagnostics`에 `outdoor_coast_correction`과 `outdoor_band_status`(`learned`/`untrained`/`missing`) 노출
+- **가동시간 비례 동적 최소 정지시간 (`const.py`, `config_flow.py`, `climate.py`, `humidifier.py`)**:
+  - PWM 설정에 `dynamic_min_off_multiplier` (`0.0 ~ 3.0`, step `0.5`, 기본 `0.0`) 추가 및 `max(min_off_time, last_run_duration_sec * multiplier)` 적용
+  - `SmartPIDExtraStoredData`에 `last_run_duration_sec` 추가(하위 호환 기본값 `0.0`)로 HA 재시작 후에도 동적 최소 OFF 보호 유지
+- **일출 절약 모드 (`switch.py`, `time.py`, `runtime.py`, `climate.py`, `const.py`)**:
+  - 난방(`heater`, `heat_cool`) 컨트롤러 전용 `EntityCategory.CONFIG` 스위치(`일출 절약 모드`, 기본 OFF) 및 시작/종료 시각(`time`) 엔티티 추가
+  - 활성화 시 자정 넘김을 지원하는 예약 시간대 또는 `sun.sun == above_horizon` 조건에서 난방 상한 여유를 제거해 목표온도 자체를 상한으로 제어
+- **HACS · Hassfest 자동 검증 워크플로우 (`.github/workflows/validate.yml`)** 및 회귀 테스트(`tests/test_stage1_safety_and_ci.py`, `tests/test_stage7_boiler_accuracy.py`) 추가
+
+### 수정 및 보안·안전성 강화 (Fixed & Hardened)
+- **`SwitchCommandGuard` 비대칭 OFF 선점 보호 (`actuator.py`)**: 진행 중인 `OFF` 확인/재시도가 완료되기 전에는 새 `async_turn_on()` 요청을 즉시 거부(`False`)해 OFF 취소 방지
+- **학습 리셋 버튼 가동 중 보호 (`runtime.py`, `button.py`)**: 기기 가동 중 또는 명령 대기 중에는 `can_reset_learning = False`로 버튼 비활성화 및 강제 호출 시 `ServiceValidationError` 발생
+- **센서 장애 복구 2회 확인 및 기기 중복 소유 차단 (`climate.py`, `humidifier.py`, `config_flow.py`, `__init__.py`)**:
+  - 실내 센서가 `unavailable`/`unknown` 장애에서 복구될 때 최소 `30초` 간격을 둔 유효 보고 2회 연속 수신 후 정상 복귀
+  - 동일 제어 기기의 다중 엔트리 중복 등록을 ConfigFlow/OptionsFlow(`duplicate_target_device`) 및 런타임(`ConfigEntryError`)에서 차단
+- **HA 공식 규격 및 하위 호환성 보강 (`manifest.json`, `__init__.py`, `climate.py`)**:
+  - `manifest.json`에 `"after_dependencies": ["recorder"]` 선언, `__init__.py`에 `CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)` 및 `async_remove_entry` (`ModelStore.async_remove()`) 추가, 구버전 HA Core용 `ClimateEntity` 조건부 폴백 적용
+- **`solar_guard` 정교화 (`learner.py`)**: 학습된 예상 정점이 존재할 때는 `expected_peak + 0.5°C` 초과 급등만 `solar_gain_contamination`으로 기각
+
+---
+
 ## [0.4.2] - 2026-11-24
 
 ### 추가 (Added)
