@@ -167,31 +167,31 @@ bootstrap_from_influxdb:
         text:
     device_active_values:
       name: Device Active (ON) Values
-      description: Optional list of InfluxDB values treated as active/ON (e.g. [1, "on"]). Uses smart fallback if omitted.
+      description: 'Optional list of InfluxDB values treated as active/ON (e.g. [1, "on"]). Uses smart fallback if omitted.'
       required: false
       selector:
         object:
     device_inactive_values:
       name: Device Inactive (OFF) Values
-      description: Optional list of InfluxDB values treated as inactive/OFF (e.g. [0, "off"]). Uses smart fallback if omitted.
+      description: 'Optional list of InfluxDB values treated as inactive/OFF (e.g. [0, "off"]). Uses smart fallback if omitted.'
       required: false
       selector:
         object:
     ventilation_open_values:
       name: Ventilation Open Values
-      description: Optional common list of InfluxDB values treated as open/ventilating for all ventilation sensors (e.g. [1, "on", "open"]).
+      description: 'Optional common list of InfluxDB values treated as open/ventilating for all ventilation sensors (e.g. [1, "on", "open"]).'
       required: false
       selector:
         object:
     ventilation_closed_values:
       name: Ventilation Closed Values
-      description: Optional common list of InfluxDB values treated as closed/normal for all ventilation sensors (e.g. [0, "off", "closed"]).
+      description: 'Optional common list of InfluxDB values treated as closed/normal for all ventilation sensors (e.g. [0, "off", "closed"]).'
       required: false
       selector:
         object:
     ventilation_sensor_map:
       name: Per-Sensor Ventilation Mapping
-      description: Optional per-entity override dict for inverted or custom sensors (e.g. {"binary_sensor.inverted_door": {"open": [0, "off"], "closed": [1, "on"]}}).
+      description: 'Optional per-entity override dict for inverted or custom sensors (e.g. {"binary_sensor.inverted_door": {"open": [0, "off"], "closed": [1, "on"]}}).'
       required: false
       selector:
         object:

@@ -7,6 +7,15 @@
 
 ---
 
+## [0.5.1] - 2026-11-24
+
+### 수정 (Fixed)
+- **`services.yaml` YAML 파싱 오류 수정 (`services.yaml`, `tests/test_services_yaml.py`)**:
+  - `device_active_values`, `device_inactive_values`, `ventilation_open_values`, `ventilation_closed_values`, `ventilation_sensor_map`의 `description` 값에 포함된 특수문자(`:`, `{}`, `[]`, `"`)를 작은따옴표(`'...'`)로 감싸 Home Assistant 액션 UI 입력 필드가 정상 로드되도록 수정
+  - `yaml.safe_load` 기반 `services.yaml` 구문 및 필수 필드(`reset_learning`, `bootstrap_from_influxdb`) 회귀 테스트 추가
+
+---
+
 ## [0.5.0] - 2026-11-24
 
 ### 추가 (Added)
