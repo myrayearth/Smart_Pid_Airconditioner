@@ -10,11 +10,17 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
+from homeassistant.exceptions import ConfigEntryError, HomeAssistantError
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 
 from .const import (
     CONF_KI,
+    CONF_TARGET_CLIMATE,
+    CONF_TARGET_DEVICE,
+    CONF_TARGET_DEVICE_COOL,
+    CONF_TARGET_DEVICE_DEHUMIDITY,
+    CONF_TARGET_DEVICE_HEAT,
+    CONF_TARGET_DEVICE_HUMIDITY,
     CONF_THERMOSTAT_TYPE,
     DEFAULT_THERMOSTAT_TYPE,
     DOMAIN,
@@ -25,8 +31,34 @@ from .const import (
 )
 from .influxdb_bootstrap import async_bootstrap_from_influxdb
 from .runtime import SmartPIDRuntime
+from .storage import ModelStore
 
 _LOGGER = logging.getLogger(__name__)
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+_TARGET_DEVICE_KEYS = (
+    CONF_TARGET_DEVICE,
+    CONF_TARGET_CLIMATE,
+    CONF_TARGET_DEVICE_COOL,
+    CONF_TARGET_DEVICE_HEAT,
+    CONF_TARGET_DEVICE_DEHUMIDITY,
+    CONF_TARGET_DEVICE_HUMIDITY,
+)
+
+
+def extract_target_devices(data: dict[str, Any], options: dict[str, Any] | None = None) -> set[str]:
+    """Return set of all configured target device entity IDs from options/data."""
+    devices: set[str] = set()
+    opts = options or {}
+    for key in _TARGET_DEVICE_KEYS:
+        val = opts.get(key)
+        if not val:
+            val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            devices.add(val.strip())
+    return devices
+
 
 _OPT_FLOAT = vol.Any(None, "", vol.Coerce(float))
 _OPT_INT = vol.Any(None, "", vol.All(vol.Coerce(float), vol.Coerce(int)))
@@ -65,11 +97,21 @@ _BOOTSTRAP_SERVICE_SCHEMA = vol.Schema(
 )
 
 
+def _iter_runtimes(hass: HomeAssistant) -> dict[str, SmartPIDRuntime]:
+    """Return mapping of entry_id -> SmartPIDRuntime, excluding metadata keys like 'owners'."""
+    domain_data = hass.data.get(DOMAIN, {})
+    return {
+        k: v
+        for k, v in domain_data.items()
+        if isinstance(v, SmartPIDRuntime)
+    }
+
+
 def _resolve_runtime_for_entity(
     hass: HomeAssistant, entity_id: str
 ) -> SmartPIDRuntime | None:
     """Find the SmartPIDRuntime managing a given climate or humidifier entity ID."""
-    runtimes: dict[str, SmartPIDRuntime] = hass.data.get(DOMAIN, {})
+    runtimes = _iter_runtimes(hass)
     if not runtimes or not entity_id:
         return None
 
@@ -97,11 +139,12 @@ def _resolve_runtime_for_entity(
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the Smart PID Thermostat component."""
     hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN].setdefault("owners", {})
 
     async def _async_handle_reset_learning(call: ServiceCall) -> None:
         target_entry_id = call.data.get("entry_id")
         target_entity_id = call.data.get("entity_id")
-        runtimes: dict[str, SmartPIDRuntime] = hass.data.get(DOMAIN, {})
+        runtimes = _iter_runtimes(hass)
 
         if target_entry_id and target_entry_id in runtimes:
             await runtimes[target_entry_id].async_reset_learning()
@@ -194,14 +237,31 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Smart PID Thermostat from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+    owners: dict[str, str] = hass.data[DOMAIN].setdefault("owners", {})
     await async_setup(hass, {})
 
-    runtime = SmartPIDRuntime(hass, entry)
-    await runtime.async_setup()
-    entry.runtime_data = runtime
-    hass.data[DOMAIN][entry.entry_id] = runtime
+    target_devices = extract_target_devices(dict(entry.data), dict(entry.options))
+    for dev_id in target_devices:
+        existing_owner = owners.get(dev_id)
+        if existing_owner is not None and existing_owner != entry.entry_id:
+            raise ConfigEntryError(
+                f"Target device '{dev_id}' is already controlled by another Smart PID entry ({existing_owner})."
+            )
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    for dev_id in target_devices:
+        owners[dev_id] = entry.entry_id
+
+    runtime = SmartPIDRuntime(hass, entry)
+    try:
+        await runtime.async_setup()
+        entry.runtime_data = runtime
+        hass.data[DOMAIN][entry.entry_id] = runtime
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        for dev_id in target_devices:
+            if owners.get(dev_id) == entry.entry_id:
+                owners.pop(dev_id, None)
+        raise
     return True
 
 
@@ -211,5 +271,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     runtime: SmartPIDRuntime | None = getattr(entry, "runtime_data", None)
     if runtime is not None:
         await runtime.async_unload()
-    hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    domain_data = hass.data.get(DOMAIN, {})
+    domain_data.pop(entry.entry_id, None)
+    owners: dict[str, str] = domain_data.get("owners", {})
+    for dev_id in [k for k, v in owners.items() if v == entry.entry_id]:
+        owners.pop(dev_id, None)
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Clean up persisted learning storage when a config entry is deleted."""
+    await ModelStore(hass, entry.entry_id).async_remove()

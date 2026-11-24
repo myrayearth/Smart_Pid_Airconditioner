@@ -326,6 +326,8 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._pwm_duty_cycle: float = 0.0
         self._pwm_on_time: float = 0.0
         self._sensor_stale_count: int = 0
+        self._sensor_fault_active: bool = False
+        self._sensor_recovery_first_at: datetime | None = None
 
         # Event tracking unsubscribers
         self._unsub_sensor_track: CALLBACK_TYPE | None = None
@@ -959,14 +961,33 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             if st and st.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                 val = self._parse_humidity(st.state, self._indoor_sensor_id)
                 if val is not None:
-                    self._indoor_humidity = val
-                    self._last_indoor_update = now
-                    self._sensor_stale_count = 0
+                    if self._sensor_fault_active:
+                        if self._sensor_recovery_first_at is None:
+                            self._sensor_recovery_first_at = now
+                        elif (now - self._sensor_recovery_first_at).total_seconds() >= 30.0:
+                            self._sensor_fault_active = False
+                            self._sensor_recovery_first_at = None
+                            self._indoor_humidity = val
+                            self._last_indoor_update = now
+                            self._sensor_stale_count = 0
+                    else:
+                        self._indoor_humidity = val
+                        self._last_indoor_update = now
+                        self._sensor_stale_count = 0
                 else:
+                    self._sensor_fault_active = True
+                    self._sensor_recovery_first_at = None
+                    self._indoor_humidity = None
                     self._sensor_stale_count += 1
             else:
+                self._sensor_fault_active = True
+                self._sensor_recovery_first_at = None
+                self._indoor_humidity = None
                 self._sensor_stale_count += 1
         else:
+            self._sensor_fault_active = True
+            self._sensor_recovery_first_at = None
+            self._indoor_humidity = None
             self._sensor_stale_count += 1
 
         if self._outdoor_sensor_id:

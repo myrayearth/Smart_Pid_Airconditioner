@@ -58,7 +58,12 @@ async def test_shadow_learn_matches_manual_pid_100_percent(hass) -> None:
     hass.states.async_set("sensor.room_temp", "26.0")
     hass.states.async_set("sensor.out_temp", "31.0")
     hass.states.async_set(
-        "climate.ac_slave",
+        "climate.ac_slave_manual",
+        "cool",
+        {"hvac_modes": ["off", "cool"], "fan_modes": ["low", "medium", "high"], "min_temp": 18, "max_temp": 30},
+    )
+    hass.states.async_set(
+        "climate.ac_slave_shadow",
         "cool",
         {"hvac_modes": ["off", "cool"], "fan_modes": ["low", "medium", "high"], "min_temp": 18, "max_temp": 30},
     )
@@ -68,7 +73,6 @@ async def test_shadow_learn_matches_manual_pid_100_percent(hass) -> None:
         CONF_THERMOSTAT_TYPE: THERMOSTAT_TYPE_COOLER,
         CONF_INDOOR_SENSOR: "sensor.room_temp",
         CONF_OUTDOOR_SENSOR: "sensor.out_temp",
-        CONF_TARGET_CLIMATE: "climate.ac_slave",
         CONF_INITIAL_TARGET_TEMP: 24.0,
         CONF_KP: 20.0,
         CONF_KI: 0.6,
@@ -81,13 +85,13 @@ async def test_shadow_learn_matches_manual_pid_100_percent(hass) -> None:
     manual_entry = ConfigEntry(
         entry_id="manual_e",
         title="Manual",
-        data={**base_data, CONF_TUNING_MODE: TUNING_MODE_MANUAL},
+        data={**base_data, CONF_TARGET_CLIMATE: "climate.ac_slave_manual", CONF_TUNING_MODE: TUNING_MODE_MANUAL},
         version=2,
     )
     shadow_entry = ConfigEntry(
         entry_id="shadow_e",
         title="Shadow",
-        data={**base_data, CONF_TUNING_MODE: TUNING_MODE_SHADOW},
+        data={**base_data, CONF_TARGET_CLIMATE: "climate.ac_slave_shadow", CONF_TUNING_MODE: TUNING_MODE_SHADOW},
         version=2,
     )
 

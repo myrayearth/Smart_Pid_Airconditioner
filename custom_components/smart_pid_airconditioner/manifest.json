@@ -1,6 +1,7 @@
 {
   "domain": "smart_pid_airconditioner",
   "name": "Smart PID Air Conditioner",
+  "after_dependencies": ["recorder"],
   "codeowners": ["@myrayearth"],
   "config_flow": true,
   "documentation": "https://github.com/myrayearth/Smart_Pid_Airconditioner",

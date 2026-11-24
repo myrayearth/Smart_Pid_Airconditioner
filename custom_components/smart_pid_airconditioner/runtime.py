@@ -177,6 +177,19 @@ class SmartPIDRuntime:
 
         self.fallback_reason: str | None = None
         self._applied_auto_params: TuningParameters | None = None
+        self._pending_command: bool = False
+
+    @property
+    def can_reset_learning(self) -> bool:
+        """Return True only when the target device is idle and no command is pending."""
+        return not self._obs_is_active and not self._pending_command
+
+    def set_pending_command(self, pending: bool) -> None:
+        """Track whether a control command is currently pending dispatch/confirmation."""
+        pending_bool = bool(pending)
+        if self._pending_command != pending_bool:
+            self._pending_command = pending_bool
+            self._notify_subscribers()
 
     def _get_setting(self, key: str, default: Any = None) -> Any:
         if key in self.entry.options and self.entry.options[key] is not None:

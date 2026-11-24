@@ -15,7 +15,8 @@
       "target_device_dehumidity_required": "PWM 가습/제습기 모드에서는 제습 제어 대상 기기(스위치)를 지정해야 합니다.",
       "target_device_humidity_required": "PWM 가습/제습기 모드에서는 가습 제어 대상 기기(스위치)를 지정해야 합니다.",
       "target_device_required": "제어 대상 기기를 선택해야 합니다.",
-      "min_times_exceed_pwm_duration": "최소 가동 시간과 최소 정지 시간의 합은 PWM 제어 주기보다 작아야 합니다."
+      "min_times_exceed_pwm_duration": "최소 가동 시간과 최소 정지 시간의 합은 PWM 제어 주기보다 작아야 합니다.",
+      "duplicate_target_device": "The selected target device is already controlled by another Smart PID entry."
     },
     "step": {
       "user": {
@@ -402,7 +403,8 @@
       "target_device_dehumidity_required": "PWM 가습/제습기 모드에서는 제습 제어 대상 기기(스위치)를 지정해야 합니다.",
       "target_device_humidity_required": "PWM 가습/제습기 모드에서는 가습 제어 대상 기기(스위치)를 지정해야 합니다.",
       "target_device_required": "제어 대상 기기를 선택해야 합니다.",
-      "min_times_exceed_pwm_duration": "최소 가동 시간과 최소 정지 시간의 합은 PWM 제어 주기보다 작아야 합니다."
+      "min_times_exceed_pwm_duration": "최소 가동 시간과 최소 정지 시간의 합은 PWM 제어 주기보다 작아야 합니다.",
+      "duplicate_target_device": "The selected target device is already controlled by another Smart PID entry."
     },
     "step": {
       "init": {

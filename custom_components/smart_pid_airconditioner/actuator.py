@@ -37,6 +37,7 @@ class SwitchCommandGuard:
         self.confirm_timeout = float(confirm_timeout)
         self.off_retry_delays = tuple(float(d) for d in off_retry_delays)
         self._generations: dict[str, int] = {}
+        self._pending_off: set[str] = set()
         self.last_error: dict[str, str] = {}
 
     def _next_generation(self, entity_id: str) -> int:
@@ -120,8 +121,14 @@ class SwitchCommandGuard:
         *,
         confirm: bool = False,
     ) -> bool:
-        """Send turn_on with safety OFF recovery if execution/confirmation fails."""
+        """Send turn_on with safety OFF recovery; blocked while OFF confirmation is pending."""
         if not entity_id:
+            return False
+        if entity_id in self._pending_off:
+            _LOGGER.warning(
+                "Blocked turn_on for %s because an OFF command is still pending confirmation",
+                entity_id,
+            )
             return False
         gen = self._next_generation(entity_id)
         sent = await self._call_switch_service(entity_id, SERVICE_TURN_ON)
@@ -162,34 +169,38 @@ class SwitchCommandGuard:
         if not entity_id:
             return False
         gen = self._next_generation(entity_id)
+        self._pending_off.add(entity_id)
         delays = (0.0, *self.off_retry_delays)
+        try:
+            for delay in delays:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if self._generations.get(entity_id) != gen:
+                    return False
 
-        for delay in delays:
-            if delay > 0:
-                await asyncio.sleep(delay)
-            if self._generations.get(entity_id) != gen:
-                return False
+                sent = await self._call_switch_service(entity_id, SERVICE_TURN_OFF)
+                if self._generations.get(entity_id) != gen:
+                    return False
+                if not sent:
+                    continue
 
-            sent = await self._call_switch_service(entity_id, SERVICE_TURN_OFF)
-            if self._generations.get(entity_id) != gen:
-                return False
-            if not sent:
-                continue
+                st = self.hass.states.get(entity_id)
+                if not confirm or self.confirm_timeout <= 0 or st is None or st.state == STATE_OFF:
+                    self.last_error.pop(entity_id, None)
+                    return True
 
-            st = self.hass.states.get(entity_id)
-            if not confirm or self.confirm_timeout <= 0 or st is None or st.state == STATE_OFF:
-                self.last_error.pop(entity_id, None)
-                return True
+                confirmed = await self._wait_for_state(
+                    entity_id, STATE_OFF, gen, self.confirm_timeout
+                )
+                if self._generations.get(entity_id) != gen:
+                    return False
+                if confirmed:
+                    self.last_error.pop(entity_id, None)
+                    return True
 
-            confirmed = await self._wait_for_state(
-                entity_id, STATE_OFF, gen, self.confirm_timeout
-            )
-            if self._generations.get(entity_id) != gen:
-                return False
-            if confirmed:
-                self.last_error.pop(entity_id, None)
-                return True
-
-        self.last_error[entity_id] = "off_unconfirmed"
-        _LOGGER.error("Switch %s could not confirm OFF after bounded retries", entity_id)
-        return False
+            self.last_error[entity_id] = "off_unconfirmed"
+            _LOGGER.error("Switch %s could not confirm OFF after bounded retries", entity_id)
+            return False
+        finally:
+            if self._generations.get(entity_id) == gen:
+                self._pending_off.discard(entity_id)

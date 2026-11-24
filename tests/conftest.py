@@ -68,6 +68,8 @@ def _install_ha_stubs() -> None:
         SENSOR = "sensor"
         BUTTON = "button"
         SELECT = "select"
+        SWITCH = "switch"
+        TIME = "time"
 
     class EntityCategory(str, Enum):
         CONFIG = "config"
@@ -235,6 +237,12 @@ def _install_ha_stubs() -> None:
         def async_get_entry(self, entry_id: str) -> Any:
             return self.entries.get(entry_id)
 
+        def async_entries(self, domain: str | None = None) -> list[Any]:
+            vals = list(self.entries.values())
+            if domain is None:
+                return vals
+            return [e for e in vals if getattr(e, "domain", None) == domain]
+
         def async_update_entry(
             self, entry: Any, *, data: dict | None = None, options: dict | None = None, version: int | None = None
         ) -> None:
@@ -297,8 +305,12 @@ def _install_ha_stubs() -> None:
     class ServiceValidationError(HomeAssistantError):
         pass
 
+    class ConfigEntryError(HomeAssistantError):
+        pass
+
     exc_mod.HomeAssistantError = HomeAssistantError
     exc_mod.ServiceValidationError = ServiceValidationError
+    exc_mod.ConfigEntryError = ConfigEntryError
 
     # --- homeassistant.config_entries ---
     ce_mod = _ensure_module("homeassistant.config_entries")
@@ -425,6 +437,7 @@ def _install_ha_stubs() -> None:
 
     class ClimateEntity:
         hass: HomeAssistant
+        native_temperature_unit: Any = None
         _attr_hvac_mode: HVACMode | str = HVACMode.OFF
         _attr_extra_state_attributes: dict[str, Any] = {}
         _attr_device_info: Any = None
@@ -544,10 +557,86 @@ def _install_ha_stubs() -> None:
         def available(self) -> bool:
             return True
 
+        async def async_added_to_hass(self) -> None:
+            pass
+
+        async def async_will_remove_from_hass(self) -> None:
+            pass
+
         def async_write_ha_state(self) -> None:
             pass
 
     btn_mod.ButtonEntity = ButtonEntity
+
+    # --- homeassistant.components.switch ---
+    sw_mod = _ensure_module("homeassistant.components.switch")
+
+    class SwitchEntity:
+        hass: HomeAssistant
+        _attr_entity_category: Any = None
+        _attr_device_info: Any = None
+        _attr_has_entity_name: bool = False
+        _attr_translation_key: str | None = None
+        _attr_icon: str | None = None
+        _attr_is_on: bool = False
+
+        @property
+        def entity_category(self) -> Any:
+            return self._attr_entity_category
+
+        @property
+        def device_info(self) -> Any:
+            return self._attr_device_info
+
+        @property
+        def is_on(self) -> bool:
+            return self._attr_is_on
+
+        async def async_added_to_hass(self) -> None:
+            pass
+
+        async def async_will_remove_from_hass(self) -> None:
+            pass
+
+        def async_write_ha_state(self) -> None:
+            pass
+
+    sw_mod.SwitchEntity = SwitchEntity
+
+    # --- homeassistant.components.time ---
+    tm_mod = _ensure_module("homeassistant.components.time")
+
+    class TimeEntity:
+        hass: HomeAssistant
+        _attr_entity_category: Any = None
+        _attr_device_info: Any = None
+        _attr_has_entity_name: bool = False
+        _attr_translation_key: str | None = None
+        _attr_icon: str | None = None
+        _attr_native_value: Any = None
+
+        @property
+        def entity_category(self) -> Any:
+            return self._attr_entity_category
+
+        @property
+        def device_info(self) -> Any:
+            return self._attr_device_info
+
+        @property
+        def native_value(self) -> Any:
+            return self._attr_native_value
+
+        async def async_added_to_hass(self) -> None:
+            pass
+
+        async def async_will_remove_from_hass(self) -> None:
+            pass
+
+        def async_write_ha_state(self) -> None:
+            pass
+
+    tm_mod.TimeEntity = TimeEntity
 
     # --- homeassistant.components.select ---
     sel_ent_mod = _ensure_module("homeassistant.components.select")
@@ -783,6 +872,7 @@ def _install_ha_stubs() -> None:
     cv_mod = _ensure_module("homeassistant.helpers.config_validation")
     cv_mod.entity_id = str
     cv_mod.string = str
+    cv_mod.config_entry_only_config_schema = lambda domain: (lambda config: config)
 
     # --- homeassistant.components.persistent_notification ---
     pn_mod = _ensure_module("homeassistant.components.persistent_notification")

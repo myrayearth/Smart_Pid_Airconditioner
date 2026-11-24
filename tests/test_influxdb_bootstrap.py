@@ -842,6 +842,7 @@ async def test_boiler_switch_string_and_numeric_with_unknown_locf(hass) -> None:
     assert "ON" in res_str["discovered_states"]["device"]["unique_values"]
     assert "off" in res_str["discovered_states"]["device"]["unique_values"]
     assert "unknown" in res_str["discovered_states"]["device"]["unique_values"]
+    await async_unload_entry(hass, entry_str)
 
     # Case B: numeric 1.0 / 0 with explicit device_active_values / device_inactive_values
     entry_num = _make_entry("entry_num_sw")
@@ -888,7 +889,6 @@ async def test_boiler_switch_string_and_numeric_with_unknown_locf(hass) -> None:
     assert res_num["discovered_states"]["device"]["applied_active_values"] == ["1"]
     assert res_num["discovered_states"]["device"]["applied_inactive_values"] == ["0"]
 
-    await async_unload_entry(hass, entry_str)
     await async_unload_entry(hass, entry_num)
 
 

@@ -401,6 +401,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         self._pwm_duty_cycle: float = 0.0
         self._pwm_on_time: float = 0.0
         self._sensor_stale_count: int = 0
+        self._sensor_fault_active: bool = False
+        self._sensor_recovery_first_at: datetime | None = None
         self._internal_pwm_slave_off: bool = False
 
         # Event tracking unsubscribers
@@ -806,6 +808,11 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
     def native_target_temperature(self) -> float:
         """Return the target temperature."""
         return self._target_temp
+
+    if not hasattr(ClimateEntity, "native_temperature_unit"):
+        _attr_temperature_unit = _attr_native_temperature_unit
+        current_temperature = native_current_temperature
+        target_temperature = native_target_temperature
 
     @property
     def supported_features(self) -> ClimateEntityFeature:
@@ -1332,13 +1339,28 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
         ):
             parsed = self._parse_humidity(indoor_state) if is_hum else self._parse_temperature(indoor_state)
             if parsed is not None:
-                if is_hum:
-                    self._indoor_humidity = parsed
+                if self._sensor_fault_active:
+                    if self._sensor_recovery_first_at is None:
+                        self._sensor_recovery_first_at = now
+                    elif (now - self._sensor_recovery_first_at).total_seconds() >= 30.0:
+                        self._sensor_fault_active = False
+                        self._sensor_recovery_first_at = None
+                        if is_hum:
+                            self._indoor_humidity = parsed
+                        else:
+                            self._indoor_temp = parsed
+                        self._last_indoor_update = now
+                        self._sensor_stale_count = 0
                 else:
-                    self._indoor_temp = parsed
-                self._last_indoor_update = now
-                self._sensor_stale_count = 0
+                    if is_hum:
+                        self._indoor_humidity = parsed
+                    else:
+                        self._indoor_temp = parsed
+                    self._last_indoor_update = now
+                    self._sensor_stale_count = 0
             else:
+                self._sensor_fault_active = True
+                self._sensor_recovery_first_at = None
                 self._sensor_stale_count += 1
                 if is_hum:
                     self._indoor_humidity = None
@@ -1350,6 +1372,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
                     indoor_state.state,
                 )
         else:
+            self._sensor_fault_active = True
+            self._sensor_recovery_first_at = None
             self._sensor_stale_count += 1
             if is_hum:
                 self._indoor_humidity = None

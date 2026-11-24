@@ -226,6 +226,44 @@ from .learner import INERTIA_PROFILES, PREDICTION_MODES
 
 _LOGGER = logging.getLogger(__name__)
 
+_OWNERSHIP_DEVICE_KEYS = (
+    CONF_TARGET_DEVICE,
+    CONF_TARGET_CLIMATE,
+    CONF_TARGET_DEVICE_COOL,
+    CONF_TARGET_DEVICE_HEAT,
+    CONF_TARGET_DEVICE_DEHUMIDITY,
+    CONF_TARGET_DEVICE_HUMIDITY,
+)
+
+
+def _find_duplicate_target_device(
+    hass: Any,
+    candidate_devices: list[str],
+    exclude_entry_id: str | None = None,
+) -> str | None:
+    """Return conflicting device entity_id if already owned by another Smart PID entry."""
+    cands = {d.strip() for d in candidate_devices if isinstance(d, str) and d.strip()}
+    if not cands or hass is None:
+        return None
+    entries_fn = getattr(getattr(hass, "config_entries", None), "async_entries", None)
+    if callable(entries_fn):
+        for entry in entries_fn(DOMAIN):
+            if exclude_entry_id and getattr(entry, "entry_id", None) == exclude_entry_id:
+                continue
+            opts = getattr(entry, "options", {}) or {}
+            data = getattr(entry, "data", {}) or {}
+            for key in _OWNERSHIP_DEVICE_KEYS:
+                val = opts.get(key) or data.get(key)
+                if isinstance(val, str) and val.strip() in cands:
+                    return val.strip()
+    owners = (hass.data.get(DOMAIN, {}) if isinstance(getattr(hass, "data", None), dict) else {}).get("owners", {})
+    if isinstance(owners, dict):
+        for dev_id in cands:
+            owner_id = owners.get(dev_id)
+            if owner_id and owner_id != exclude_entry_id:
+                return dev_id
+    return None
+
 FALLBACK_FAN_MODES = ["low", "medium", "high", "turbo", "auto"]
 
 
@@ -809,6 +847,14 @@ class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             errors[CONF_TARGET_DEVICE] = "target_device_must_be_climate"
                     elif control_mode == CONTROL_MODE_SWITCH_PWM and domain not in ("switch", "input_boolean"):
                         errors[CONF_TARGET_DEVICE] = "target_device_must_be_switch"
+
+            if not errors:
+                dup = _find_duplicate_target_device(
+                    self.hass,
+                    [target_dev, target_cool, target_heat, target_dehumidity, target_humidity],
+                )
+                if dup is not None:
+                    errors["base"] = "duplicate_target_device"
 
             if not errors:
                 flat_user_input = _flatten_sections_input(user_input)
@@ -1708,6 +1754,15 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlowWithReload):
                             errors[CONF_TARGET_DEVICE] = "target_device_must_be_climate"
                     elif active_control_mode == CONTROL_MODE_SWITCH_PWM and domain not in ("switch", "input_boolean"):
                         errors[CONF_TARGET_DEVICE] = "target_device_must_be_switch"
+
+            if not errors:
+                dup = _find_duplicate_target_device(
+                    self.hass,
+                    [target_dev, target_cool, target_heat, target_dehumidity, target_humidity],
+                    exclude_entry_id=self.config_entry.entry_id,
+                )
+                if dup is not None:
+                    errors["base"] = "duplicate_target_device"
 
             if not errors:
                 flat_user_input = _flatten_sections_input(user_input)
