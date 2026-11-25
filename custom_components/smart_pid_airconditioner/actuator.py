@@ -12,6 +12,8 @@ from homeassistant.const import (
     SERVICE_TURN_ON,
     STATE_OFF,
     STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
 )
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.event import async_track_state_change_event
@@ -22,6 +24,9 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_UNVERIFIED_STATES: frozenset[str | None] = frozenset(
+    {None, "", STATE_UNKNOWN, STATE_UNAVAILABLE}
+)
 
 
 class SwitchCommandGuard:
@@ -40,6 +45,18 @@ class SwitchCommandGuard:
         self._generations: dict[str, int] = {}
         self._pending_off: set[str] = set()
         self.last_error: dict[str, str] = {}
+        self.failure_counts: dict[str, int] = {}
+
+    def _is_confirmed_state(self, entity_id: str, desired_state: str) -> bool:
+        """Return True only when state exists, is known/available, and matches desired_state."""
+        st = self.hass.states.get(entity_id)
+        if st is None or st.state in _UNVERIFIED_STATES:
+            return False
+        return st.state == desired_state
+
+    def _is_confirmed_off(self, entity_id: str) -> bool:
+        """Return True only when switch state is explicitly confirmed OFF."""
+        return self._is_confirmed_state(entity_id, STATE_OFF)
 
     def _next_generation(self, entity_id: str) -> int:
         gen = self._generations.get(entity_id, 0) + 1
@@ -89,30 +106,31 @@ class SwitchCommandGuard:
         generation: int,
         timeout: float,
     ) -> bool:
-        st = self.hass.states.get(entity_id)
-        if st is None or st.state == desired_state:
+        if self._is_confirmed_state(entity_id, desired_state):
             return True
         if timeout <= 0:
-            return True
+            return False
 
         event = asyncio.Event()
 
         @callback
         def _on_change(ev: Event) -> None:
             new_st = ev.data.get("new_state") if isinstance(ev.data, Mapping) else None
-            if new_st is not None and new_st.state == desired_state:
+            if (
+                new_st is not None
+                and new_st.state not in _UNVERIFIED_STATES
+                and new_st.state == desired_state
+            ):
                 event.set()
 
         unsub = async_track_state_change_event(self.hass, [entity_id], _on_change)
         try:
-            st_again = self.hass.states.get(entity_id)
-            if st_again is not None and st_again.state == desired_state:
+            if self._is_confirmed_state(entity_id, desired_state):
                 return True
             await asyncio.wait_for(event.wait(), timeout=timeout)
             return self._generations.get(entity_id) == generation
         except TimeoutError:
-            final_st = self.hass.states.get(entity_id)
-            return final_st is not None and final_st.state == desired_state
+            return self._is_confirmed_state(entity_id, desired_state)
         finally:
             unsub()
 
@@ -134,6 +152,7 @@ class SwitchCommandGuard:
         gen = self._next_generation(entity_id)
         sent = await self._call_switch_service(entity_id, SERVICE_TURN_ON)
         if not sent:
+            self.failure_counts[entity_id] = self.failure_counts.get(entity_id, 0) + 1
             self.last_error[entity_id] = "turn_on_failed"
             await self.async_turn_off(entity_id, confirm=False)
             return False
@@ -153,11 +172,13 @@ class SwitchCommandGuard:
                     entity_id,
                     self.confirm_timeout,
                 )
+                self.failure_counts[entity_id] = self.failure_counts.get(entity_id, 0) + 1
                 self.last_error[entity_id] = "on_unconfirmed"
                 await self.async_turn_off(entity_id, confirm=False)
                 return False
 
         self.last_error.pop(entity_id, None)
+        self.failure_counts.pop(entity_id, None)
         return True
 
     async def async_turn_off(
@@ -185,9 +206,14 @@ class SwitchCommandGuard:
                 if not sent:
                     continue
 
-                st = self.hass.states.get(entity_id)
-                if not confirm or self.confirm_timeout <= 0 or st is None or st.state == STATE_OFF:
+                if not confirm or self.confirm_timeout <= 0:
                     self.last_error.pop(entity_id, None)
+                    self.failure_counts.pop(entity_id, None)
+                    return True
+
+                if self._is_confirmed_off(entity_id):
+                    self.last_error.pop(entity_id, None)
+                    self.failure_counts.pop(entity_id, None)
                     return True
 
                 confirmed = await self._wait_for_state(
@@ -197,10 +223,28 @@ class SwitchCommandGuard:
                     return False
                 if confirmed:
                     self.last_error.pop(entity_id, None)
+                    self.failure_counts.pop(entity_id, None)
                     return True
 
-            self.last_error[entity_id] = "off_unconfirmed"
-            _LOGGER.error("Switch %s could not confirm OFF after bounded retries", entity_id)
+            self.failure_counts[entity_id] = self.failure_counts.get(entity_id, 0) + 1
+            final_st = self.hass.states.get(entity_id)
+            final_val = final_st.state if final_st is not None else None
+            if final_val in _UNVERIFIED_STATES:
+                self.last_error[entity_id] = "unverified_off"
+                _LOGGER.warning(
+                    "Switch %s OFF state unverified (state=%r) after bounded retries (failures=%d)",
+                    entity_id,
+                    final_val,
+                    self.failure_counts[entity_id],
+                )
+            else:
+                self.last_error[entity_id] = "off_unconfirmed"
+                _LOGGER.warning(
+                    "Switch %s remained '%s' (OFF unconfirmed) after bounded retries (failures=%d)",
+                    entity_id,
+                    final_val,
+                    self.failure_counts[entity_id],
+                )
             return False
         finally:
             if self._generations.get(entity_id) == gen:

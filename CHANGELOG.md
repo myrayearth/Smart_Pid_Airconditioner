@@ -7,6 +7,24 @@
 
 ---
 
+## [0.6.4] - 2026-11-25
+
+### 수정 및 안전성 강화 (Fixed & Improved)
+- **PWM 제어기 제거/언로드 시 물리 스위치 안전 종료 보장 (`climate.py`, `humidifier.py`)**:
+  - `async_will_remove_from_hass()`에서 구독/타이머 해제 직후 활성 또는 상태 미확정 PWM 스위치(냉/난방·가습/제습 겸용 포함)에 `SwitchCommandGuard.async_turn_off(confirm=True)` 안전 종료를 수행하고, 실패 시 예외 전파 없이 `_LOGGER.error` 기록
+  - 안전 종료 시각 및 가동 시간을 반영해 `hass.data[DOMAIN]["reload_off"][device_id]`의 `(off_at, deadline)`을 정확히 갱신
+- **스위치 상태 미확인(`None`/`unknown`/`unavailable`/빈 상태) Fail-Safe 처리 (`actuator.py`)**:
+  - `_is_confirmed_state()` / `_is_confirmed_off()`를 도입해 명확한 목표 상태일 때만 확인 성공(`True`)으로 판정하도록 수정 (`None`/불명 상태를 성공 처리하던 버그 제거)
+  - 제한적 재시도 후에도 OFF가 미확인되면 `failure_counts[entity_id]` 및 `last_error[entity_id]`(`"unverified_off"` / `"off_unconfirmed"`)를 기록하고 `_LOGGER.warning` 출력
+- **플랫폼 언로드 실패 시 런타임 및 소유권 보존 (`__init__.py`)**:
+  - `async_unload_entry()`에서 `async_unload_platforms()`가 `False`를 반환할 때 `_LOGGER.warning`을 기록하고 런타임(`SmartPIDRuntime`), `hass.data[DOMAIN]`, 기기 소유권(`owners`)을 해지하지 않은 채 `False` 반환
+- **플랫폼 셋업 실패 시 시작된 런타임 완전 롤백 (`__init__.py`, `runtime.py`)**:
+  - `async_setup_entry()` 예외 경로에서 `await runtime.async_unload()`(1분 틱 해제, `_bootstrap_task` 취소 및 `CancelledError` 정리, dirty 스냅샷 저장), `hass.data[DOMAIN]`/`entry.runtime_data` 정리, `owners` 소유권 해제를 일괄 수행 후 예외 재전파
+- **회귀 테스트 추가 (`tests/test_review_safety_lifecycle.py`)**:
+  - PWM 단일/이중/가습기 안전 종료·실패 로깅, 스위치 미확인 상태 Fail-Safe 재시도, 언로드 실패 보존, 셋업 실패 롤백·태스크 정리 등 8개 테스트 케이스 추가
+
+---
+
 ## [0.6.3] - 2026-11-24
 
 ### 수정 (Fixed)

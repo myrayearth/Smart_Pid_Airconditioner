@@ -265,6 +265,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN][entry.entry_id] = runtime
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except Exception:
+        try:
+            await runtime.async_unload()
+        except Exception as unload_err:
+            _LOGGER.warning(
+                "Error rolling back runtime during failed setup for %s: %s",
+                entry.entry_id,
+                unload_err,
+            )
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        if getattr(entry, "runtime_data", None) is runtime:
+            entry.runtime_data = None
         for dev_id in target_devices:
             if owners.get(dev_id) == entry.entry_id:
                 owners.pop(dev_id, None)
@@ -275,6 +286,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        _LOGGER.warning(
+            "Failed to unload platforms for Smart PID entry %s; preserving runtime and device ownership",
+            entry.entry_id,
+        )
+        return False
+
     runtime: SmartPIDRuntime | None = getattr(entry, "runtime_data", None)
     if runtime is not None:
         await runtime.async_unload()
@@ -297,7 +315,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
         ]:
             reload_off.pop(dev_id, None)
-    return unload_ok
+    return True
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:

@@ -1058,7 +1058,6 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from Home Assistant."""
-        self._record_reload_off()
         if self._unsub_runtime is not None:
             self._unsub_runtime()
             self._unsub_runtime = None
@@ -1075,6 +1074,8 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             self._keep_alive_cancel()
             self._keep_alive_cancel = None
         self._cancel_pwm_timers()
+        shutdown_records = await self._async_safe_shutdown_pwm_on_remove()
+        self._record_reload_off(shutdown_records=shutdown_records)
         parent_remove = getattr(super(), "async_will_remove_from_hass", None)
         if callable(parent_remove):
             await parent_remove()
@@ -2807,13 +2808,101 @@ class SmartPIDThermostatEntity(ClimateEntity, RestoreEntity):
             return min(float(self._min_off_time), max(1.0, pwm_dur * 0.05))
         return base_min_off
 
-    def _record_reload_off(self) -> None:
+    async def _async_safe_shutdown_pwm_on_remove(self) -> dict[str, tuple[datetime, float]]:
+        """Safely turn off active/indeterminate PWM switches when removing entity."""
+        if self._control_mode != CONTROL_MODE_SWITCH_PWM or self.hass is None:
+            return {}
+        active_dev = self._active_target_device_id
+        controller_active = bool(self._is_active_hvac_mode)
+        shutdown_records: dict[str, tuple[datetime, float]] = {}
+
+        for dev_id in self._pwm_device_ids():
+            st = self.hass.states.get(dev_id)
+            state_val = st.state if st is not None else None
+            is_active_target = dev_id == active_dev
+            internal_active = bool(self._pwm_state and is_active_target)
+            state_is_on = state_val == STATE_ON
+            state_is_indeterminate = state_val in (
+                None,
+                "",
+                STATE_UNKNOWN,
+                STATE_UNAVAILABLE,
+            )
+            needs_shutdown = (
+                state_is_on
+                or internal_active
+                or (
+                    state_is_indeterminate
+                    and controller_active
+                    and (is_active_target or st is not None)
+                )
+            )
+            if not needs_shutdown:
+                continue
+
+            now_before = dt_util.utcnow()
+            last_on = self._last_switch_on_times.get(dev_id, self._last_switch_on_time)
+            run_dur = (
+                max(0.0, (now_before - last_on).total_seconds())
+                if last_on is not None
+                else self._last_run_duration_sec
+            )
+            try:
+                confirmed_off = await self._switch_guard.async_turn_off(
+                    dev_id, confirm=True
+                )
+                if not confirmed_off:
+                    _LOGGER.error(
+                        "Failed to confirm safe PWM shutdown for %s on removal (reason=%s)",
+                        dev_id,
+                        self._switch_guard.last_error.get(dev_id, "unknown"),
+                    )
+            except Exception as err:
+                _LOGGER.error(
+                    "Safe PWM shutdown raised error for %s on removal: %s",
+                    dev_id,
+                    err,
+                )
+
+            off_at = dt_util.utcnow()
+            self._pwm_state = False
+            if is_active_target and last_on is not None:
+                self._last_run_duration_sec = run_dur
+            self._last_switch_off_times[dev_id] = off_at
+            if (
+                is_active_target
+                or self._last_switch_off_time is None
+                or off_at > self._last_switch_off_time
+            ):
+                self._last_switch_off_time = off_at
+            shutdown_records[dev_id] = (off_at, run_dur)
+
+        return shutdown_records
+
+    def _record_reload_off(
+        self, shutdown_records: Mapping[str, tuple[datetime, float]] | None = None
+    ) -> None:
         """Persist active or pending minimum OFF deadline across config entry reload."""
-        if self._control_mode != CONTROL_MODE_SWITCH_PWM:
+        if self._control_mode != CONTROL_MODE_SWITCH_PWM or self.hass is None:
             return
         reload_off = self.hass.data.setdefault(DOMAIN, {}).setdefault("reload_off", {})
         now = dt_util.utcnow()
         for dev_id in self._pwm_device_ids():
+            if shutdown_records and dev_id in shutdown_records:
+                off_at, run_dur = shutdown_records[dev_id]
+                eff = self._compute_effective_min_off(run_dur)
+                deadline = (
+                    off_at + timedelta(seconds=eff) if eff > 0 else None
+                )
+                prev_deadline = self._reload_min_off_deadlines.get(dev_id)
+                if prev_deadline is not None and (
+                    deadline is None or prev_deadline > deadline
+                ):
+                    deadline = prev_deadline
+                if deadline is not None and deadline > now:
+                    reload_off[dev_id] = (off_at, deadline)
+                continue
+
             st = self.hass.states.get(dev_id)
             is_running = (self._pwm_state and dev_id == self._active_target_device_id) or (
                 st is not None and st.state == STATE_ON

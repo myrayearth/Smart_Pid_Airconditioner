@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
+import contextlib
 from datetime import datetime, time as dt_time, timedelta
 import logging
 import time
@@ -312,8 +314,14 @@ class SmartPIDRuntime:
         if self._unsub_tick is not None:
             self._unsub_tick()
             self._unsub_tick = None
-        if self._bootstrap_task is not None and not self._bootstrap_task.done():
-            self._bootstrap_task.cancel()
+        if self._bootstrap_task is not None:
+            task = self._bootstrap_task
+            self._bootstrap_task = None
+            if not task.done():
+                task.cancel()
+                if asyncio.isfuture(task):
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
         if self._dirty:
             await self.store.async_save(self.snapshot)
             self._dirty = False
