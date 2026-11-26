@@ -244,10 +244,8 @@ async def test_pwm_removal_safe_shutdown_single_dual_humidifier_and_error_handli
         r.levelno == logging.ERROR and "switch.fail_rm" in r.getMessage()
         for r in caplog.records
     )
-    assert hass.data[DOMAIN]["reload_off"]["switch.fail_rm"] == (
-        t_fail,
-        t_fail + timedelta(seconds=180),
-    )
+    assert "switch.fail_rm" not in hass.data[DOMAIN]["reload_off"]
+    assert "switch.fail_rm" in hass.data[DOMAIN]["reload_unverified_off"]
     await async_unload_entry(hass, fail_entry)
 
 

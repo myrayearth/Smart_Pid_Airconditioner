@@ -58,6 +58,14 @@ class SwitchCommandGuard:
         """Return True only when switch state is explicitly confirmed OFF."""
         return self._is_confirmed_state(entity_id, STATE_OFF)
 
+    def is_confirmed_off(self, entity_id: str) -> bool:
+        """Public wrapper returning True only when switch state is explicitly confirmed OFF."""
+        return self._is_confirmed_off(entity_id)
+
+    def is_off_pending(self, entity_id: str) -> bool:
+        """Return True if an OFF confirmation retry sequence is currently in progress."""
+        return entity_id in self._pending_off
+
     def _next_generation(self, entity_id: str) -> int:
         gen = self._generations.get(entity_id, 0) + 1
         self._generations[entity_id] = gen

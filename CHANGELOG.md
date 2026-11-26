@@ -7,6 +7,27 @@
 
 ---
 
+## [0.6.5] - 2026-11-26
+
+### Fixed & Hardened (GPT 6.2 Astra 코드 리뷰 14건 + 테스트 하네스 검증 개선)
+- **이중 릴레이 상호배제(Interlock) 강제 (Critical)**: `THERMOSTAT_TYPE_HEAT_COOL` 및 `THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY`에서 반대편 릴레이의 명시적 OFF 확인에 실패하거나(`on` 유지)·`unavailable`·엔티티 누락(`None`) 상태일 때 신규 릴레이 ON과 keep-alive 재전송을 원천 차단하도록 개선했습니다. (`SwitchCommandGuard.is_confirmed_off` / `is_off_pending`, `_async_ensure_inactive_off`)
+- **비유한 센서값(`NaN`/`Inf`/`-Inf`) 차단**: `parse_temperature_state`, `parse_humidity_state`, `runtime.py`, `pid_core.compute_pid_step`, `climate.py`·`humidifier.py` 과열 래치/복구 판정 전 경로에 `math.isfinite()` 검사를 적용해 `NaN` 입력이 `100%` 난방 PWM 출력으로 변환되는 결함을 수정했습니다.
+- **`EVENT_HOMEASSISTANT_STOP` 안전 정지**: `async_will_remove_from_hass()`에 더해 HA 종료 이벤트(`EVENT_HOMEASSISTANT_STOP`) 수신 시 즉시 신규 ON을 차단하고 PWM 타이머를 취소한 뒤 공용 멱등 안전 정지 루틴(`_async_shutdown_pwm`)을 실행하도록 보완했습니다.
+- **센서 보고 만료(`last_reported`) 및 2회 독립 보고 복구**: `DEFAULT_SENSOR_STALE_TIMEOUT_SEC`(1800초) 기준으로 실제 `last_reported` 보고 시각 만료를 감시해 센서 값이 숫자 그대로 멈춰 있어도 Fail-Safe로 전환하며, 동일 값 라이브 하트비트는 유지하고 고장 복구에는 최소 30초 이상 떨어진 서로 다른 2회의 유효 보고를 요구합니다.
+- **Fail-Safe 중 예측 기동(`predictive_on_boost`) 차단**: 센서 고장 및 2회 보고 복구 대기 중에는 `predictive_on_triggered`와 `early_stop_triggered`를 비활성화해 설정된 `output_safety`(0%)를 유지하도록 수정했습니다.
+- **제습/가습 기본 최소 휴지 시간(180초) 및 PWM 상태 동기화 보완**: `dynamic_min_off_multiplier == 0.0`인 기본 설정에서도 제습·가습 PWM의 `min_off_time`(180초)을 상시 적용하고, 수동 OFF·모드 전환·전체 주기 시 장치별 OFF 시각을 기록하도록 통합했습니다. 또한 `humidifier.py`가 `switch_pwm` 모드에서 릴레이 OFF 펄스 이벤트를 `_async_sync_mode_from_slave()`로 처리해 컨트롤러를 정지시키던 결함과 `climate.py`가 이미 `off` 상태인 스위치에 대해 시작 시 허위 `min_off` 타임스탬프를 찍던 경로를 수정했습니다.
+- **온도 단위(`°F`/`K`) 섭씨(`°C`) 정규화**: `68°F` 등 화씨·켈빈 센서 및 `weather` 엔티티의 `temperature_unit`을 섭씨로 정규화해 실온에서 `35°C` 과열 래치가 오작동하거나 냉방/난방 오차가 왜곡되는 문제를 해결했습니다.
+- **지연 ON 창(Window) 바인딩 및 취소**: `min_off_time` 잔여 시간으로 예약된 지연 ON을 `cycle_id`, 대상 장치, ON 마감 시각(`on_deadline`)에 바인딩해 잔여 `min_off`가 예정 ON 구간을 넘기면 예약을 건너뛰고 OFF 경로에서 즉시 취소하도록 수정했습니다.
+- **짧은 PWM 주기 검증 및 물리적 `min_on`/`min_off` 보존**: 설정 단계(`process_pwm_sections_input`)에서 `min_on + min_off >= pwm_duration` 조합을 차단(`min_times_exceed_pwm_duration`)하고, 런타임에서도 `min_on` 임의 단축(`5%`)을 제거해 물리적 최소 가동·휴지 시간을 보존했습니다.
+- **`reset_learning` 대상 검증 엄격화**: 존재하지 않거나 비어 있거나 엔트리와 일치하지 않는 `entry_id`·`entity_id` 지정 시 `ServiceValidationError`를 발생시켜 0개만 초기화하며, 두 필드를 모두 생략한 경우에만 전체 컨트롤러 초기화를 허용합니다.
+- **keep-alive `SwitchCommandGuard` 경로 통합**: `climate.py`·`humidifier.py`의 `_async_keep_alive_handler`가 `blocking=False` 직통 호출 대신 `SwitchCommandGuard`, `_async_clear_unverified_off_before_on`, `_async_ensure_inactive_off`를 거치도록 통일했습니다.
+- **리로드 미확인 OFF 상태 보존(`reload_unverified_off`)**: 언로드/종료 중 OFF 확인에 실패하거나 예외가 발생한 스위치는 `reload_off`에 가짜 휴지 시각을 기록하지 않고 `reload_unverified_off`에 보존해 재로드 후 실제 OFF가 확인될 때까지 ON을 차단하고 확인 시점부터 `min_off`를 시작하도록 수정했습니다.
+- **InfluxDB 부트스트랩 0분 데이터 보존**: 범위 필터링 결과 `in_range_minutes == 0`이면 기존 학습 스냅샷 및 영구 `ModelStore`를 덮어쓰지 않고 `applied: false`를 반환하도록 수정했습니다.
+- **손상된 RLS 공분산 행렬 `P` 로드 검증**: `HuberRLS.from_dict()` 및 `LearningStateSnapshot.from_dict()`에서 행·열 크기(`n_features × n_features`)와 `math.isfinite()`를 검증하고 손상 시 경고 로그와 함께 안전 초기화해 이후 첫 `update()` 실패(`IndexError`)를 방지합니다.
+
+### Added / Changed (테스트)
+- `tests/conftest.py`에 `VirtualBus`, `VirtualClockHarness`(`virtual_clock` 픽스처), `EVENT_HOMEASSISTANT_STOP`, `State.last_reported`, `hass.config.units.temperature_unit`을 추가하고 `tests/test_astra_review_fixes.py`에 14대 결함 및 타이머 하네스 회귀 테스트 20건을 추가했습니다. (`tests/test_ventilation.py` 스위치 응답 핸들러 보완 포함)
+
 ## [0.6.4] - 2026-11-25
 
 ### 수정 및 안전성 강화 (Fixed & Improved)

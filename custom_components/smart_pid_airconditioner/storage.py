@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 from homeassistant.core import HomeAssistant
@@ -14,6 +15,8 @@ from .learner import (
     INERTIA_FAST_AIR,
     TuningSafetyManager,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 1
 STORAGE_MINOR_VERSION = 1
@@ -62,9 +65,15 @@ class LearningStateSnapshot:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LearningStateSnapshot:
+        temp_rls = HuberRLS.from_dict(data["temp_rls"]) if "temp_rls" in data else None
+        if temp_rls is not None and temp_rls.n_features != 3:
+            raise ValueError(f"Invalid temp_rls feature count: {temp_rls.n_features}")
+        hum_rls = HuberRLS.from_dict(data["hum_rls"]) if "hum_rls" in data else None
+        if hum_rls is not None and hum_rls.n_features != 2:
+            raise ValueError(f"Invalid hum_rls feature count: {hum_rls.n_features}")
         return cls(
-            temp_rls=HuberRLS.from_dict(data["temp_rls"]) if "temp_rls" in data else None,
-            hum_rls=HuberRLS.from_dict(data["hum_rls"]) if "hum_rls" in data else None,
+            temp_rls=temp_rls,
+            hum_rls=hum_rls,
             coasting=(
                 DynamicCoastingLearner.from_dict(data["coasting"])
                 if "coasting" in data
@@ -111,8 +120,11 @@ class ModelStore:
                     peak_confirm_delta=peak_confirm_delta,
                 )
                 return snap
-            except Exception:
-                pass
+            except Exception as err:
+                _LOGGER.warning(
+                    "Corrupted learning snapshot; resetting to defaults: %s",
+                    err,
+                )
         return LearningStateSnapshot(
             inertia_profile=inertia_profile,
             tau_em_min=tau_em_min,

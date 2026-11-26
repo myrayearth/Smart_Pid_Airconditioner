@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
+import math
+import re
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTemperature
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
 from homeassistant.helpers import event as ha_event
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -143,37 +146,87 @@ def resolve_type_label(thermostat_type: str) -> str:
     return "Cooler"
 
 
-def parse_temperature_state(state_obj: Any) -> float | None:
-    """Extract a float temperature value from a Home Assistant State object."""
+_TEMP_STR_RE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][+-]?\d+)?)\s*(?:°\s*([cCfFkK])|([℃℉])|([cCfFkK]))?\s*$"
+)
+
+
+def _is_finite_number(val: Any) -> bool:
+    """Return True if val is a real finite int/float (excluding bool, NaN, Inf)."""
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val))
+
+
+def _normalize_temp_unit(unit: Any) -> str | None:
+    """Normalize a temperature unit enum/string to 'C', 'F', or 'K'."""
+    if unit is None:
+        return None
+    raw = unit.value if hasattr(unit, "value") else str(unit)
+    norm = str(raw).strip().upper().replace("°", "").replace(" ", "")
+    if norm in ("F", "℉", "FAHRENHEIT"):
+        return "F"
+    if norm in ("K", "KELVIN"):
+        return "K"
+    if norm in ("C", "℃", "CELSIUS"):
+        return "C"
+    return None
+
+
+def _convert_temperature_to_celsius(val: float, unit: Any) -> float:
+    """Convert temperature value to Celsius when unit is Fahrenheit or Kelvin."""
+    norm = _normalize_temp_unit(unit)
+    if norm == "F":
+        return (val - 32.0) * 5.0 / 9.0
+    if norm == "K":
+        return val - 273.15
+    return val
+
+
+def _parse_temp_string(raw: str) -> tuple[float | None, str | None]:
+    """Parse a strict finite temperature string and optional inline unit suffix."""
+    if raw.strip().lower() in _INVALID_STATES:
+        return None, None
+    match = _TEMP_STR_RE.fullmatch(raw)
+    if match is None:
+        return None, None
+    num_str = match.group(1).replace(",", ".")
+    try:
+        num = float(num_str)
+    except (ValueError, TypeError):
+        return None, None
+    if not math.isfinite(num):
+        return None, None
+    inline_unit = match.group(2) or match.group(3) or match.group(4)
+    return num, inline_unit
+
+
+def parse_temperature_state(state_obj: Any, *, default_unit: Any = None) -> float | None:
+    """Extract a finite Celsius float temperature from a Home Assistant State object."""
     if state_obj is None:
         return None
-    if isinstance(state_obj, (int, float)):
-        return float(state_obj)
+    if isinstance(state_obj, (int, float, bool)):
+        if not _is_finite_number(state_obj):
+            return None
+        c_val = _convert_temperature_to_celsius(float(state_obj), default_unit)
+        return c_val if math.isfinite(c_val) else None
+
+    raw_attrs = getattr(state_obj, "attributes", None)
+    attrs: Mapping[str, Any] = raw_attrs if isinstance(raw_attrs, Mapping) else {}
+    state_unit = attrs.get("unit_of_measurement") or attrs.get("temperature_unit") or default_unit
 
     state_val = getattr(state_obj, "state", None)
-    if isinstance(state_val, (int, float)):
-        return float(state_val)
+    if isinstance(state_val, (int, float, bool)):
+        if _is_finite_number(state_val):
+            c_val = _convert_temperature_to_celsius(float(state_val), state_unit)
+            if math.isfinite(c_val):
+                return c_val
+    elif isinstance(state_val, str):
+        parsed, inline_unit = _parse_temp_string(state_val)
+        if parsed is not None:
+            c_val = _convert_temperature_to_celsius(parsed, inline_unit or state_unit)
+            if math.isfinite(c_val):
+                return c_val
 
-    if isinstance(state_val, str):
-        if state_val.strip().lower() in _INVALID_STATES:
-            return None
-        cleaned = (
-            state_val.replace("°C", "")
-            .replace("°F", "")
-            .replace("℃", "")
-            .replace("℉", "")
-            .replace("°", "")
-            .replace("C", "")
-            .replace("F", "")
-            .replace(",", ".")
-            .strip()
-        )
-        try:
-            return float(cleaned)
-        except (ValueError, TypeError):
-            pass
-
-    attrs = getattr(state_obj, "attributes", None) or {}
+    attr_unit = attrs.get("temperature_unit") or attrs.get("unit_of_measurement") or default_unit
     for attr in (
         "temperature",
         "native_temperature",
@@ -185,60 +238,71 @@ def parse_temperature_state(state_obj: Any) -> float | None:
         val = attrs.get(attr)
         if val is None:
             continue
-        if isinstance(val, (int, float)):
-            return float(val)
-        if isinstance(val, str):
-            cleaned = (
-                val.replace("°C", "")
-                .replace("°F", "")
-                .replace("℃", "")
-                .replace("℉", "")
-                .replace("°", "")
-                .replace("C", "")
-                .replace("F", "")
-                .replace(",", ".")
-                .strip()
-            )
+        if isinstance(val, (int, float, bool)):
+            if _is_finite_number(val):
+                c_val = _convert_temperature_to_celsius(float(val), attr_unit)
+                if math.isfinite(c_val):
+                    return c_val
+        elif isinstance(val, str):
+            parsed, inline_unit = _parse_temp_string(val)
+            if parsed is not None:
+                c_val = _convert_temperature_to_celsius(parsed, inline_unit or attr_unit)
+                if math.isfinite(c_val):
+                    return c_val
+    return None
+
+
+def parse_humidity_state(state_obj: Any) -> float | None:
+    """Extract a finite float humidity value (%) from a Home Assistant State object."""
+    if state_obj is None:
+        return None
+    if isinstance(state_obj, (int, float, bool)):
+        return float(state_obj) if _is_finite_number(state_obj) else None
+
+    state_val = getattr(state_obj, "state", None)
+    if isinstance(state_val, (int, float, bool)):
+        if _is_finite_number(state_val):
+            return float(state_val)
+    elif isinstance(state_val, str):
+        if state_val.strip().lower() not in _INVALID_STATES:
+            cleaned = state_val.replace("%", "").replace(",", ".").strip()
             try:
-                return float(cleaned)
+                num = float(cleaned)
+                if math.isfinite(num):
+                    return num
+            except (ValueError, TypeError):
+                pass
+
+    raw_attrs = getattr(state_obj, "attributes", None)
+    attrs: Mapping[str, Any] = raw_attrs if isinstance(raw_attrs, Mapping) else {}
+    for attr in ("humidity", "relative_humidity", "current_humidity", "target_humidity"):
+        val = attrs.get(attr)
+        if val is None:
+            continue
+        if isinstance(val, (int, float, bool)):
+            if _is_finite_number(val):
+                return float(val)
+        elif isinstance(val, str):
+            if val.strip().lower() in _INVALID_STATES:
+                continue
+            cleaned = val.replace("%", "").replace(",", ".").strip()
+            try:
+                num = float(cleaned)
+                if math.isfinite(num):
+                    return num
             except (ValueError, TypeError):
                 pass
     return None
 
 
-def parse_humidity_state(state_obj: Any) -> float | None:
-    """Extract a float humidity value (%) from a Home Assistant State object."""
+def get_state_report_time(state_obj: Any) -> datetime | None:
+    """Return the most recent report/update timestamp present on a HA State object."""
     if state_obj is None:
         return None
-    if isinstance(state_obj, (int, float)):
-        return float(state_obj)
-
-    state_val = getattr(state_obj, "state", None)
-    if isinstance(state_val, (int, float)):
-        return float(state_val)
-
-    if isinstance(state_val, str):
-        if state_val.strip().lower() in _INVALID_STATES:
-            return None
-        cleaned = state_val.replace("%", "").replace(",", ".").strip()
-        try:
-            return float(cleaned)
-        except (ValueError, TypeError):
-            pass
-
-    attrs = getattr(state_obj, "attributes", None) or {}
-    for attr in ("humidity", "relative_humidity", "current_humidity", "target_humidity"):
-        val = attrs.get(attr)
-        if val is None:
-            continue
-        if isinstance(val, (int, float)):
-            return float(val)
-        if isinstance(val, str):
-            cleaned = val.replace("%", "").replace(",", ".").strip()
-            try:
-                return float(cleaned)
-            except (ValueError, TypeError):
-                pass
+    for attr in ("last_reported", "last_updated", "last_changed"):
+        val = getattr(state_obj, attr, None)
+        if isinstance(val, datetime):
+            return val
     return None
 
 
@@ -326,7 +390,10 @@ class SmartPIDExtraStoredData(ExtraStoredData):
             }
             active_sec = int(data.get("active_section", 1))
             integral = float(data.get("integral", 0.0))
-            last_run_dur = max(0.0, float(data.get("last_run_duration_sec", 0.0)))
+            if not math.isfinite(integral):
+                integral = 0.0
+            last_run_dur = float(data.get("last_run_duration_sec", 0.0))
+            last_run_dur = max(0.0, last_run_dur) if math.isfinite(last_run_dur) else 0.0
             return cls(
                 last_switch_on_times=on_times,
                 last_switch_off_times=off_times,

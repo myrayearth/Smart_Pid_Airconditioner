@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
+from typing import Any
 
 from .const import (
     DEFAULT_TAU_D,
@@ -31,6 +33,10 @@ class PIDStepResult:
     prev_val: float | None
 
 
+def _is_finite_float(val: Any) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val))
+
+
 def compute_pid_step(
     *,
     indoor_val: float,
@@ -55,6 +61,40 @@ def compute_pid_step(
     per_minute_integral: bool = True,
 ) -> PIDStepResult:
     """Compute one PID + outdoor feedforward step with LPF derivative and anti-windup."""
+    safe_integral = float(integral) if _is_finite_float(integral) else 0.0
+    safe_filtered_d = float(filtered_d) if _is_finite_float(filtered_d) else 0.0
+    safe_prev_val = float(prev_val) if (prev_val is not None and _is_finite_float(prev_val)) else None
+    safe_outdoor = float(outdoor_val) if (outdoor_val is not None and _is_finite_float(outdoor_val)) else None
+
+    if not (
+        _is_finite_float(indoor_val)
+        and _is_finite_float(target_val)
+        and _is_finite_float(kp)
+        and _is_finite_float(ki)
+        and _is_finite_float(kd)
+        and _is_finite_float(ke)
+        and _is_finite_float(max_i)
+        and _is_finite_float(dt)
+    ):
+        return PIDStepResult(
+            error=0.0,
+            p_term=0.0,
+            i_term=0.0,
+            d_term=0.0,
+            e_term=0.0,
+            raw_output=0.0,
+            final_output=0.0,
+            integral=safe_integral,
+            filtered_d=safe_filtered_d,
+            last_d_calc_time=last_d_calc_time,
+            prev_val=safe_prev_val,
+        )
+
+    integral = safe_integral
+    filtered_d = safe_filtered_d
+    prev_val = safe_prev_val
+    outdoor_val = safe_outdoor
+
     if is_heating:
         error = target_val - indoor_val
         e_term = ke * (target_val - outdoor_val) if (has_outdoor_sensor and outdoor_val is not None) else 0.0
@@ -125,6 +165,29 @@ def compute_pid_step(
             i_term = max(-max_i_limit, min(max_i_limit, raw_i_term))
 
     raw_output = p_term + i_term + d_term + e_term
+    if not (
+        math.isfinite(raw_output)
+        and math.isfinite(error)
+        and math.isfinite(p_term)
+        and math.isfinite(i_term)
+        and math.isfinite(d_term)
+        and math.isfinite(e_term)
+        and math.isfinite(new_integral)
+        and math.isfinite(new_filtered_d)
+    ):
+        return PIDStepResult(
+            error=0.0,
+            p_term=0.0,
+            i_term=0.0,
+            d_term=0.0,
+            e_term=0.0,
+            raw_output=0.0,
+            final_output=0.0,
+            integral=safe_integral,
+            filtered_d=safe_filtered_d,
+            last_d_calc_time=last_d_calc_time,
+            prev_val=safe_prev_val,
+        )
     final_output = max(0.0, min(100.0, raw_output))
 
     return PIDStepResult(
@@ -254,21 +317,23 @@ def evaluate_sensor_recovery(
     recovery_first_at: datetime | None,
     now: datetime,
     min_recovery_gap_sec: float = 30.0,
+    report_at: datetime | None = None,
 ) -> tuple[bool, bool, datetime | None]:
     """Evaluate 2-reading sensor fault recovery.
 
     Returns (accept_value, new_fault_active, new_recovery_first_at).
     """
-    if parsed is None:
+    if parsed is None or not _is_finite_float(parsed):
         return False, True, None
 
     if not fault_active:
         return True, False, None
 
+    sample_at = report_at if report_at is not None else now
     if recovery_first_at is None:
-        return False, True, now
+        return False, True, sample_at
 
-    if (now - recovery_first_at).total_seconds() >= min_recovery_gap_sec:
+    if (sample_at - recovery_first_at).total_seconds() >= min_recovery_gap_sec:
         return True, False, None
 
     return False, True, recovery_first_at

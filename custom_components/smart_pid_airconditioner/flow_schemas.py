@@ -1061,7 +1061,7 @@ def process_pwm_sections_input(
     keep_alive = duration_to_seconds(user_input.get(CONF_KEEP_ALIVE), DEFAULT_KEEP_ALIVE)
     output_safety = float(user_input.get(CONF_OUTPUT_SAFETY, DEFAULT_OUTPUT_SAFETY))
 
-    if min_on + min_off > pwm_dur:
+    if pwm_dur <= 0 or (min_on + min_off) >= pwm_dur:
         errors["base"] = "min_times_exceed_pwm_duration"
         return errors, {}
 

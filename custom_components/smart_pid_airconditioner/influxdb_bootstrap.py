@@ -1267,34 +1267,60 @@ async def async_bootstrap_from_influxdb(
         warnings.append(
             "Zero minutes fell within the specified indoor temperature/humidity bounds; model parameters remain unchanged."
         )
+        existing_snap = runtime.snapshot
+        existing_rls = existing_snap.hum_rls if is_humidity else existing_snap.temp_rls
+        existing_coasting = existing_snap.coasting
+        existing_safety = existing_snap.safety
+        recommended = runtime.tuner.compute(
+            existing_rls,
+            prediction_mode=runtime.prediction_mode,
+            dead_time_min=existing_coasting.get_effective_dead_time(now_ts=end_dt.timestamp()),
+            baseline=runtime.baseline,
+        )
+        stage, _ = existing_safety.get_confidence_stage(
+            rls_samples=existing_rls.sample_count,
+            valid_cycles=existing_coasting.accepted_count,
+        )
+        applied = False
+        rls_updates = 0
+        rls_rejected_delta = 0
+        accepted_cycles_delta = 0
+        rejected_delta: dict[str, int] = {}
+        coast_factor = (
+            round(existing_coasting.k_afterglow, 4)
+            if existing_coasting.inertia_profile in (INERTIA_HIGH_INERTIA, INERTIA_CUSTOM)
+            else round(existing_coasting.tau_coast, 4)
+        )
+    else:
+        recommended = runtime.tuner.compute(
+            rls,
+            prediction_mode=runtime.prediction_mode,
+            dead_time_min=coasting.get_effective_dead_time(now_ts=end_dt.timestamp()),
+            baseline=runtime.baseline,
+        )
+        stage, _ = safety.get_confidence_stage(
+            rls_samples=rls.sample_count,
+            valid_cycles=coasting.accepted_count,
+        )
 
-    recommended = runtime.tuner.compute(
-        rls,
-        prediction_mode=runtime.prediction_mode,
-        dead_time_min=coasting.get_effective_dead_time(now_ts=end_dt.timestamp()),
-        baseline=runtime.baseline,
-    )
-    stage, _ = safety.get_confidence_stage(
-        rls_samples=rls.sample_count,
-        valid_cycles=coasting.accepted_count,
-    )
+        applied = False
+        if not dry_run:
+            await runtime.async_apply_bootstrapped_snapshot(snapshot)
+            applied = True
 
-    applied = False
-    if not dry_run:
-        await runtime.async_apply_bootstrapped_snapshot(snapshot)
-        applied = True
+        rls_rejected_delta = max(0, rls.rejected_outliers - init_rls_rejected)
+        accepted_cycles_delta = max(0, coasting.accepted_count - init_accepted)
+        rejected_delta = {}
+        for k, v in coasting.rejected_counts.items():
+            diff = v - init_rejected.get(k, 0)
+            if diff > 0:
+                rejected_delta[k] = diff
 
-    rejected_delta: dict[str, int] = {}
-    for k, v in coasting.rejected_counts.items():
-        diff = v - init_rejected.get(k, 0)
-        if diff > 0:
-            rejected_delta[k] = diff
-
-    coast_factor = (
-        round(coasting.k_afterglow, 4)
-        if coasting.inertia_profile in (INERTIA_HIGH_INERTIA, INERTIA_CUSTOM)
-        else round(coasting.tau_coast, 4)
-    )
+        coast_factor = (
+            round(coasting.k_afterglow, 4)
+            if coasting.inertia_profile in (INERTIA_HIGH_INERTIA, INERTIA_CUSTOM)
+            else round(coasting.tau_coast, 4)
+        )
 
     discovered_states: dict[str, Any] = {
         "device": {
@@ -1326,8 +1352,8 @@ async def async_bootstrap_from_influxdb(
         "skipped_out_of_range_minutes": skipped_out_of_range_minutes,
         "discovered_states": discovered_states,
         "rls_updates": rls_updates,
-        "rls_rejected_outliers": max(0, rls.rejected_outliers - init_rls_rejected),
-        "accepted_cycles": max(0, coasting.accepted_count - init_accepted),
+        "rls_rejected_outliers": rls_rejected_delta,
+        "accepted_cycles": accepted_cycles_delta,
         "rejected_cycles": rejected_delta,
         "learned_coast_factor": coast_factor,
         "recommended_kp": round(recommended.kp, 4),

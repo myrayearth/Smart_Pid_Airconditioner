@@ -154,6 +154,19 @@ async def test_integral_freeze_and_pwm_off_during_ventilation(hass) -> None:
     hass.states.async_set("binary_sensor.win1", "off")
     hass.states.async_set("switch.ac_plug", "on")
 
+    async def _turn_on(call) -> None:
+        eid = call.data.get("entity_id")
+        if isinstance(eid, str):
+            hass.states.async_set(eid, "on")
+
+    async def _turn_off(call) -> None:
+        eid = call.data.get("entity_id")
+        if isinstance(eid, str):
+            hass.states.async_set(eid, "off")
+
+    hass.services.async_register("switch", "turn_on", _turn_on)
+    hass.services.async_register("switch", "turn_off", _turn_off)
+
     entry = ConfigEntry(
         entry_id="vent_pwm",
         data={

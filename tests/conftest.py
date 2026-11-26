@@ -86,6 +86,7 @@ def _install_ha_stubs() -> None:
     const_mod.PERCENTAGE = "%"
     const_mod.ATTR_ENTITY_ID = "entity_id"
     const_mod.ATTR_TEMPERATURE = "temperature"
+    const_mod.EVENT_HOMEASSISTANT_STOP = "homeassistant_stop"
     const_mod.SERVICE_TURN_ON = "turn_on"
     const_mod.SERVICE_TURN_OFF = "turn_off"
     const_mod.STATE_ON = "on"
@@ -109,6 +110,7 @@ def _install_ha_stubs() -> None:
         attributes: dict[str, Any] = field(default_factory=dict)
         last_changed: datetime = field(default_factory=utcnow)
         last_updated: datetime = field(default_factory=utcnow)
+        last_reported: datetime = field(default_factory=utcnow)
         context: Context = field(default_factory=Context)
 
     @dataclass
@@ -121,7 +123,8 @@ def _install_ha_stubs() -> None:
         pass
 
     class StateMachine:
-        def __init__(self) -> None:
+        def __init__(self, hass: Any = None) -> None:
+            self._hass = hass
             self._states: dict[str, State] = {}
             self._listeners: list[tuple[set[str], Callable]] = []
 
@@ -145,6 +148,7 @@ def _install_ha_stubs() -> None:
                 attributes=dict(attributes or {}),
                 last_changed=now,
                 last_updated=now,
+                last_reported=now,
                 context=context or Context(),
             )
             self._states[entity_id] = st
@@ -161,7 +165,10 @@ def _install_ha_stubs() -> None:
                 if entity_id in entities:
                     res = cb(ev)
                     if asyncio.iscoroutine(res):
-                        res.close()
+                        if self._hass is not None and getattr(self._hass, "_run_async_state_listeners", False):
+                            self._hass.async_create_task(res)
+                        else:
+                            res.close()
 
         def async_entity_ids(self, domain: str | None = None) -> list[str]:
             if domain is None:
@@ -259,9 +266,12 @@ def _install_ha_stubs() -> None:
     class HomeAssistant:
         def __init__(self) -> None:
             self.data: dict[str, Any] = {}
-            self.states = StateMachine()
+            self.states = StateMachine(self)
             self.services = ServiceRegistry()
             self.config_entries = ConfigEntriesManager(self)
+            self.config = types.SimpleNamespace(
+                units=types.SimpleNamespace(temperature_unit=UnitOfTemperature.CELSIUS)
+            )
             self._tasks: list[asyncio.Task] = []
 
         def async_create_task(self, coro: Any, name: str | None = None) -> asyncio.Task:
@@ -270,9 +280,10 @@ def _install_ha_stubs() -> None:
             return task
 
         async def async_block_till_done(self) -> None:
-            if self._tasks:
-                await asyncio.gather(*self._tasks, return_exceptions=True)
+            while self._tasks:
+                batch = list(self._tasks)
                 self._tasks.clear()
+                await asyncio.gather(*batch, return_exceptions=True)
 
     def callback(func: Callable) -> Callable:
         return func
@@ -764,16 +775,25 @@ def _install_ha_stubs() -> None:
     def async_track_time_interval(
         hass: HomeAssistant, action: Callable, interval: timedelta
     ) -> Callable[[], None]:
+        clock = getattr(hass, "_virtual_clock", None)
+        if clock is not None:
+            return clock.schedule_interval(action, interval)
         return lambda: None
 
     def async_call_later(
         hass: HomeAssistant, delay: float, action: Callable
     ) -> Callable[[], None]:
+        clock = getattr(hass, "_virtual_clock", None)
+        if clock is not None:
+            return clock.call_later(delay, action)
         return lambda: None
 
     def async_track_point_in_time(
         hass: HomeAssistant, action: Callable, point_in_time: datetime
     ) -> Callable[[], None]:
+        clock = getattr(hass, "_virtual_clock", None)
+        if clock is not None:
+            return clock.track_point_in_time(action, point_in_time)
         return lambda: None
 
     ev_mod.async_track_state_change_event = async_track_state_change_event
@@ -946,6 +966,167 @@ def _reset_test_env():
     reg._entities.clear()
     reg._by_entity_id.clear()
     yield
+
+
+class VirtualBus:
+    """Test event bus supporting async_listen, async_listen_once, event_filter, and async tasks."""
+
+    def __init__(self, hass: HomeAssistant | None = None) -> None:
+        self._hass = hass
+        self._listeners: dict[
+            str,
+            list[tuple[Callable[[Any], Any], Callable[[Mapping[str, Any]], bool] | None]],
+        ] = {}
+
+    def async_listen(
+        self,
+        event_type: str,
+        listener: Callable[[Any], Any],
+        *,
+        event_filter: Callable[[Mapping[str, Any]], bool] | None = None,
+    ) -> Callable[[], None]:
+        from homeassistant.exceptions import HomeAssistantError
+
+        if event_type == "state_reported" and event_filter is None:
+            raise HomeAssistantError(f"Event filter is required for event {event_type}")
+        entry = (listener, event_filter)
+        self._listeners.setdefault(event_type, []).append(entry)
+
+        def _unsub() -> None:
+            lst = self._listeners.get(event_type, [])
+            if entry in lst:
+                lst.remove(entry)
+
+        return _unsub
+
+    def async_listen_once(
+        self,
+        event_type: str,
+        listener: Callable[[Any], Any],
+        *,
+        event_filter: Callable[[Mapping[str, Any]], bool] | None = None,
+    ) -> Callable[[], None]:
+        unsub_holder: list[Callable[[], None]] = []
+
+        def _once_wrapper(ev: Any) -> Any:
+            if unsub_holder:
+                unsub_holder[0]()
+            return listener(ev)
+
+        unsub = self.async_listen(event_type, _once_wrapper, event_filter=event_filter)
+        unsub_holder.append(unsub)
+        return unsub
+
+    def async_fire(self, event_type: str, event_data: dict[str, Any] | None = None) -> None:
+        from homeassistant.core import Event
+
+        ev = Event(event_type=event_type, data=dict(event_data or {}))
+        for cb, ev_filter in list(self._listeners.get(event_type, [])):
+            if ev_filter is None or ev_filter(ev.data):
+                res = cb(ev)
+                if asyncio.iscoroutine(res):
+                    if self._hass is not None:
+                        self._hass.async_create_task(res)
+                    else:
+                        res.close()
+
+    async def async_fire_and_wait(
+        self, event_type: str, event_data: dict[str, Any] | None = None
+    ) -> None:
+        from homeassistant.core import Event
+
+        ev = Event(event_type=event_type, data=dict(event_data or {}))
+        pending: list[Any] = []
+        for cb, ev_filter in list(self._listeners.get(event_type, [])):
+            if ev_filter is None or ev_filter(ev.data):
+                res = cb(ev)
+                if asyncio.iscoroutine(res):
+                    pending.append(res)
+        if pending:
+            await asyncio.gather(*pending)
+        if self._hass is not None:
+            await self._hass.async_block_till_done()
+
+    def listener_count(self, event_type: str) -> int:
+        return len(self._listeners.get(event_type, []))
+
+
+class VirtualClockHarness:
+    """Deterministic virtual clock executing scheduled HA timers and async state listeners."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        *,
+        run_async_state_listeners: bool = True,
+        attach_bus: bool = True,
+    ) -> None:
+        self.hass = hass
+        self._seq = 0
+        # List of [fire_at, seq, interval_td | None, action, cancelled]
+        self._timers: list[list[Any]] = []
+        hass._virtual_clock = self  # type: ignore[attr-defined]
+        if run_async_state_listeners:
+            hass._run_async_state_listeners = True  # type: ignore[attr-defined]
+        if attach_bus and not hasattr(hass, "bus"):
+            hass.bus = VirtualBus(hass)  # type: ignore[attr-defined]
+
+    def _add_timer(
+        self, fire_at: datetime, action: Callable[[datetime], Any], interval: timedelta | None = None
+    ) -> Callable[[], None]:
+        self._seq += 1
+        rec: list[Any] = [fire_at, self._seq, interval, action, False]
+        self._timers.append(rec)
+
+        def _cancel() -> None:
+            rec[4] = True
+
+        return _cancel
+
+    def call_later(self, delay: float, action: Callable[[datetime], Any]) -> Callable[[], None]:
+        fire_at = dt_util.utcnow() + timedelta(seconds=max(0.0, float(delay)))
+        return self._add_timer(fire_at, action, None)
+
+    def track_point_in_time(
+        self, action: Callable[[datetime], Any], point_in_time: datetime
+    ) -> Callable[[], None]:
+        return self._add_timer(point_in_time, action, None)
+
+    def schedule_interval(
+        self, action: Callable[[datetime], Any], interval: timedelta
+    ) -> Callable[[], None]:
+        return self._add_timer(dt_util.utcnow() + interval, action, interval)
+
+    async def flush(self) -> None:
+        await self.hass.async_block_till_done()
+
+    async def advance(self, seconds: float) -> None:
+        target = dt_util.utcnow() + timedelta(seconds=float(seconds))
+        while True:
+            active = [t for t in self._timers if not t[4] and t[0] <= target]
+            if not active:
+                break
+            active.sort(key=lambda t: (t[0], t[1]))
+            rec = active[0]
+            fire_at, _seq, interval, action, cancelled = rec
+            if cancelled:
+                continue
+            if interval is not None:
+                rec[0] = fire_at + interval
+            else:
+                rec[4] = True
+            dt_util.set_utcnow(fire_at)
+            res = action(fire_at)
+            if asyncio.iscoroutine(res):
+                await res
+            await self.hass.async_block_till_done()
+        dt_util.set_utcnow(target)
+        await self.hass.async_block_till_done()
+
+
+@pytest.fixture
+def virtual_clock(hass: HomeAssistant) -> VirtualClockHarness:
+    return VirtualClockHarness(hass)
 
 
 @pytest.fixture

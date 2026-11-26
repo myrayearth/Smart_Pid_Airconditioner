@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
@@ -438,22 +439,102 @@ class HuberRLS:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> HuberRLS:
+    def from_dict(cls, data: Mapping[str, Any]) -> HuberRLS:
+        if not isinstance(data, Mapping):
+            raise ValueError("HuberRLS snapshot must be a mapping")
+
+        def _fin(val: Any, name: str) -> float:
+            if isinstance(val, bool):
+                raise ValueError(f"Invalid boolean for {name}")
+            try:
+                fval = float(val)
+            except (ValueError, TypeError) as err:
+                raise ValueError(f"Invalid float for {name}: {val!r}") from err
+            if not math.isfinite(fval):
+                raise ValueError(f"Non-finite value for {name}: {val!r}")
+            return fval
+
+        def _int(val: Any, name: str) -> int:
+            if isinstance(val, bool):
+                raise ValueError(f"Invalid boolean for {name}")
+            try:
+                return int(val)
+            except (ValueError, TypeError) as err:
+                raise ValueError(f"Invalid integer for {name}: {val!r}") from err
+
+        n_features = _int(data.get("n_features", 2), "n_features")
+        if n_features < 1:
+            raise ValueError(f"Invalid n_features={n_features}")
+
+        forgetting = _fin(data.get("forgetting", 0.992), "forgetting")
+        if not (0.0 < forgetting <= 1.0):
+            raise ValueError(f"Invalid forgetting={forgetting}")
+
+        p_min = _fin(data.get("p_min", 1e-6), "p_min")
+        p_max = _fin(data.get("p_max", 50.0), "p_max")
+        if p_min <= 0.0 or p_max < p_min:
+            raise ValueError(f"Invalid covariance bounds p_min={p_min}, p_max={p_max}")
+
+        warmup_samples = _int(data.get("warmup_samples", 20), "warmup_samples")
+        if warmup_samples < 0:
+            raise ValueError(f"Invalid warmup_samples={warmup_samples}")
+
+        huber_delta = _fin(data.get("huber_delta", 0.04), "huber_delta")
+        hard_reject = _fin(data.get("hard_reject", 0.12), "hard_reject")
+        if huber_delta <= 0.0 or hard_reject <= 0.0:
+            raise ValueError(f"Invalid huber thresholds ({huber_delta}, {hard_reject})")
+
+        parsed_theta: list[float] | None = None
+        if "theta" in data:
+            raw_theta = data["theta"]
+            if not isinstance(raw_theta, list) or len(raw_theta) != n_features:
+                raise ValueError("Invalid RLS theta length")
+            parsed_theta = [_fin(v, "theta") for v in raw_theta]
+
+        parsed_bounds: list[tuple[float, float]] | None = None
+        if "bounds" in data:
+            raw_bounds = data["bounds"]
+            if not isinstance(raw_bounds, list) or len(raw_bounds) != n_features:
+                raise ValueError("Invalid RLS bounds length")
+            parsed_bounds = []
+            for b in raw_bounds:
+                if not isinstance(b, (list, tuple)) or len(b) != 2:
+                    raise ValueError("Invalid RLS bound entry")
+                lo = _fin(b[0], "bounds.lo")
+                hi = _fin(b[1], "bounds.hi")
+                if lo > hi:
+                    raise ValueError("Invalid RLS bound ordering")
+                parsed_bounds.append((lo, hi))
+
         obj = cls(
-            n_features=int(data.get("n_features", 2)),
-            initial_theta=data.get("theta"),
-            bounds=[tuple(b) for b in data["bounds"]] if "bounds" in data else None,
-            forgetting=float(data.get("forgetting", 0.992)),
-            p_min=float(data.get("p_min", 1e-6)),
-            p_max=float(data.get("p_max", 50.0)),
-            warmup_samples=int(data.get("warmup_samples", 20)),
-            huber_delta=float(data.get("huber_delta", 0.04)),
-            hard_reject=float(data.get("hard_reject", 0.12)),
+            n_features=n_features,
+            initial_theta=parsed_theta,
+            bounds=parsed_bounds,
+            forgetting=forgetting,
+            p_min=p_min,
+            p_max=p_max,
+            warmup_samples=warmup_samples,
+            huber_delta=huber_delta,
+            hard_reject=hard_reject,
         )
-        if "P" in data and isinstance(data["P"], list):
-            obj.P = [[float(v) for v in row] for row in data["P"]]
-        obj.sample_count = int(data.get("sample_count", 0))
-        obj.rejected_outliers = int(data.get("rejected_outliers", 0))
+
+        if "P" in data:
+            raw_p = data["P"]
+            if not isinstance(raw_p, list) or len(raw_p) != n_features:
+                raise ValueError("Invalid RLS covariance matrix P dimensions")
+            parsed_p: list[list[float]] = []
+            for row in raw_p:
+                if not isinstance(row, list) or len(row) != n_features:
+                    raise ValueError("Invalid RLS covariance matrix P row dimensions")
+                parsed_p.append([_fin(v, "P") for v in row])
+            obj.P = parsed_p
+
+        sample_count = _int(data.get("sample_count", 0), "sample_count")
+        rejected_outliers = _int(data.get("rejected_outliers", 0), "rejected_outliers")
+        if sample_count < 0 or rejected_outliers < 0:
+            raise ValueError("Negative RLS sample/outlier count")
+        obj.sample_count = sample_count
+        obj.rejected_outliers = rejected_outliers
         return obj
 
 

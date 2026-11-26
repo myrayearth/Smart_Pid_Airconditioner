@@ -12,7 +12,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
-from homeassistant.exceptions import ConfigEntryError, HomeAssistantError
+from homeassistant.exceptions import ConfigEntryError, HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 import homeassistant.util.dt as dt_util
 
@@ -144,22 +144,60 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault("owners", {})
     hass.data[DOMAIN].setdefault("reload_off", {})
+    hass.data[DOMAIN].setdefault("reload_unverified_off", {})
 
     async def _async_handle_reset_learning(call: ServiceCall) -> None:
-        target_entry_id = call.data.get("entry_id")
-        target_entity_id = call.data.get("entity_id")
+        raw_entry_id = call.data.get("entry_id")
+        raw_entity_id = call.data.get("entity_id")
+        entry_id_provided = "entry_id" in call.data and raw_entry_id is not None
+        entity_id_provided = "entity_id" in call.data and raw_entity_id is not None
         runtimes = _iter_runtimes(hass)
 
-        if target_entry_id and target_entry_id in runtimes:
-            await runtimes[target_entry_id].async_reset_learning()
-            return
+        if entry_id_provided or entity_id_provided:
+            selected_runtimes: list[SmartPIDRuntime] = []
 
-        if target_entity_id:
-            rt = _resolve_runtime_for_entity(hass, target_entity_id)
-            if rt is not None:
-                await rt.async_reset_learning()
-                return
-            for rt in list(runtimes.values()):
+            entry_runtime: SmartPIDRuntime | None = None
+            if entry_id_provided:
+                target_entry_id = str(raw_entry_id).strip()
+                if not target_entry_id or target_entry_id not in runtimes:
+                    raise ServiceValidationError(
+                        f"Could not find an active Smart PID controller for entry_id '{raw_entry_id}'."
+                    )
+                entry_runtime = runtimes[target_entry_id]
+                selected_runtimes.append(entry_runtime)
+
+            if entity_id_provided:
+                if isinstance(raw_entity_id, str):
+                    target_entity_ids = [raw_entity_id.strip()] if raw_entity_id.strip() else []
+                elif isinstance(raw_entity_id, (list, tuple, set)):
+                    target_entity_ids = [
+                        str(e).strip() for e in raw_entity_id if e is not None and str(e).strip()
+                    ]
+                else:
+                    target_entity_ids = []
+
+                if not target_entity_ids:
+                    raise ServiceValidationError(
+                        f"Invalid or empty entity_id '{raw_entity_id}' specified for reset_learning."
+                    )
+
+                entity_runtimes: list[SmartPIDRuntime] = []
+                for eid in target_entity_ids:
+                    rt = _resolve_runtime_for_entity(hass, eid)
+                    if rt is None:
+                        raise ServiceValidationError(
+                            f"Could not find an active Smart PID controller for entity_id '{eid}'."
+                        )
+                    if entry_runtime is not None and rt is not entry_runtime:
+                        raise ServiceValidationError(
+                            f"Target entity_id '{eid}' does not match specified entry_id '{raw_entry_id}'."
+                        )
+                    entity_runtimes.append(rt)
+
+                if not entry_id_provided:
+                    selected_runtimes.extend(entity_runtimes)
+
+            for rt in dict.fromkeys(selected_runtimes):
                 await rt.async_reset_learning()
             return
 
@@ -245,6 +283,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     owners: dict[str, str] = hass.data[DOMAIN].setdefault("owners", {})
     hass.data[DOMAIN].setdefault("reload_off", {})
+    hass.data[DOMAIN].setdefault("reload_unverified_off", {})
     await async_setup(hass, {})
 
     target_devices = extract_target_devices(dict(entry.data), dict(entry.options))

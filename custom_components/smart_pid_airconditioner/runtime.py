@@ -7,6 +7,7 @@ from collections.abc import Mapping
 import contextlib
 from datetime import datetime, time as dt_time, timedelta
 import logging
+import math
 import time
 from typing import Any, Callable
 
@@ -102,7 +103,7 @@ from .learner import (
     SimcAutoTuner,
     TuningParameters,
 )
-from .config_utils import get_entry_setting
+from .config_utils import get_entry_setting, parse_temperature_state
 from .psychrometrics import rh_to_ah
 from .storage import LearningStateSnapshot, ModelStore
 from .ventilation import VentState, VentStatus
@@ -442,8 +443,13 @@ class SmartPIDRuntime:
         if self.aux_temp_sensor:
             st = self.hass.states.get(self.aux_temp_sensor)
             if st is not None and st.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-                try:
-                    temp_c = float(st.state)
+                default_unit = getattr(
+                    getattr(getattr(self.hass, "config", None), "units", None),
+                    "temperature_unit",
+                    None,
+                )
+                temp_c = parse_temperature_state(st, default_unit=default_unit)
+                if temp_c is not None:
                     ah_in = rh_to_ah(temp_c, self._obs_indoor)
                     ah_out = (
                         rh_to_ah(temp_c, self._obs_outdoor)
@@ -451,8 +457,6 @@ class SmartPIDRuntime:
                         else None
                     )
                     return ah_in, ah_out, None
-                except (ValueError, TypeError):
-                    pass
             return self._obs_indoor, self._obs_outdoor, "aux_temp_unavailable_rh_fallback"
 
         return self._obs_indoor, self._obs_outdoor, "no_aux_temp_rh_fallback"
@@ -1067,6 +1071,8 @@ class SmartPIDRuntime:
             try:
                 v0 = float(prev_st.state)
                 v1 = float(curr_st.state)
+                if not (math.isfinite(v0) and math.isfinite(v1)):
+                    continue
                 dt_min = max(1.0, (curr_st.last_changed - prev_st.last_changed).total_seconds() / 60.0)
                 if dt_min <= 15.0:
                     dy = (v1 - v0) / dt_min
