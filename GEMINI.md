@@ -1,6 +1,6 @@
 ---
 name: smart-pid-airconditioner
-version: "1.0.0"
+version: "1.1.0"
 project_name: "Smart PID Air Conditioner"
 default_tier: 2          # 1: 즉시 실행 / 2: 요약 후 실행 / 3: Plan 승인 필수
 strict_test: true        # true일 경우 테스트/검증 결과 보고 필수
@@ -33,4 +33,11 @@ github_repo: "https://github.com/myrayearth/smart_pid_airconditioner.git"
    - PID 제어, PWM 스위칭, 공조기/릴레이 제어 시 센서 값 결측(`unavailable`/`unknown`)이나 통신 두절에 대비한 안전 정지(Fallback) 로직을 반드시 포함한다.
    - 릴레이나 압축기의 물리적 손상을 막기 위해 최소 작동/휴지 시간(Min Cycle Duration) 제약을 코드 수준에서 강제한다.
 4. **다국어 및 UI 설정**: Config Flow 구현 시 한국어 번역 파일(`translations/ko.json`)을 항상 동기화해 작성한다.
-5. **작업 완료 시 자동 버전업 및 릴리스 (Auto Release)**: 기능 구현·수정 및 테스트 검증이 완료되면 별도 요청 없이도 `CHANGELOG.md` 버전 규칙(메이저 기능 업데이트 +0.1, 마이너/버그 픽스 +0.0.1)에 따라 `manifest.json`과 `CHANGELOG.md`를 버전업하고, 커밋 → Git 태그(`vX.Y.Z`) 생성 → 원격(`origin main` 및 태그) 푸시까지 자동으로 일괄 완료한다.
+5. **작업 완료 시 자동 버전업 (Auto Version Bump)**: 컴포넌트 기능 구현·수정 및 테스트 검증이 완료되면 별도 요청 없이도 `CHANGELOG.md` 버전 규칙(메이저 기능 업데이트 +0.1, 마이너/버그 픽스 +0.0.1)에 따라 `manifest.json`과 `CHANGELOG.md`를 버전업하고 Git 태그(`vX.Y.Z`)를 생성한다. (규칙/문서 전용 변경은 버전업 제외)
+6. **대기열 기반 Git 커밋 · GitHub 푸시 · HA 커스텀 컴포넌트 업데이트**:
+   - **모든 요청에 `git commit` 진행**: 파일 변경이 발생한 모든 요청 완료 시 반드시 로컬 `git commit`을 수행한다.
+   - **대기열 확인 (`t3_queue(action="list")`) 후 분기**:
+     - **대기열에 다음 요청이 등록되어 있는 경우**: `git commit`까지만 진행하고(GitHub 푸시 및 HA 업데이트 보류), 즉시 다음 요청을 수행한다.
+     - **대기열에 등록된 다음 요청이 없는 경우**:
+       1. 로컬 커밋(및 생성된 `vX.Y.Z` 태그)을 원격 저장소(`origin main` 및 태그)로 **GitHub 푸시**한다.
+       2. Home Assistant MCP(`ha_manage_hacs`: `action="update_information"` → `action="download"`, `repository_id="myrayearth/Smart_Pid_Airconditioner"`)를 호출해 **HA 커스텀 컴포넌트 업데이트**를 진행한다. (최신 GitHub 릴리스가 이미 HA에 설치되어 있으면 생략한다.)
