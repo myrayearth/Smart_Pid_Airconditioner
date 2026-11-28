@@ -16,8 +16,11 @@ from homeassistant.exceptions import ConfigEntryError, HomeAssistantError, Servi
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 import homeassistant.util.dt as dt_util
 
+from .config_utils import get_entry_setting
 from .const import (
+    CONF_CONTROL_MODE,
     CONF_KI,
+    CONF_SAMPLE_PERIOD,
     CONF_TARGET_CLIMATE,
     CONF_TARGET_DEVICE,
     CONF_TARGET_DEVICE_COOL,
@@ -25,12 +28,18 @@ from .const import (
     CONF_TARGET_DEVICE_HEAT,
     CONF_TARGET_DEVICE_HUMIDITY,
     CONF_THERMOSTAT_TYPE,
+    CONTROL_MODE_SWITCH_PWM,
+    DEFAULT_CONTROL_MODE,
+    DEFAULT_SAMPLE_PERIOD,
     DEFAULT_THERMOSTAT_TYPE,
     DOMAIN,
     PLATFORMS,
     SERVICE_BOOTSTRAP_INFLUXDB,
     SERVICE_RESET_LEARNING,
+    THERMOSTAT_TYPE_HEAT_COOL,
+    THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY,
     is_humidity_type,
+    resolve_thermostat_type,
 )
 from .influxdb_bootstrap import async_bootstrap_from_influxdb
 from .runtime import SmartPIDRuntime
@@ -50,17 +59,60 @@ _TARGET_DEVICE_KEYS = (
 )
 
 
-def extract_target_devices(data: dict[str, Any], options: dict[str, Any] | None = None) -> set[str]:
+def extract_target_devices(
+    data: Mapping[str, Any], options: Mapping[str, Any] | None = None
+) -> set[str]:
     """Return set of all configured target device entity IDs from options/data."""
     devices: set[str] = set()
     opts = options or {}
     for key in _TARGET_DEVICE_KEYS:
-        val = opts.get(key)
-        if not val:
-            val = data.get(key)
+        val = opts[key] if key in opts else data.get(key)
         if isinstance(val, str) and val.strip():
             devices.add(val.strip())
     return devices
+
+
+def validate_entry_target_devices(entry: ConfigEntry) -> None:
+    """Reject dual PWM entries configured with the same device for opposing roles."""
+    control_mode = str(get_entry_setting(entry, CONF_CONTROL_MODE, DEFAULT_CONTROL_MODE))
+    if control_mode != CONTROL_MODE_SWITCH_PWM:
+        return
+    thermostat_type = resolve_thermostat_type(entry)
+    if thermostat_type == THERMOSTAT_TYPE_HEAT_COOL:
+        cool_dev = str(get_entry_setting(entry, CONF_TARGET_DEVICE_COOL, "") or "").strip()
+        heat_dev = str(get_entry_setting(entry, CONF_TARGET_DEVICE_HEAT, "") or "").strip()
+        if cool_dev and heat_dev and cool_dev == heat_dev:
+            raise ConfigEntryError(
+                f"Dual PWM heat_cool entry '{entry.entry_id}' cannot assign '{cool_dev}' to both cool and heat."
+            )
+    elif thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
+        dehum_dev = str(get_entry_setting(entry, CONF_TARGET_DEVICE_DEHUMIDITY, "") or "").strip()
+        hum_dev = str(get_entry_setting(entry, CONF_TARGET_DEVICE_HUMIDITY, "") or "").strip()
+        if dehum_dev and hum_dev and dehum_dev == hum_dev:
+            raise ConfigEntryError(
+                f"Dual PWM humidity_dehumidity entry '{entry.entry_id}' cannot assign '{dehum_dev}' to both humidity and dehumidity."
+            )
+
+
+def _strict_bool(val: Any) -> bool:
+    """Validate that a service parameter is strictly a boolean."""
+    if isinstance(val, bool):
+        return val
+    raise vol.Invalid(f"Expected boolean true/false, got {val!r}")
+
+
+def _single_entity_id(val: Any) -> str:
+    """Accept a single non-empty entity_id string or 1-element list and return stripped string."""
+    if isinstance(val, str):
+        stripped = val.strip()
+        if stripped:
+            return stripped
+        raise vol.Invalid("entity_id must not be empty")
+    if isinstance(val, (list, tuple)):
+        if len(val) != 1 or not isinstance(val[0], str) or not val[0].strip():
+            raise vol.Invalid("entity_id must contain a single non-empty entity ID")
+        return val[0].strip()
+    raise vol.Invalid("entity_id must be a single entity ID string")
 
 
 _OPT_FLOAT = vol.Any(None, "", vol.Coerce(float))
@@ -68,7 +120,7 @@ _OPT_INT = vol.Any(None, "", vol.All(vol.Coerce(float), vol.Coerce(int)))
 
 _BOOTSTRAP_SERVICE_SCHEMA = vol.Schema(
     {
-        vol.Required("entity_id"): vol.Any(str, [str]),
+        vol.Required("entity_id"): _single_entity_id,
         vol.Optional("url"): vol.Any(None, str),
         vol.Optional("database"): vol.Any(None, str),
         vol.Optional("username"): vol.Any(None, str),
@@ -93,8 +145,8 @@ _BOOTSTRAP_SERVICE_SCHEMA = vol.Schema(
         vol.Optional("outdoor_measurement"): vol.Any(None, str),
         vol.Optional("device_measurement"): vol.Any(None, str),
         vol.Optional("ventilation_measurement"): vol.Any(None, str),
-        vol.Optional("reset_existing"): vol.Any(None, bool),
-        vol.Optional("dry_run"): vol.Any(None, bool),
+        vol.Optional("reset_existing"): _strict_bool,
+        vol.Optional("dry_run"): _strict_bool,
     },
     extra=vol.ALLOW_EXTRA,
 )
@@ -145,6 +197,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data[DOMAIN].setdefault("owners", {})
     hass.data[DOMAIN].setdefault("reload_off", {})
     hass.data[DOMAIN].setdefault("reload_unverified_off", {})
+    hass.data[DOMAIN].setdefault("overheat_latched", {})
 
     async def _async_handle_reset_learning(call: ServiceCall) -> None:
         raw_entry_id = call.data.get("entry_id")
@@ -205,11 +258,26 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             await rt.async_reset_learning()
 
     async def _async_handle_bootstrap_influxdb(call: ServiceCall) -> dict[str, Any]:
-        raw_eid = call.data.get("entity_id", "")
-        if isinstance(raw_eid, list):
-            target_entity_id = str(raw_eid[0]).strip() if raw_eid else ""
+        raw_eid = call.data.get("entity_id")
+        if isinstance(raw_eid, (list, tuple)):
+            if len(raw_eid) != 1 or not isinstance(raw_eid[0], str) or not raw_eid[0].strip():
+                raise ServiceValidationError(
+                    "entity_id must be a single non-empty Smart PID entity ID."
+                )
+            target_entity_id = raw_eid[0].strip()
+        elif isinstance(raw_eid, str) and raw_eid.strip():
+            target_entity_id = raw_eid.strip()
         else:
-            target_entity_id = str(raw_eid).strip()
+            raise ServiceValidationError(
+                "entity_id must be a single non-empty Smart PID entity ID."
+            )
+
+        for bool_key in ("dry_run", "reset_existing"):
+            if bool_key in call.data and not isinstance(call.data[bool_key], bool):
+                raise ServiceValidationError(
+                    f"'{bool_key}' must be a boolean (true/false), got {call.data[bool_key]!r}."
+                )
+
         runtime = _resolve_runtime_for_entity(hass, target_entity_id)
         if runtime is None:
             raise HomeAssistantError(
@@ -275,6 +343,63 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
             options=new_options,
             version=2,
         )
+
+    if config_entry.version == 2:
+        _LOGGER.info(
+            "Migrating Smart PID config entry %s from v2 to v3 (humidity per-minute Ki normalization)",
+            config_entry.entry_id,
+        )
+        new_data = dict(config_entry.data)
+        new_options = dict(config_entry.options)
+        thermostat_type = resolve_thermostat_type(config_entry)
+        if is_humidity_type(thermostat_type):
+            try:
+                sample_period = max(
+                    1,
+                    int(
+                        float(
+                            get_entry_setting(
+                                config_entry, CONF_SAMPLE_PERIOD, DEFAULT_SAMPLE_PERIOD
+                            )
+                        )
+                    ),
+                )
+            except (ValueError, TypeError):
+                sample_period = DEFAULT_SAMPLE_PERIOD
+            scale = 60.0 / float(sample_period)
+            if abs(scale - 1.0) > 1e-9:
+                def _scale_hum_ki_in_dict(d: dict[str, Any]) -> None:
+                    if CONF_KI in d and d[CONF_KI] is not None:
+                        try:
+                            d[CONF_KI] = round(
+                                max(0.0, min(100.0, float(d[CONF_KI]) * scale)), 4
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                    raw_ki_group = d.get("ki_group")
+                    if (
+                        isinstance(raw_ki_group, Mapping)
+                        and CONF_KI in raw_ki_group
+                        and raw_ki_group[CONF_KI] is not None
+                    ):
+                        ki_group = dict(raw_ki_group)
+                        d["ki_group"] = ki_group
+                        try:
+                            ki_group[CONF_KI] = round(
+                                max(0.0, min(100.0, float(ki_group[CONF_KI]) * scale)), 4
+                            )
+                        except (ValueError, TypeError):
+                            pass
+
+                _scale_hum_ki_in_dict(new_data)
+                _scale_hum_ki_in_dict(new_options)
+
+        hass.config_entries.async_update_entry(
+            config_entry,
+            data=new_data,
+            options=new_options,
+            version=3,
+        )
     return True
 
 
@@ -284,8 +409,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     owners: dict[str, str] = hass.data[DOMAIN].setdefault("owners", {})
     hass.data[DOMAIN].setdefault("reload_off", {})
     hass.data[DOMAIN].setdefault("reload_unverified_off", {})
+    hass.data[DOMAIN].setdefault("overheat_latched", {})
     await async_setup(hass, {})
 
+    validate_entry_target_devices(entry)
     target_devices = extract_target_devices(dict(entry.data), dict(entry.options))
     for dev_id in target_devices:
         existing_owner = owners.get(dev_id)
@@ -294,28 +421,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 f"Target device '{dev_id}' is already controlled by another Smart PID entry ({existing_owner})."
             )
 
-    for dev_id in target_devices:
-        owners[dev_id] = entry.entry_id
-
-    runtime = SmartPIDRuntime(hass, entry)
+    reserved_devices: list[str] = []
+    runtime: SmartPIDRuntime | None = None
+    runtime_started = False
+    platforms_forwarded = False
     try:
+        for dev_id in target_devices:
+            owners[dev_id] = entry.entry_id
+            reserved_devices.append(dev_id)
+
+        runtime = SmartPIDRuntime(hass, entry)
         await runtime.async_setup()
+        runtime_started = True
         entry.runtime_data = runtime
         hass.data[DOMAIN][entry.entry_id] = runtime
+        platforms_forwarded = True
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except Exception:
-        try:
-            await runtime.async_unload()
-        except Exception as unload_err:
-            _LOGGER.warning(
-                "Error rolling back runtime during failed setup for %s: %s",
-                entry.entry_id,
-                unload_err,
-            )
-        hass.data[DOMAIN].pop(entry.entry_id, None)
-        if getattr(entry, "runtime_data", None) is runtime:
-            entry.runtime_data = None
-        for dev_id in target_devices:
+        if platforms_forwarded:
+            try:
+                await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+            except Exception as plat_err:
+                _LOGGER.warning(
+                    "Error unloading platforms during failed setup for %s: %s",
+                    entry.entry_id,
+                    plat_err,
+                )
+        if runtime is not None and runtime_started:
+            try:
+                await runtime.async_unload()
+            except Exception as unload_err:
+                _LOGGER.warning(
+                    "Error rolling back runtime during failed setup for %s: %s",
+                    entry.entry_id,
+                    unload_err,
+                )
+        if runtime is not None:
+            if hass.data[DOMAIN].get(entry.entry_id) is runtime:
+                hass.data[DOMAIN].pop(entry.entry_id, None)
+            if getattr(entry, "runtime_data", None) is runtime:
+                entry.runtime_data = None
+        for dev_id in reversed(reserved_devices):
             if owners.get(dev_id) == entry.entry_id:
                 owners.pop(dev_id, None)
         raise
@@ -359,4 +505,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Clean up persisted learning storage when a config entry is deleted."""
+    domain_data = hass.data.get(DOMAIN)
+    if isinstance(domain_data, dict):
+        latches = domain_data.get("overheat_latched")
+        if isinstance(latches, dict):
+            latches.pop(entry.entry_id, None)
     await ModelStore(hass, entry.entry_id).async_remove()

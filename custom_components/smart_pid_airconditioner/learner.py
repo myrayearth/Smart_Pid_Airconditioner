@@ -1544,6 +1544,7 @@ class TuningSafetyManager:
         self.lifetime_applies: int = 0
         self.rollback_count: int = 0
         self.active_snapshot: TuningSnapshot | None = None
+        self.applied_params: TuningParameters | None = None
         self.last_fallback_reason: str | None = None
 
         # Cumulative coasting prediction accuracy (MAE) tracking
@@ -1608,6 +1609,7 @@ class TuningSafetyManager:
         prev_params: TuningParameters,
         baseline_mae: float,
         baseline_overshoot: float,
+        applied_params: TuningParameters | None = None,
     ) -> None:
         """Save snapshot before applying new SIMC parameters."""
         self.active_snapshot = TuningSnapshot(
@@ -1615,6 +1617,8 @@ class TuningSafetyManager:
             baseline_mae=max(0.05, float(baseline_mae)),
             baseline_overshoot=max(0.05, float(baseline_overshoot)),
         )
+        if applied_params is not None:
+            self.applied_params = applied_params
         self.season_applies += 1
         self.lifetime_applies += 1
 
@@ -1643,6 +1647,7 @@ class TuningSafetyManager:
         if mae_degraded or overshoot_degraded:
             self.rollback_count += 1
             self.last_fallback_reason = "auto_rollback_performance_degraded"
+            self.applied_params = snap.params
             return snap.params
 
         self.last_fallback_reason = None
@@ -1662,6 +1667,9 @@ class TuningSafetyManager:
             "last_signed_coast_error": self.last_signed_coast_error,
             "active_snapshot": (
                 self.active_snapshot.to_dict() if self.active_snapshot is not None else None
+            ),
+            "applied_params": (
+                self.applied_params.to_dict() if self.applied_params is not None else None
             ),
         }
 
@@ -1695,6 +1703,12 @@ class TuningSafetyManager:
             else None
         )
         snap_raw = data.get("active_snapshot")
-        if isinstance(snap_raw, dict):
-            obj.active_snapshot = TuningSnapshot.from_dict(snap_raw)
+        if isinstance(snap_raw, Mapping):
+            obj.active_snapshot = TuningSnapshot.from_dict(dict(snap_raw))
+        applied_raw = data.get("applied_params")
+        if isinstance(applied_raw, Mapping):
+            try:
+                obj.applied_params = TuningParameters.from_dict(dict(applied_raw))
+            except (TypeError, ValueError):
+                obj.applied_params = None
         return obj

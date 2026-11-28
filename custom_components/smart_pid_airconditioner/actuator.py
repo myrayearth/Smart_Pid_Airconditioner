@@ -1,4 +1,4 @@
-"""Bounded switch command guard with OFF preemption, state confirmation, and retry."""
+"""Bounded switch command guard with OFF preemption, in-flight ON tracking, timeout, and retry."""
 
 from __future__ import annotations
 
@@ -38,12 +38,21 @@ class SwitchCommandGuard:
         *,
         confirm_timeout: float = DEFAULT_SWITCH_CONFIRM_TIMEOUT,
         off_retry_delays: tuple[float, ...] = DEFAULT_SWITCH_OFF_RETRY_DELAYS,
+        service_timeout: float | None = None,
     ) -> None:
         self.hass = hass
         self.confirm_timeout = float(confirm_timeout)
         self.off_retry_delays = tuple(float(d) for d in off_retry_delays)
+        self.service_timeout = (
+            max(0.05, float(service_timeout))
+            if service_timeout is not None
+            else max(self.confirm_timeout, 2.0)
+        )
         self._generations: dict[str, int] = {}
+        self._off_requested_gen: dict[str, int] = {}
         self._pending_off: set[str] = set()
+        self._inflight_on_counts: dict[str, int] = {}
+        self._inflight_on_done: dict[str, asyncio.Event] = {}
         self.last_error: dict[str, str] = {}
         self.failure_counts: dict[str, int] = {}
 
@@ -58,9 +67,13 @@ class SwitchCommandGuard:
         """Return True only when switch state is explicitly confirmed OFF."""
         return self._is_confirmed_state(entity_id, STATE_OFF)
 
+    def has_inflight_on(self, entity_id: str) -> bool:
+        """Return True when a turn_on service call is currently executing for entity_id."""
+        return self._inflight_on_counts.get(entity_id, 0) > 0
+
     def is_confirmed_off(self, entity_id: str) -> bool:
-        """Public wrapper returning True only when switch state is explicitly confirmed OFF."""
-        return self._is_confirmed_off(entity_id)
+        """Public wrapper returning True only when explicitly OFF and no turn_on is in flight."""
+        return self._is_confirmed_off(entity_id) and not self.has_inflight_on(entity_id)
 
     def is_off_pending(self, entity_id: str) -> bool:
         """Return True if an OFF confirmation retry sequence is currently in progress."""
@@ -71,16 +84,53 @@ class SwitchCommandGuard:
         self._generations[entity_id] = gen
         return gen
 
-    async def _call_switch_service(self, entity_id: str, service: str) -> bool:
+    def _was_preempted_by_off(self, entity_id: str, on_gen: int) -> bool:
+        """Return True if an OFF request superseded on_gen without a newer ON superseding that OFF."""
+        off_gen = self._off_requested_gen.get(entity_id, 0)
+        if off_gen <= on_gen:
+            return entity_id in self._pending_off
+        cur_gen = self._generations.get(entity_id, 0)
+        return cur_gen == off_gen or entity_id in self._pending_off
+
+    async def _async_corrective_off(self, entity_id: str) -> None:
+        """Send corrective OFF when a delayed ON finishes after an OFF preemption."""
+        if entity_id in self._pending_off:
+            return
+        if self._is_confirmed_off(entity_id) and not self.has_inflight_on(entity_id):
+            return
+        _LOGGER.warning(
+            "Preempted turn_on completed for %s after OFF; issuing corrective turn_off",
+            entity_id,
+        )
+        await self.async_turn_off(entity_id, confirm=True)
+
+    async def _call_switch_service(
+        self,
+        entity_id: str,
+        service: str,
+        *,
+        timeout: float | None = None,
+    ) -> bool:
         target_domain = entity_id.split(".")[0] if "." in entity_id else "homeassistant"
+        call_timeout = self.service_timeout if timeout is None else max(0.01, float(timeout))
         try:
-            await self.hass.services.async_call(
+            async with asyncio.timeout(call_timeout):
+                await self.hass.services.async_call(
+                    target_domain,
+                    service,
+                    {ATTR_ENTITY_ID: entity_id},
+                    blocking=True,
+                )
+            return True
+        except TimeoutError:
+            _LOGGER.warning(
+                "Switch service %s.%s timed out after %.2fs for %s",
                 target_domain,
                 service,
-                {ATTR_ENTITY_ID: entity_id},
-                blocking=True,
+                call_timeout,
+                entity_id,
             )
-            return True
+            return False
         except Exception as err:
             _LOGGER.warning(
                 "Switch service %s.%s failed for %s: %s",
@@ -91,13 +141,21 @@ class SwitchCommandGuard:
             )
             if target_domain != "homeassistant":
                 try:
-                    await self.hass.services.async_call(
-                        "homeassistant",
-                        service,
-                        {ATTR_ENTITY_ID: entity_id},
-                        blocking=True,
-                    )
+                    async with asyncio.timeout(call_timeout):
+                        await self.hass.services.async_call(
+                            "homeassistant",
+                            service,
+                            {ATTR_ENTITY_ID: entity_id},
+                            blocking=True,
+                        )
                     return True
+                except TimeoutError:
+                    _LOGGER.error(
+                        "Fallback homeassistant.%s timed out after %.2fs for %s",
+                        service,
+                        call_timeout,
+                        entity_id,
+                    )
                 except Exception as fb_err:
                     _LOGGER.error(
                         "Fallback homeassistant.%s failed for %s: %s",
@@ -114,11 +172,22 @@ class SwitchCommandGuard:
         generation: int,
         timeout: float,
     ) -> bool:
-        if self._is_confirmed_state(entity_id, desired_state):
+        def _is_ready() -> bool:
+            if self._generations.get(entity_id) != generation:
+                return False
+            if not self._is_confirmed_state(entity_id, desired_state):
+                return False
+            if desired_state == STATE_OFF and self.has_inflight_on(entity_id):
+                return False
+            return True
+
+        if _is_ready():
             return True
         if timeout <= 0:
             return False
 
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout)
         event = asyncio.Event()
 
         @callback
@@ -133,12 +202,23 @@ class SwitchCommandGuard:
 
         unsub = async_track_state_change_event(self.hass, [entity_id], _on_change)
         try:
-            if self._is_confirmed_state(entity_id, desired_state):
-                return True
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-            return self._generations.get(entity_id) == generation
-        except TimeoutError:
-            return self._is_confirmed_state(entity_id, desired_state)
+            while True:
+                if self._generations.get(entity_id) != generation:
+                    return False
+                if _is_ready():
+                    return True
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return _is_ready()
+                event.clear()
+                if _is_ready():
+                    return True
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
+                except TimeoutError:
+                    return _is_ready()
+                if _is_ready():
+                    return True
         finally:
             unsub()
 
@@ -158,14 +238,31 @@ class SwitchCommandGuard:
             )
             return False
         gen = self._next_generation(entity_id)
-        sent = await self._call_switch_service(entity_id, SERVICE_TURN_ON)
+        done_ev = self._inflight_on_done.get(entity_id)
+        if done_ev is None:
+            done_ev = asyncio.Event()
+            self._inflight_on_done[entity_id] = done_ev
+        done_ev.clear()
+        self._inflight_on_counts[entity_id] = self._inflight_on_counts.get(entity_id, 0) + 1
+        try:
+            sent = await self._call_switch_service(entity_id, SERVICE_TURN_ON)
+        finally:
+            rem_count = self._inflight_on_counts.get(entity_id, 1) - 1
+            if rem_count <= 0:
+                self._inflight_on_counts.pop(entity_id, None)
+                done_ev.set()
+            else:
+                self._inflight_on_counts[entity_id] = rem_count
+
+        if self._generations.get(entity_id) != gen:
+            if self._was_preempted_by_off(entity_id, gen):
+                await self._async_corrective_off(entity_id)
+            return False
+
         if not sent:
             self.failure_counts[entity_id] = self.failure_counts.get(entity_id, 0) + 1
             self.last_error[entity_id] = "turn_on_failed"
             await self.async_turn_off(entity_id, confirm=False)
-            return False
-
-        if self._generations.get(entity_id) != gen:
             return False
 
         if confirm and self.confirm_timeout > 0:
@@ -173,6 +270,8 @@ class SwitchCommandGuard:
                 entity_id, STATE_ON, gen, self.confirm_timeout
             )
             if self._generations.get(entity_id) != gen:
+                if self._was_preempted_by_off(entity_id, gen):
+                    await self._async_corrective_off(entity_id)
                 return False
             if not confirmed:
                 _LOGGER.error(
@@ -194,23 +293,77 @@ class SwitchCommandGuard:
         entity_id: str,
         *,
         confirm: bool = True,
+        deadline_timeout: float | None = None,
     ) -> bool:
         """Immediately preempt pending ON and execute bounded retry until OFF confirms."""
         if not entity_id:
             return False
         gen = self._next_generation(entity_id)
+        self._off_requested_gen[entity_id] = gen
         self._pending_off.add(entity_id)
         delays = (0.0, *self.off_retry_delays)
+        loop = asyncio.get_running_loop()
+        total_budget = (
+            max(0.02, float(deadline_timeout))
+            if deadline_timeout is not None
+            else (
+                max(self.service_timeout, self.confirm_timeout) * len(delays)
+                + sum(self.off_retry_delays)
+                + 0.5
+            )
+        )
+        deadline = loop.time() + total_budget
+
         try:
             for delay in delays:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
                 if delay > 0:
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(min(delay, remaining))
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
                 if self._generations.get(entity_id) != gen:
                     return False
 
-                sent = await self._call_switch_service(entity_id, SERVICE_TURN_OFF)
+                had_inflight_on = self.has_inflight_on(entity_id)
+                sent = await self._call_switch_service(
+                    entity_id,
+                    SERVICE_TURN_OFF,
+                    timeout=min(remaining, self.service_timeout),
+                )
                 if self._generations.get(entity_id) != gen:
                     return False
+
+                # If an earlier turn_on was still running when OFF arrived, wait for it to finish
+                # and re-issue a final OFF before ever accepting OFF confirmation.
+                if had_inflight_on or self.has_inflight_on(entity_id):
+                    done_ev = self._inflight_on_done.get(entity_id)
+                    if done_ev is not None and self.has_inflight_on(entity_id):
+                        wait_rem = deadline - loop.time()
+                        if wait_rem <= 0:
+                            break
+                        try:
+                            async with asyncio.timeout(wait_rem):
+                                await done_ev.wait()
+                        except TimeoutError:
+                            break
+                    if self._generations.get(entity_id) != gen:
+                        return False
+                    post_rem = deadline - loop.time()
+                    if post_rem <= 0:
+                        break
+                    sent = await self._call_switch_service(
+                        entity_id,
+                        SERVICE_TURN_OFF,
+                        timeout=min(post_rem, self.service_timeout),
+                    )
+                    if self._generations.get(entity_id) != gen:
+                        return False
+
+                if self.has_inflight_on(entity_id):
+                    continue
                 if not sent:
                     continue
 
@@ -219,17 +372,23 @@ class SwitchCommandGuard:
                     self.failure_counts.pop(entity_id, None)
                     return True
 
-                if self._is_confirmed_off(entity_id):
+                if self._is_confirmed_off(entity_id) and not self.has_inflight_on(entity_id):
                     self.last_error.pop(entity_id, None)
                     self.failure_counts.pop(entity_id, None)
                     return True
 
+                wait_rem = deadline - loop.time()
+                if wait_rem <= 0:
+                    break
                 confirmed = await self._wait_for_state(
-                    entity_id, STATE_OFF, gen, self.confirm_timeout
+                    entity_id,
+                    STATE_OFF,
+                    gen,
+                    min(wait_rem, self.confirm_timeout),
                 )
                 if self._generations.get(entity_id) != gen:
                     return False
-                if confirmed:
+                if confirmed and not self.has_inflight_on(entity_id):
                     self.last_error.pop(entity_id, None)
                     self.failure_counts.pop(entity_id, None)
                     return True
@@ -237,7 +396,14 @@ class SwitchCommandGuard:
             self.failure_counts[entity_id] = self.failure_counts.get(entity_id, 0) + 1
             final_st = self.hass.states.get(entity_id)
             final_val = final_st.state if final_st is not None else None
-            if final_val in _UNVERIFIED_STATES:
+            if self.has_inflight_on(entity_id):
+                self.last_error[entity_id] = "inflight_on_pending"
+                _LOGGER.warning(
+                    "Switch %s OFF unconfirmed because turn_on is still in flight (failures=%d)",
+                    entity_id,
+                    self.failure_counts[entity_id],
+                )
+            elif final_val in _UNVERIFIED_STATES:
                 self.last_error[entity_id] = "unverified_off"
                 _LOGGER.warning(
                     "Switch %s OFF state unverified (state=%r) after bounded retries (failures=%d)",

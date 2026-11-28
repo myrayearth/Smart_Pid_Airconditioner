@@ -708,8 +708,8 @@ def validate_device_sensor_input(
     target_humidity = ""
 
     if is_dual_heat_cool_pwm:
-        target_cool = user_input.get(CONF_TARGET_DEVICE_COOL, "")
-        target_heat = user_input.get(CONF_TARGET_DEVICE_HEAT, "")
+        target_cool = str(user_input.get(CONF_TARGET_DEVICE_COOL, "") or "").strip()
+        target_heat = str(user_input.get(CONF_TARGET_DEVICE_HEAT, "") or "").strip()
         if not target_cool:
             errors[CONF_TARGET_DEVICE_COOL] = "target_device_cool_required"
         elif (target_cool.split(".")[0] if "." in target_cool else "") not in ("switch", "input_boolean"):
@@ -718,10 +718,12 @@ def validate_device_sensor_input(
             errors[CONF_TARGET_DEVICE_HEAT] = "target_device_heat_required"
         elif (target_heat.split(".")[0] if "." in target_heat else "") not in ("switch", "input_boolean"):
             errors[CONF_TARGET_DEVICE_HEAT] = "target_device_heat_must_be_switch"
+        if target_cool and target_heat and target_cool == target_heat:
+            errors["base"] = "duplicate_dual_target_device"
         target_dev = target_cool or target_heat
     elif is_dual_humidity_pwm:
-        target_dehumidity = user_input.get(CONF_TARGET_DEVICE_DEHUMIDITY, "")
-        target_humidity = user_input.get(CONF_TARGET_DEVICE_HUMIDITY, "")
+        target_dehumidity = str(user_input.get(CONF_TARGET_DEVICE_DEHUMIDITY, "") or "").strip()
+        target_humidity = str(user_input.get(CONF_TARGET_DEVICE_HUMIDITY, "") or "").strip()
         if not target_dehumidity:
             errors[CONF_TARGET_DEVICE_DEHUMIDITY] = "target_device_dehumidity_required"
         elif (target_dehumidity.split(".")[0] if "." in target_dehumidity else "") not in (
@@ -736,9 +738,11 @@ def validate_device_sensor_input(
             "input_boolean",
         ):
             errors[CONF_TARGET_DEVICE_HUMIDITY] = "target_device_humidity_must_be_switch"
+        if target_dehumidity and target_humidity and target_dehumidity == target_humidity:
+            errors["base"] = "duplicate_dual_target_device"
         target_dev = target_dehumidity or target_humidity
     else:
-        target_dev = user_input.get(CONF_TARGET_DEVICE, "")
+        target_dev = str(user_input.get(CONF_TARGET_DEVICE, "") or "").strip()
         if not target_dev:
             errors[CONF_TARGET_DEVICE] = "target_device_required"
         else:
@@ -765,7 +769,29 @@ def validate_device_sensor_input(
 
     hvac_modes_default = default_hvac_modes_for_type(thermostat_type)
     payload = flatten_sections_input(user_input)
-    payload[CONF_OUTDOOR_SENSOR] = user_input.get(CONF_OUTDOOR_SENSOR) or ""
+    payload[CONF_OUTDOOR_SENSOR] = str(payload.get(CONF_OUTDOOR_SENSOR) or "").strip()
+    payload[CONF_VENT_SWITCH] = str(payload.get(CONF_VENT_SWITCH) or "").strip()
+    raw_vs = payload.get(CONF_VENT_SENSORS)
+    if isinstance(raw_vs, str):
+        payload[CONF_VENT_SENSORS] = [raw_vs.strip()] if raw_vs.strip() else []
+    elif isinstance(raw_vs, (list, tuple, set)):
+        payload[CONF_VENT_SENSORS] = [
+            str(s).strip() for s in raw_vs if isinstance(s, str) and s.strip()
+        ]
+    else:
+        payload[CONF_VENT_SENSORS] = []
+
+    if is_hum:
+        payload[CONF_AUX_TEMP_SENSOR] = str(payload.get(CONF_AUX_TEMP_SENSOR) or "").strip()
+        payload[CONF_COUPLED_AC] = str(payload.get(CONF_COUPLED_AC) or "").strip()
+        payload[CONF_COUPLED_DEHUMIDIFIER] = ""
+    else:
+        payload[CONF_COUPLED_DEHUMIDIFIER] = str(
+            payload.get(CONF_COUPLED_DEHUMIDIFIER) or ""
+        ).strip()
+        payload[CONF_AUX_TEMP_SENSOR] = ""
+        payload[CONF_COUPLED_AC] = ""
+
     payload[CONF_TARGET_CLIMATE] = target_dev
     payload[CONF_TARGET_DEVICE] = target_dev
 
@@ -780,6 +806,9 @@ def validate_device_sensor_input(
                 hass, target_dev, hvac_modes_default
             )
             payload[CONF_AVAILABLE_FAN_MODES] = get_fan_modes(hass, target_dev)
+    else:
+        payload.pop(CONF_AVAILABLE_HVAC_MODES, None)
+        payload.pop(CONF_AVAILABLE_FAN_MODES, None)
 
     payload[CONF_TARGET_DEVICE_COOL] = target_cool if is_dual_heat_cool_pwm else ""
     payload[CONF_TARGET_DEVICE_HEAT] = target_heat if is_dual_heat_cool_pwm else ""
@@ -891,39 +920,6 @@ def build_device_sensor_schema(
     else:
         schema_dict[vol.Required(CONF_INDOOR_SENSOR)] = indoor_selector
         schema_dict[vol.Optional(CONF_OUTDOOR_SENSOR)] = outdoor_selector
-
-    def_modes = default_hvac_modes_for_type(thermostat_type)
-    hvac_modes_default = get_val(CONF_AVAILABLE_HVAC_MODES, def_modes) if is_options else def_modes
-    hvac_options = ALL_HUMIDITY_MODES if is_hum else ALL_HVAC_MODES
-
-    if control_mode == CONTROL_MODE_SWITCH_PWM:
-        schema_dict[
-            vol.Required(CONF_AVAILABLE_HVAC_MODES, default=hvac_modes_default)
-        ] = SelectSelector(
-            SelectSelectorConfig(
-                options=hvac_options,
-                multiple=True,
-                translation_key="available_hvac_modes",
-                mode=SelectSelectorMode.DROPDOWN,
-            )
-        )
-        schema_dict[
-            vol.Required(
-                CONF_AVAILABLE_FAN_MODES,
-                default=(
-                    get_val(CONF_AVAILABLE_FAN_MODES, DEFAULT_AVAILABLE_FAN_MODES)
-                    if is_options
-                    else DEFAULT_AVAILABLE_FAN_MODES
-                ),
-            )
-        ] = SelectSelector(
-            SelectSelectorConfig(
-                options=ALL_FAN_MODES,
-                multiple=True,
-                translation_key="available_fan_modes",
-                mode=SelectSelectorMode.DROPDOWN,
-            )
-        )
 
     unit_meas = "%" if is_hum else "°C"
     step_options = ["0.5", "1.0", "2.0"] if is_hum else ["0.1", "0.5", "1.0"]
@@ -1145,13 +1141,14 @@ def validate_and_prepare_climate_sections(
 
     nested_sections: dict[str, Any] = {}
     if isinstance(user_input, Mapping):
-        for sec in ("section_1", "section_2", "section_3", "section_4"):
+        for sec in ("section_0", "section_1", "section_2", "section_3", "section_4"):
             if sec in user_input and isinstance(user_input[sec], Mapping):
                 sec_copy = dict(user_input[sec])
                 sec_idx = sec.split("_")[1]
-                sec_copy[f"sec{sec_idx}_apply_delta"] = sec_copy.get(
-                    f"sec{sec_idx}_apply_temp", DEFAULT_SEC_APPLY_TEMP
-                )
+                if sec_idx in ("1", "2", "3", "4"):
+                    sec_copy[f"sec{sec_idx}_apply_delta"] = sec_copy.get(
+                        f"sec{sec_idx}_apply_temp", DEFAULT_SEC_APPLY_TEMP
+                    )
                 nested_sections[sec] = sec_copy
 
     return errors, {**flat_input, **nested_sections}

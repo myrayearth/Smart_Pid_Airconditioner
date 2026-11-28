@@ -7,6 +7,29 @@
 
 ---
 
+## [0.6.6] - 2026-11-28
+
+### Fixed & Hardened (GPT 6.2 Sol 코드 리뷰 17건 전면 개선 & CI 테스트 통합)
+- **Safety / Actuator (`S01`–`S08`)**:
+  - `SwitchCommandGuard`에 비행 중 ON 추적(`_inflight_on_counts`, `has_inflight_on`) 및 선점된 느린 ON의 교정 OFF(`_async_corrective_off`)를 추가하고, `service_timeout` 및 `async_turn_off(..., deadline_timeout=...)`를 도입해 응답 없는 스위치 서비스의 무한 대기를 차단했습니다.
+  - `climate.py`·`humidifier.py`의 종료·전체 릴레이 정지(`_async_safe_shutdown_pwm_on_remove`, `_async_turn_off_all_devices`)를 `asyncio.gather` 기반 병렬 유한 시간 정지로 개선했습니다.
+  - `climate.py` 과열 래치(`35.0°C` 차단 / `34.0°C` 해제)를 `SmartPIDExtraStoredData.overheat_latched` 및 `hass.data[DOMAIN]["overheat_latched"]`에 영구 저장·복원하고, `async_set_hvac_mode(HEAT/AUTO)` 및 슬레이브 모드 전환(`_async_set_slave_hvac_mode`)에서도 난방을 차단하며(`heat_cool` 냉방은 허용), 엔트리 제거 시 정리하도록 보완했습니다.
+  - 듀얼 컨트롤러의 장치별 직전 가동 시간(`_last_run_durations`)과 외부 ON/OFF 상태 전환 타임스탬프를 분리 추적하고, 지연된 자체 `state_changed` 이벤트가 이미 기록된 OFF 타임스탬프를 덮어쓰지 않도록 방어했습니다.
+  - `humidifier.py`에 Section 0(`sec0_action`/`sec0_threshold`/`sec0_delta`) 동적 전환·적분 동결, `climate_delta` Fail-Safe 시 꺼진 슬레이브 가습기/제습기 기동 원천 차단, PWM `min_on_time` 지연/강제 정지 구분 및 지연 ON 예약을 반영했습니다.
+  - `climate.py`·`humidifier.py` 안전 감시(Watchdog)가 PID 출력이 아닌 물리적 가동 상태(`_is_physically_running`)를 기준으로 연속 운전 시간을 측정하고, `manual_override` 및 Section 0 `setback`보다 우선하여 강제 정지하도록 수정했습니다.
+- **Learning / Units / Bootstrap (`M01`–`M05`)**:
+  - `config_utils.py`와 `climate.py`, `runtime.py`에 화씨(`°F`)·켈빈(`K`) 온도 변환 헬퍼(`convert_temperature_to_celsius`, `convert_temperature_from_celsius`, `parse_temperature_state`)를 통합해 상태 복원, 슬레이브 상하한, `climate.set_temperature` 송출을 정확히 변환합니다.
+  - `ModelStore.async_load(..., expected_learning_unit=...)`, `runtime.py`, `influxdb_bootstrap.py` 간 습도 학습 단위(`ah` vs `rh`)를 강제 일치시키고, `ah` 모드에서 `aux_temp_sensor`/온도 시계열 결측 시 학습·부트스트랩을 안전하게 건너뛰거나 오류로 차단하며, 조기 정지 예측(`get_early_stop_prediction_in_control_units`)을 제어 단위(`%RH`)로 환산합니다.
+  - 가습/제습 PID 적분을 `per_minute_integral=True`로 통일하고, ConfigEntry `v2 → v3` 마이그레이션 시 습도 엔트리 `ki`를 `60 / sample_period`로 환산하며(`__init__.py`), 레거시 `ExtraStoredData` 적분값(`integral_format != "per_minute"`)을 1회만 자동 변환합니다.
+  - `TuningSafetyManager.applied_params` 영속화·롤백 복원 및 `async_set_prediction_mode()`의 동일 게인 불필요 롤백 창 방지(`_same_pid_gains`)를 추가했습니다.
+  - `influxdb_bootstrap.py`의 분 단위 리플레이(`_replay_chunk_sync`)를 `hass.async_add_executor_job`으로 오프로드하고, `runtime.async_unload()` 시 진행 중인 부트스트랩 태스크 취소 및 세대 토큰(`_snapshot_generation`/`_reset_generation`/`_apply_generation`) 검증을 적용했습니다.
+- **Config Flow / Lifecycle / Services (`C01`–`C04`)**:
+  - 듀얼 PWM 동일 엔티티 중복 지정을 `ConfigFlow`, `OptionsFlow`, `async_setup_entry`(`validate_entry_target_devices`) 전 경로에서 차단하고(`duplicate_dual_target_device`), `async_setup_entry` 실패 시 단일 롤백 블록으로 `runtime_data`와 `hass.data`를 완전 복구합니다.
+  - `OptionsFlow`에서 비워진 선택 엔티티(`outdoor_sensor`, `vent_switch`, `vent_sensors`, `aux_temp_sensor`, `coupled_ac`, `coupled_dehumidifier`)의 중첩 섹션(`ventilation`, `adaptive_learning`) 동기화 및 미사용 PWM `available_hvac_modes`/`available_fan_modes` 정리를 적용했습니다.
+  - `bootstrap_from_influxdb` 서비스 스키마(`_strict_bool`, `_single_entity_id`)의 엄격한 불리언 및 단일 엔티티 검증과 CI `pytest` 워크플로우(`.github/workflows/validate.yml`)를 추가했습니다.
+
+---
+
 ## [0.6.5] - 2026-11-26
 
 ### Fixed & Hardened (GPT 6.2 Astra 코드 리뷰 14건 + 테스트 하네스 검증 개선)

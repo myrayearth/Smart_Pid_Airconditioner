@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import logging
@@ -126,6 +127,18 @@ def _parse_float(val: Any) -> float | None:
     except (ValueError, TypeError):
         return None
     return num if math.isfinite(num) else None
+
+
+def _parse_strict_bool(params: Mapping[str, Any], key: str, default: bool) -> bool:
+    """Parse boolean service argument strictly, rejecting None or non-bool values."""
+    if key not in params:
+        return default
+    val = params[key]
+    if isinstance(val, bool):
+        return val
+    raise ServiceValidationError(
+        f"'{key}' must be a boolean (true/false), got {val!r}."
+    )
 
 
 def _norm_key(val: Any) -> tuple[float | None, str | None]:
@@ -361,6 +374,264 @@ class _SeriesSpec:
     field: str
     is_fahrenheit: bool = False
     is_numeric_field: bool = True
+
+
+@dataclass
+class _ReplayLoopState:
+    """Mutable state carried across 30-day replay chunks in executor."""
+
+    is_humidity: bool
+    target_unit: str
+    min_temp: float | None
+    max_temp: float | None
+    min_hum: float | None
+    max_hum: float | None
+    rls: Any
+    coasting: Any
+    safety: Any
+    vent_guard: VentilationGuard
+    replay_hass: _ReplayHass
+    device_matcher: _StateMatcher
+    vent_matchers: dict[str, _StateMatcher]
+    vent_specs_keys: tuple[str, ...]
+    cur_vent_states: dict[str, str]
+    last_temp_val: float | None = None
+    last_temp_min: int | None = None
+    last_hum_val: float | None = None
+    last_hum_min: int | None = None
+    last_outdoor_val: float | None = None
+    last_outdoor_min: int | None = None
+    cur_dev_active: bool = False
+    cur_dev_heating: bool = False
+    has_dev_seed: bool = False
+    block_minutes: int = 0
+    block_start_val: float | None = None
+    block_end_val: float | None = None
+    block_u_sum: float = 0.0
+    block_out_diff_sum: float = 0.0
+    block_contaminated: bool = False
+    total_minutes_scanned: int = 0
+    in_range_minutes: int = 0
+    skipped_out_of_range_minutes: int = 0
+    rls_updates: int = 0
+    global_min: int = 0
+
+    def reset_rls_block(self) -> None:
+        self.block_minutes = 0
+        self.block_start_val = None
+        self.block_end_val = None
+        self.block_u_sum = 0.0
+        self.block_out_diff_sum = 0.0
+        self.block_contaminated = False
+
+
+def _replay_chunk_sync(
+    state: _ReplayLoopState,
+    chunk_start: datetime,
+    chunk_minutes: int,
+    temp_map: dict[int, float],
+    hum_map: dict[int, float],
+    outdoor_map: dict[int, float],
+    dev_events: list[tuple[int, Any]],
+    vent_events: dict[str, list[tuple[int, Any]]],
+) -> None:
+    """Execute 1-minute historical chunk replay synchronously (safe for executor thread)."""
+    dev_ptr = 0
+    dev_len = len(dev_events)
+    vent_ptrs: dict[str, int] = {veid: 0 for veid in state.vent_specs_keys}
+
+    for m in range(chunk_minutes):
+        cur_dt = chunk_start + timedelta(minutes=m)
+
+        # Advance device state transitions up to current minute m (keep LOCF on unmapped/unknown)
+        while dev_ptr < dev_len and dev_events[dev_ptr][0] <= m:
+            raw_dev = dev_events[dev_ptr][1]
+            matched_dev = state.device_matcher.match(raw_dev)
+            if matched_dev is not None:
+                state.cur_dev_active = matched_dev
+            if isinstance(raw_dev, str):
+                s_low = raw_dev.strip().lower()
+                if s_low in _HEATING_STRINGS:
+                    state.cur_dev_heating = True
+                elif s_low in _COOLING_STRINGS:
+                    state.cur_dev_heating = False
+            dev_ptr += 1
+
+        # Advance ventilation states up to current minute m (keep LOCF on unmapped/unknown)
+        if state.vent_specs_keys:
+            for veid in state.vent_specs_keys:
+                ev_list = vent_events[veid]
+                ptr = vent_ptrs[veid]
+                ev_len = len(ev_list)
+                while ptr < ev_len and ev_list[ptr][0] <= m:
+                    matched_v = state.vent_matchers[veid].match(ev_list[ptr][1])
+                    if matched_v is not None:
+                        state.cur_vent_states[veid] = "on" if matched_v else "off"
+                    ptr += 1
+                vent_ptrs[veid] = ptr
+                state.replay_hass.states.set_state(veid, state.cur_vent_states[veid])
+            vent_status = state.vent_guard.evaluate(state.replay_hass, now=cur_dt)
+        else:
+            vent_status = VentStatus(VentState.NORMAL, False, False, 0, False)
+
+        # Update LOCF for numeric sensors
+        if m in temp_map:
+            state.last_temp_val = temp_map[m]
+            state.last_temp_min = state.global_min
+        if m in hum_map:
+            state.last_hum_val = hum_map[m]
+            state.last_hum_min = state.global_min
+        if m in outdoor_map:
+            state.last_outdoor_val = outdoor_map[m]
+            state.last_outdoor_min = state.global_min
+
+        temp_fresh = (
+            state.last_temp_val is not None
+            and state.last_temp_min is not None
+            and (state.global_min - state.last_temp_min) <= INFLUXDB_MAX_SENSOR_GAP_MIN
+        )
+        hum_fresh = (
+            state.last_hum_val is not None
+            and state.last_hum_min is not None
+            and (state.global_min - state.last_hum_min) <= INFLUXDB_MAX_SENSOR_GAP_MIN
+        )
+        outdoor_fresh = (
+            state.last_outdoor_val is not None
+            and state.last_outdoor_min is not None
+            and (state.global_min - state.last_outdoor_min) <= INFLUXDB_MAX_SENSOR_GAP_MIN
+        )
+
+        temp_now = state.last_temp_val if temp_fresh else None
+        hum_now = state.last_hum_val if hum_fresh else None
+        out_now = state.last_outdoor_val if outdoor_fresh else None
+
+        # Evaluate regime segmentation bounds & sensor freshness (> 30 min gap -> out_of_range)
+        in_range = True
+        if state.is_humidity:
+            if hum_now is None:
+                in_range = False
+            elif state.min_hum is not None and hum_now < state.min_hum:
+                in_range = False
+            elif state.max_hum is not None and hum_now > state.max_hum:
+                in_range = False
+
+            if in_range and state.target_unit == "ah" and temp_now is None:
+                in_range = False
+
+            if in_range and (state.min_temp is not None or state.max_temp is not None):
+                if temp_now is None:
+                    in_range = False
+                elif state.min_temp is not None and temp_now < state.min_temp:
+                    in_range = False
+                elif state.max_temp is not None and temp_now > state.max_temp:
+                    in_range = False
+        else:
+            if temp_now is None:
+                in_range = False
+            elif state.min_temp is not None and temp_now < state.min_temp:
+                in_range = False
+            elif state.max_temp is not None and temp_now > state.max_temp:
+                in_range = False
+
+            if in_range and (state.min_hum is not None or state.max_hum is not None):
+                if hum_now is None:
+                    in_range = False
+                elif state.min_hum is not None and hum_now < state.min_hum:
+                    in_range = False
+                elif state.max_hum is not None and hum_now > state.max_hum:
+                    in_range = False
+
+        state.total_minutes_scanned += 1
+
+        if not in_range:
+            state.skipped_out_of_range_minutes += 1
+            if (
+                state.coasting.phase != CyclePhase.IDLE
+                or state.block_minutes > 0
+                or state.coasting.emitter_charge != 0.0
+            ):
+                state.coasting.abort_cycle_to_idle()
+            state.reset_rls_block()
+            state.global_min += 1
+            continue
+
+        # Resolve value in target learning domain (RH -> AH strictly when target_unit == 'ah')
+        if state.is_humidity:
+            assert hum_now is not None
+            if state.target_unit == "ah":
+                assert temp_now is not None
+                val_in = rh_to_ah(temp_now, hum_now)
+                val_out = rh_to_ah(temp_now, out_now) if out_now is not None else None
+            else:
+                val_in = hum_now
+                val_out = out_now
+        else:
+            assert temp_now is not None
+            val_in = temp_now
+            val_out = out_now
+
+        state.in_range_minutes += 1
+        blocked = vent_status.should_block_learning
+        block_reason = (
+            "ventilation_degraded" if vent_status.degraded else "ventilation_contamination"
+        )
+        u_effort = 1.0 if state.cur_dev_active else 0.0
+
+        # 1-minute DynamicCoastingLearner step
+        state.coasting.step_cycle(
+            is_active=state.cur_dev_active,
+            u_effort=u_effort,
+            value=val_in,
+            is_heating=state.cur_dev_heating,
+            dt_min=1.0,
+            blocked_for_learning=blocked,
+            block_reason=block_reason,
+            target_val=None,
+            solar_rising_active=False,
+            outdoor_temp=None if state.is_humidity else out_now,
+            now_ts=cur_dt.timestamp(),
+        )
+        completed = state.coasting.consume_completed_cycle()
+        if completed is not None:
+            state.safety.record_prediction_comparison(
+                predicted_coast=completed["predicted_coast"],
+                observed_coast=completed["observed_coast"],
+            )
+
+        # 5-minute HuberRLS block accumulation
+        if blocked:
+            state.block_contaminated = True
+        if state.block_start_val is None:
+            state.block_start_val = val_in
+        state.block_end_val = val_in
+        signed_u = u_effort if state.cur_dev_heating else -u_effort
+        state.block_u_sum += signed_u
+        state.block_out_diff_sum += (val_in - val_out) if val_out is not None else 0.0
+        state.block_minutes += 1
+
+        if state.block_minutes >= 5:
+            if (
+                not state.block_contaminated
+                and state.block_start_val is not None
+                and state.block_end_val is not None
+            ):
+                dy_per_min = (state.block_end_val - state.block_start_val) / float(
+                    state.block_minutes
+                )
+                u_avg = state.block_u_sum / float(state.block_minutes)
+                diff_avg = state.block_out_diff_sum / float(state.block_minutes)
+                if state.is_humidity:
+                    ok = state.rls.update(
+                        [abs(u_avg), -diff_avg],
+                        dy_per_min if state.cur_dev_heating else -dy_per_min,
+                    )
+                else:
+                    ok = state.rls.update([u_avg, -diff_avg, 0.0], dy_per_min)
+                if ok:
+                    state.rls_updates += 1
+            state.reset_rls_block()
+
+        state.global_min += 1
 
 
 class InfluxDBv1Client:
@@ -728,12 +999,84 @@ async def async_bootstrap_from_influxdb(
     vent_closed_values = _coerce_value_list(params.get("ventilation_closed_values"))
     raw_vent_map = params.get("ventilation_sensor_map")
     vent_sensor_map = raw_vent_map if isinstance(raw_vent_map, dict) else None
-    reset_existing = bool(params.get("reset_existing", True))
-    dry_run = bool(params.get("dry_run", True))
+    reset_existing = _parse_strict_bool(params, "reset_existing", True)
+    dry_run = _parse_strict_bool(params, "dry_run", True)
 
+    if not runtime.is_active_runtime():
+        raise HomeAssistantError("Runtime is unloaded or no longer active.")
+
+    start_snap_gen = runtime._snapshot_generation
+    start_reset_gen = runtime._reset_generation
+    start_apply_gen = runtime._apply_generation
+    cur_task = asyncio.current_task()
+    runtime.register_bootstrap_task(cur_task)
+    try:
+        return await _async_bootstrap_from_influxdb_inner(
+            hass=hass,
+            runtime=runtime,
+            params=params,
+            url=url,
+            database=database,
+            username=username,
+            password=password,
+            days=days,
+            min_temp=min_temp,
+            max_temp=max_temp,
+            min_hum=min_hum,
+            max_hum=max_hum,
+            raw_device_field=raw_device_field,
+            device_active_values=device_active_values,
+            device_inactive_values=device_inactive_values,
+            vent_open_values=vent_open_values,
+            vent_closed_values=vent_closed_values,
+            vent_sensor_map=vent_sensor_map,
+            reset_existing=reset_existing,
+            dry_run=dry_run,
+            start_snap_gen=start_snap_gen,
+            start_reset_gen=start_reset_gen,
+            start_apply_gen=start_apply_gen,
+        )
+    finally:
+        runtime.unregister_bootstrap_task(cur_task)
+
+
+async def _async_bootstrap_from_influxdb_inner(
+    *,
+    hass: HomeAssistant,
+    runtime: SmartPIDRuntime,
+    params: dict[str, Any],
+    url: str,
+    database: str,
+    username: Any,
+    password: Any,
+    days: int,
+    min_temp: float | None,
+    max_temp: float | None,
+    min_hum: float | None,
+    max_hum: float | None,
+    raw_device_field: str,
+    device_active_values: list[Any] | None,
+    device_inactive_values: list[Any] | None,
+    vent_open_values: list[Any] | None,
+    vent_closed_values: list[Any] | None,
+    vent_sensor_map: dict[str, Any] | None,
+    reset_existing: bool,
+    dry_run: bool,
+    start_snap_gen: int,
+    start_reset_gen: int,
+    start_apply_gen: int,
+) -> dict[str, Any]:
+    """Execute InfluxDB preflight, chunked queries, executor replay, and guarded apply."""
     defaults = runtime.get_bootstrap_defaults()
     is_humidity = bool(defaults["is_humidity"])
     is_heating_default = bool(defaults["is_heating_default"])
+    target_unit = str(
+        getattr(
+            runtime,
+            "learning_unit",
+            ("ah" if (is_humidity and defaults.get("aux_temp_sensor")) else ("rh" if is_humidity else "c")),
+        )
+    )
 
     if is_humidity:
         indoor_hum_eid = str(params.get("indoor_humidity_entity_id") or defaults["indoor_sensor"] or "").strip() or None
@@ -836,6 +1179,10 @@ async def async_bootstrap_from_influxdb(
                 is_temperature=True,
             )
             if temp_spec is None:
+                if target_unit == "ah":
+                    raise HomeAssistantError(
+                        f"Auxiliary/indoor temperature sensor '{indoor_temp_eid}' had no InfluxDB data; cannot compute absolute humidity (g/m³) for learning_unit='ah'."
+                    )
                 msg = f"Auxiliary/indoor temperature sensor '{indoor_temp_eid}' had no InfluxDB data; humidity replay will use RH% fallback."
                 warnings.append(msg)
                 if min_temp is not None or max_temp is not None:
@@ -844,6 +1191,10 @@ async def async_bootstrap_from_influxdb(
                     )
             elif temp_spec.is_fahrenheit:
                 warnings.append(f"Converted '{indoor_temp_eid}' values from °F to °C.")
+        elif target_unit == "ah":
+            raise HomeAssistantError(
+                "No auxiliary indoor temperature sensor configured or specified; cannot compute absolute humidity (g/m³) for learning_unit='ah'."
+            )
     else:
         temp_diag: dict[str, Any] = {}
         temp_spec = await _resolve_series_spec(
@@ -948,9 +1299,15 @@ async def async_bootstrap_from_influxdb(
             tau_em_min=tau_em,
             max_coast_window_min=coast_win,
             peak_confirm_delta=peak_delta,
+            learning_unit=target_unit,
         )
     else:
         snapshot = LearningStateSnapshot.from_dict(runtime.snapshot.to_dict())
+        if snapshot.learning_unit is not None and snapshot.learning_unit != target_unit:
+            raise HomeAssistantError(
+                f"Existing snapshot learning_unit {snapshot.learning_unit!r} does not match runtime unit {target_unit!r}."
+            )
+        snapshot.learning_unit = target_unit
         snapshot.coasting.apply_profile_settings(
             runtime.inertia_profile,
             tau_em_min=tau_em,
@@ -965,7 +1322,6 @@ async def async_bootstrap_from_influxdb(
     init_accepted = coasting.accepted_count
     init_rejected = dict(coasting.rejected_counts)
     init_rls_rejected = rls.rejected_outliers
-    rls_updates = 0
 
     vent_guard = VentilationGuard(
         mode=vent_mode if vent_specs else VENT_MODE_DISABLED,
@@ -976,14 +1332,6 @@ async def async_bootstrap_from_influxdb(
         cooldown_min=max(20, int(defaults["vent_cooldown_min"])) if vent_override else int(defaults["vent_cooldown_min"]),
     )
     replay_hass = _ReplayHass()
-
-    # Tracking state across 30-day chunks
-    last_temp_val: float | None = None
-    last_temp_min: int | None = None
-    last_hum_val: float | None = None
-    last_hum_min: int | None = None
-    last_outdoor_val: float | None = None
-    last_outdoor_min: int | None = None
 
     device_matcher = _StateMatcher(
         kind="device",
@@ -999,38 +1347,31 @@ async def async_bootstrap_from_influxdb(
         veid: _UniqueValueCollector() for veid in vent_specs
     }
 
-    cur_dev_active: bool = False
-    cur_dev_heating: bool = is_heating_default
-    has_dev_seed: bool = False
-
-    cur_vent_states: dict[str, str] = {veid: "off" for veid in vent_specs}
     has_vent_seed: dict[str, bool] = {veid: False for veid in vent_specs}
+    replay_state = _ReplayLoopState(
+        is_humidity=is_humidity,
+        target_unit=target_unit,
+        min_temp=min_temp,
+        max_temp=max_temp,
+        min_hum=min_hum,
+        max_hum=max_hum,
+        rls=rls,
+        coasting=coasting,
+        safety=safety,
+        vent_guard=vent_guard,
+        replay_hass=replay_hass,
+        device_matcher=device_matcher,
+        vent_matchers=vent_matchers,
+        vent_specs_keys=tuple(vent_specs.keys()),
+        cur_vent_states={veid: "off" for veid in vent_specs},
+        cur_dev_heating=is_heating_default,
+    )
 
-    # 5-minute RLS block accumulator
-    block_minutes = 0
-    block_start_val: float | None = None
-    block_end_val: float | None = None
-    block_u_sum = 0.0
-    block_out_diff_sum = 0.0
-    block_contaminated = False
-
-    total_minutes_scanned = 0
-    in_range_minutes = 0
-    skipped_out_of_range_minutes = 0
-    global_min = 0
-
-    def _reset_rls_block() -> None:
-        nonlocal block_minutes, block_start_val, block_end_val, block_u_sum, block_out_diff_sum, block_contaminated
-        block_minutes = 0
-        block_start_val = None
-        block_end_val = None
-        block_u_sum = 0.0
-        block_out_diff_sum = 0.0
-        block_contaminated = False
-
-    # 3. Sequential 30-day chunked querying & 1-minute replay
+    # 3. Sequential 30-day chunked querying & 1-minute executor replay
     chunk_start = start_dt
     while chunk_start < end_dt:
+        if not runtime.is_active_runtime():
+            raise HomeAssistantError("Runtime is unloaded or no longer active.")
         chunk_end = min(end_dt, chunk_start + timedelta(days=INFLUXDB_CHUNK_DAYS))
         c_start_ms = int(chunk_start.timestamp() * 1000)
         c_end_ms = int(chunk_end.timestamp() * 1000)
@@ -1044,16 +1385,16 @@ async def async_bootstrap_from_influxdb(
             dev_unique.add(seed_dev)
             matched_dev = device_matcher.match(seed_dev)
             if matched_dev is not None:
-                cur_dev_active = matched_dev
-                has_dev_seed = True
+                replay_state.cur_dev_active = matched_dev
+                replay_state.has_dev_seed = True
             if isinstance(seed_dev, str):
                 s_low = seed_dev.strip().lower()
                 if s_low in _HEATING_STRINGS:
-                    cur_dev_heating = True
+                    replay_state.cur_dev_heating = True
                 elif s_low in _COOLING_STRINGS:
-                    cur_dev_heating = False
-        elif not has_dev_seed:
-            cur_dev_active = False
+                    replay_state.cur_dev_heating = False
+        elif not replay_state.has_dev_seed:
+            replay_state.cur_dev_active = False
 
         for veid, vspec in vent_specs.items():
             seed_v = await _fetch_pre_chunk_state(client, vspec, c_start_ms)
@@ -1061,10 +1402,10 @@ async def async_bootstrap_from_influxdb(
                 vent_uniques[veid].add(seed_v)
                 matched_v = vent_matchers[veid].match(seed_v)
                 if matched_v is not None:
-                    cur_vent_states[veid] = "on" if matched_v else "off"
+                    replay_state.cur_vent_states[veid] = "on" if matched_v else "off"
                     has_vent_seed[veid] = True
             elif not has_vent_seed[veid]:
-                cur_vent_states[veid] = "off"
+                replay_state.cur_vent_states[veid] = "off"
 
         # Query aggregated 1-minute sensor series and raw transition events
         temp_map = await _fetch_numeric_chunk(client, temp_spec, c_start_ms, c_end_ms) if temp_spec else {}
@@ -1082,186 +1423,40 @@ async def async_bootstrap_from_influxdb(
             for _, raw_v in ev_list:
                 vent_uniques[veid].add(raw_v)
 
-        dev_ptr = 0
-        dev_len = len(dev_events)
-        vent_ptrs: dict[str, int] = {veid: 0 for veid in vent_specs}
-
-        for m in range(chunk_minutes):
-            cur_dt = chunk_start + timedelta(minutes=m)
-
-            # Advance device state transitions up to current minute m (keep LOCF on unmapped/unknown)
-            while dev_ptr < dev_len and dev_events[dev_ptr][0] <= m:
-                raw_dev = dev_events[dev_ptr][1]
-                matched_dev = device_matcher.match(raw_dev)
-                if matched_dev is not None:
-                    cur_dev_active = matched_dev
-                if isinstance(raw_dev, str):
-                    s_low = raw_dev.strip().lower()
-                    if s_low in _HEATING_STRINGS:
-                        cur_dev_heating = True
-                    elif s_low in _COOLING_STRINGS:
-                        cur_dev_heating = False
-                dev_ptr += 1
-
-            # Advance ventilation states up to current minute m (keep LOCF on unmapped/unknown)
-            if vent_specs:
-                for veid, ev_list in vent_events.items():
-                    ptr = vent_ptrs[veid]
-                    ev_len = len(ev_list)
-                    while ptr < ev_len and ev_list[ptr][0] <= m:
-                        matched_v = vent_matchers[veid].match(ev_list[ptr][1])
-                        if matched_v is not None:
-                            cur_vent_states[veid] = "on" if matched_v else "off"
-                        ptr += 1
-                    vent_ptrs[veid] = ptr
-                    replay_hass.states.set_state(veid, cur_vent_states[veid])
-                vent_status = vent_guard.evaluate(replay_hass, now=cur_dt)
-            else:
-                vent_status = VentStatus(VentState.NORMAL, False, False, 0, False)
-
-            # Update LOCF for numeric sensors
-            if m in temp_map:
-                last_temp_val = temp_map[m]
-                last_temp_min = global_min
-            if m in hum_map:
-                last_hum_val = hum_map[m]
-                last_hum_min = global_min
-            if m in outdoor_map:
-                last_outdoor_val = outdoor_map[m]
-                last_outdoor_min = global_min
-
-            temp_fresh = (
-                last_temp_val is not None
-                and last_temp_min is not None
-                and (global_min - last_temp_min) <= INFLUXDB_MAX_SENSOR_GAP_MIN
+        if hasattr(hass, "async_add_executor_job"):
+            await hass.async_add_executor_job(
+                _replay_chunk_sync,
+                replay_state,
+                chunk_start,
+                chunk_minutes,
+                temp_map,
+                hum_map,
+                outdoor_map,
+                dev_events,
+                vent_events,
             )
-            hum_fresh = (
-                last_hum_val is not None
-                and last_hum_min is not None
-                and (global_min - last_hum_min) <= INFLUXDB_MAX_SENSOR_GAP_MIN
+        else:
+            _replay_chunk_sync(
+                replay_state,
+                chunk_start,
+                chunk_minutes,
+                temp_map,
+                hum_map,
+                outdoor_map,
+                dev_events,
+                vent_events,
             )
-            outdoor_fresh = (
-                last_outdoor_val is not None
-                and last_outdoor_min is not None
-                and (global_min - last_outdoor_min) <= INFLUXDB_MAX_SENSOR_GAP_MIN
-            )
+            await asyncio.sleep(0)
 
-            temp_now = last_temp_val if temp_fresh else None
-            hum_now = last_hum_val if hum_fresh else None
-            out_now = last_outdoor_val if outdoor_fresh else None
-
-            # Evaluate regime segmentation bounds & sensor freshness (> 30 min gap -> out_of_range)
-            in_range = True
-            if is_humidity:
-                if hum_now is None:
-                    in_range = False
-                elif min_hum is not None and hum_now < min_hum:
-                    in_range = False
-                elif max_hum is not None and hum_now > max_hum:
-                    in_range = False
-
-                if in_range and (min_temp is not None or max_temp is not None):
-                    if temp_now is None:
-                        in_range = False
-                    elif min_temp is not None and temp_now < min_temp:
-                        in_range = False
-                    elif max_temp is not None and temp_now > max_temp:
-                        in_range = False
-            else:
-                if temp_now is None:
-                    in_range = False
-                elif min_temp is not None and temp_now < min_temp:
-                    in_range = False
-                elif max_temp is not None and temp_now > max_temp:
-                    in_range = False
-
-                if in_range and (min_hum is not None or max_hum is not None):
-                    if hum_now is None:
-                        in_range = False
-                    elif min_hum is not None and hum_now < min_hum:
-                        in_range = False
-                    elif max_hum is not None and hum_now > max_hum:
-                        in_range = False
-
-            total_minutes_scanned += 1
-
-            if not in_range:
-                skipped_out_of_range_minutes += 1
-                if coasting.phase != CyclePhase.IDLE or block_minutes > 0 or coasting.emitter_charge != 0.0:
-                    coasting.abort_cycle_to_idle()
-                _reset_rls_block()
-                global_min += 1
-                continue
-
-            # Resolve value in target learning domain (RH -> AH if humidity controller with temp)
-            if is_humidity:
-                assert hum_now is not None
-                if temp_now is not None:
-                    val_in = rh_to_ah(temp_now, hum_now)
-                    val_out = rh_to_ah(temp_now, out_now) if out_now is not None else None
-                else:
-                    val_in = hum_now
-                    val_out = out_now
-            else:
-                assert temp_now is not None
-                val_in = temp_now
-                val_out = out_now
-
-            in_range_minutes += 1
-            blocked = vent_status.should_block_learning
-            block_reason = (
-                "ventilation_degraded" if vent_status.degraded else "ventilation_contamination"
-            )
-            u_effort = 1.0 if cur_dev_active else 0.0
-
-            # 1-minute DynamicCoastingLearner step
-            coasting.step_cycle(
-                is_active=cur_dev_active,
-                u_effort=u_effort,
-                value=val_in,
-                is_heating=cur_dev_heating,
-                dt_min=1.0,
-                blocked_for_learning=blocked,
-                block_reason=block_reason,
-                target_val=None,
-                solar_rising_active=False,
-                outdoor_temp=None if is_humidity else out_now,
-                now_ts=cur_dt.timestamp(),
-            )
-            completed = coasting.consume_completed_cycle()
-            if completed is not None:
-                safety.record_prediction_comparison(
-                    predicted_coast=completed["predicted_coast"],
-                    observed_coast=completed["observed_coast"],
-                )
-
-            # 5-minute HuberRLS block accumulation
-            if blocked:
-                block_contaminated = True
-            if block_start_val is None:
-                block_start_val = val_in
-            block_end_val = val_in
-            signed_u = u_effort if cur_dev_heating else -u_effort
-            block_u_sum += signed_u
-            block_out_diff_sum += (val_in - val_out) if val_out is not None else 0.0
-            block_minutes += 1
-
-            if block_minutes >= 5:
-                if not block_contaminated and block_start_val is not None and block_end_val is not None:
-                    dy_per_min = (block_end_val - block_start_val) / float(block_minutes)
-                    u_avg = block_u_sum / float(block_minutes)
-                    diff_avg = block_out_diff_sum / float(block_minutes)
-                    if is_humidity:
-                        ok = rls.update([abs(u_avg), -diff_avg], dy_per_min if cur_dev_heating else -dy_per_min)
-                    else:
-                        ok = rls.update([u_avg, -diff_avg, 0.0], dy_per_min)
-                    if ok:
-                        rls_updates += 1
-                _reset_rls_block()
-
-            global_min += 1
+        if not runtime.is_active_runtime():
+            raise HomeAssistantError("Runtime is unloaded or no longer active.")
 
         chunk_start = chunk_end
+
+    total_minutes_scanned = replay_state.total_minutes_scanned
+    in_range_minutes = replay_state.in_range_minutes
+    skipped_out_of_range_minutes = replay_state.skipped_out_of_range_minutes
+    rls_updates = replay_state.rls_updates
 
     if in_range_minutes == 0:
         warnings.append(
@@ -1305,7 +1500,12 @@ async def async_bootstrap_from_influxdb(
 
         applied = False
         if not dry_run:
-            await runtime.async_apply_bootstrapped_snapshot(snapshot)
+            await runtime.async_apply_bootstrapped_snapshot(
+                snapshot,
+                expected_snapshot_generation=None if reset_existing else start_snap_gen,
+                expected_reset_generation=start_reset_gen,
+                expected_apply_generation=start_apply_gen,
+            )
             applied = True
 
         rls_rejected_delta = max(0, rls.rejected_outliers - init_rls_rejected)

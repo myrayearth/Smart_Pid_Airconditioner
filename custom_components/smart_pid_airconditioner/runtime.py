@@ -14,6 +14,7 @@ from typing import Any, Callable
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_interval
 import homeassistant.util.dt as dt_util
 
@@ -104,12 +105,23 @@ from .learner import (
     TuningParameters,
 )
 from .config_utils import get_entry_setting, parse_temperature_state
-from .psychrometrics import rh_to_ah
+from .psychrometrics import ah_to_rh, rh_to_ah
 from .storage import LearningStateSnapshot, ModelStore
 from .ventilation import VentState, VentStatus
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_OUTAGE_BUFFERED_TICKS = 10
+
+
+def _same_pid_gains(a: TuningParameters | None, b: TuningParameters | None) -> bool:
+    """Return True when two TuningParameters have identical effective (kp, ki, ke)."""
+    if a is None or b is None:
+        return a is b
+    return (
+        math.isclose(a.kp, b.kp, rel_tol=0.0, abs_tol=1e-6)
+        and math.isclose(a.ki, b.ki, rel_tol=0.0, abs_tol=1e-6)
+        and math.isclose(a.ke, b.ke, rel_tol=0.0, abs_tol=1e-6)
+    )
 
 
 def _parse_time_value(value: Any, default: dt_time) -> dt_time:
@@ -140,7 +152,12 @@ class SmartPIDRuntime:
         self._subscribers: list[Callable[[], None]] = []
         self._unsub_tick: CALLBACK_TYPE | None = None
         self._bootstrap_task: Any = None
+        self._active_bootstrap_tasks: set[asyncio.Task[Any]] = set()
         self._dirty: bool = False
+        self._unloaded: bool = False
+        self._snapshot_generation: int = 0
+        self._reset_generation: int = 0
+        self._apply_generation: int = 0
 
         # Config cache
         self.tuning_mode: str = str(self._get_setting(CONF_TUNING_MODE, DEFAULT_TUNING_MODE))
@@ -172,6 +189,9 @@ class SmartPIDRuntime:
         self.aux_temp_sensor: str | None = self._get_setting(CONF_AUX_TEMP_SENSOR, None) or None
         self.thermostat_type: str = str(self._get_setting(CONF_THERMOSTAT_TYPE, DEFAULT_THERMOSTAT_TYPE))
         self.is_humidity: bool = is_humidity_type(self.thermostat_type)
+        self.learning_unit: str = (
+            ("ah" if self.aux_temp_sensor else "rh") if self.is_humidity else "c"
+        )
 
         tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
         self.snapshot = LearningStateSnapshot(
@@ -179,6 +199,7 @@ class SmartPIDRuntime:
             tau_em_min=tau_em,
             max_coast_window_min=coast_win,
             peak_confirm_delta=peak_delta,
+            learning_unit=self.learning_unit,
         )
 
         self.coupled_dehumidifier: str | None = self._get_setting(CONF_COUPLED_DEHUMIDIFIER, None) or None
@@ -287,15 +308,42 @@ class SmartPIDRuntime:
         peak_delta = 0.5 if (self.is_humidity and not self.aux_temp_sensor) else 0.1
         return tau_em, coast_win, peak_delta
 
+    def is_active_runtime(self) -> bool:
+        """Return True if this runtime is still registered and not unloaded."""
+        if self._unloaded:
+            return False
+        domain_data = getattr(self.hass, "data", {}).get(DOMAIN)
+        if isinstance(domain_data, Mapping):
+            reg = domain_data.get(self.entry.entry_id)
+            if isinstance(reg, SmartPIDRuntime) and reg is not self:
+                return False
+        entry_rt = getattr(self.entry, "runtime_data", None)
+        if isinstance(entry_rt, SmartPIDRuntime) and entry_rt is not self:
+            return False
+        return True
+
+    def register_bootstrap_task(self, task: asyncio.Task[Any] | None) -> None:
+        """Track an active external bootstrap task so unload can cancel it cleanly."""
+        if task is not None:
+            self._active_bootstrap_tasks.add(task)
+
+    def unregister_bootstrap_task(self, task: asyncio.Task[Any] | None) -> None:
+        """Stop tracking a finished bootstrap task."""
+        if task is not None:
+            self._active_bootstrap_tasks.discard(task)
+
     async def async_setup(self) -> None:
         """Load persisted state and start 1-minute learning tick."""
+        self._unloaded = False
         tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
         self.snapshot = await self.store.async_load(
             inertia_profile=self.inertia_profile,
             tau_em_min=tau_em,
             max_coast_window_min=coast_win,
             peak_confirm_delta=peak_delta,
+            expected_learning_unit=self.learning_unit,
         )
+        self._applied_auto_params = self.snapshot.safety.applied_params
         self.recommended = self._recompute_recommended()
         self._unsub_tick = async_track_time_interval(
             self.hass,
@@ -312,12 +360,23 @@ class SmartPIDRuntime:
 
     async def async_unload(self) -> None:
         """Clean up timers and persist pending dirty state."""
+        self._unloaded = True
         if self._unsub_tick is not None:
             self._unsub_tick()
             self._unsub_tick = None
         if self._bootstrap_task is not None:
             task = self._bootstrap_task
             self._bootstrap_task = None
+            if not task.done():
+                task.cancel()
+                if asyncio.isfuture(task):
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+        current_task = asyncio.current_task()
+        for task in list(self._active_bootstrap_tasks):
+            self._active_bootstrap_tasks.discard(task)
+            if task is current_task:
+                continue
             if not task.done():
                 task.cancel()
                 if asyncio.isfuture(task):
@@ -431,6 +490,20 @@ class SmartPIDRuntime:
             return str(st.state) == "above_horizon" and float(elevation) > 0.0
         return str(st.state) == "above_horizon"
 
+    def _get_aux_temp_celsius(self) -> float | None:
+        """Read and normalize aux_temp_sensor to °C, returning None if unavailable."""
+        if not self.aux_temp_sensor:
+            return None
+        st = self.hass.states.get(self.aux_temp_sensor)
+        if st is None or st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return None
+        default_unit = getattr(
+            getattr(getattr(self.hass, "config", None), "units", None),
+            "temperature_unit",
+            None,
+        )
+        return parse_temperature_state(st, default_unit=default_unit)
+
     def _resolve_learning_values(self) -> tuple[float | None, float | None, str | None]:
         """Return (indoor_learning_val, outdoor_learning_val, fallback_reason)."""
         if self._obs_indoor is None:
@@ -441,22 +514,15 @@ class SmartPIDRuntime:
 
         # Humidity type: try converting RH% to AH (g/m³) using aux_temp_sensor
         if self.aux_temp_sensor:
-            st = self.hass.states.get(self.aux_temp_sensor)
-            if st is not None and st.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-                default_unit = getattr(
-                    getattr(getattr(self.hass, "config", None), "units", None),
-                    "temperature_unit",
-                    None,
+            temp_c = self._get_aux_temp_celsius()
+            if temp_c is not None:
+                ah_in = rh_to_ah(temp_c, self._obs_indoor)
+                ah_out = (
+                    rh_to_ah(temp_c, self._obs_outdoor)
+                    if self._obs_outdoor is not None
+                    else None
                 )
-                temp_c = parse_temperature_state(st, default_unit=default_unit)
-                if temp_c is not None:
-                    ah_in = rh_to_ah(temp_c, self._obs_indoor)
-                    ah_out = (
-                        rh_to_ah(temp_c, self._obs_outdoor)
-                        if self._obs_outdoor is not None
-                        else None
-                    )
-                    return ah_in, ah_out, None
+                return ah_in, ah_out, None
             return self._obs_indoor, self._obs_outdoor, "aux_temp_unavailable_rh_fallback"
 
         return self._obs_indoor, self._obs_outdoor, "no_aux_temp_rh_fallback"
@@ -496,6 +562,7 @@ class SmartPIDRuntime:
                 cycle_mae=completed["coast_error"],
                 cycle_overshoot=completed["overshoot"],
             )
+            self._snapshot_generation += 1
             self._dirty = True
             self.store.async_delay_save(self.snapshot.to_dict, delay=600)
 
@@ -508,6 +575,16 @@ class SmartPIDRuntime:
             self.fallback_reason = None
 
         if val_in is None:
+            return
+
+        if (
+            self.is_humidity
+            and self.learning_unit == "ah"
+            and fb_reason == "aux_temp_unavailable_rh_fallback"
+        ):
+            self.snapshot.coasting.mark_contaminated("aux_temp_unavailable")
+            self._block_contaminated = True
+            self._notify_subscribers()
             return
 
         blocked = (
@@ -528,10 +605,10 @@ class SmartPIDRuntime:
         # Resolve target in same domain as val_in (convert target RH% to AH when aux temp active)
         target_for_cycle = self._obs_target
         if self.is_humidity and target_for_cycle is not None and fb_reason is None and self.aux_temp_sensor:
-            st_aux = self.hass.states.get(self.aux_temp_sensor)
-            if st_aux is not None and st_aux.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            aux_temp_c = self._get_aux_temp_celsius()
+            if aux_temp_c is not None:
                 try:
-                    target_for_cycle = rh_to_ah(float(st_aux.state), float(target_for_cycle))
+                    target_for_cycle = rh_to_ah(aux_temp_c, float(target_for_cycle))
                 except (ValueError, TypeError):
                     pass
 
@@ -615,6 +692,7 @@ class SmartPIDRuntime:
                 else:
                     rls.update([u_avg, -diff_avg, aux_avg], dy_per_min)
 
+                self._snapshot_generation += 1
                 self.recommended = self._recompute_recommended(rls)
                 self._dirty = True
                 self.store.async_delay_save(self.snapshot.to_dict, delay=600)
@@ -664,9 +742,11 @@ class SmartPIDRuntime:
                 prev_params=prev,
                 baseline_mae=max(0.15, base_mae) if base_mae is not None else 0.3,
                 baseline_overshoot=0.4,
+                applied_params=self.recommended,
             )
             self._applied_auto_params = self.recommended
             self._dirty = True
+            self.store.async_delay_save(self.snapshot.to_dict, delay=600)
 
         self.fallback_reason = None
         return (
@@ -710,6 +790,34 @@ class SmartPIDRuntime:
             apply_bias=True,
             apply_shortfall_scale=True,
         )
+
+    def get_early_stop_prediction_in_control_units(
+        self,
+        *,
+        current_rh: float | None = None,
+        is_heating: bool | None = None,
+    ) -> float:
+        """Return early-stop prediction converted into control units (°C or %RH)."""
+        coast = self.get_early_stop_prediction()
+        if coast <= 0.0 or not self.is_humidity or self.learning_unit != "ah":
+            return coast
+
+        temp_c = self._get_aux_temp_celsius()
+        rh_now = current_rh if current_rh is not None else self._obs_indoor
+        if temp_c is None or rh_now is None or not math.isfinite(float(rh_now)):
+            return 0.0
+
+        rh_val = float(rh_now)
+        ah_now = rh_to_ah(temp_c, rh_val)
+        heating = self._obs_is_heating if is_heating is None else bool(is_heating)
+        if heating:
+            ah_after = ah_now + coast
+            rh_after = ah_to_rh(temp_c, ah_after)
+            return max(0.0, rh_after - rh_val)
+
+        ah_after = max(0.0, ah_now - coast)
+        rh_after = ah_to_rh(temp_c, ah_after)
+        return max(0.0, rh_val - rh_after)
 
     def is_sunrise_saving_active(self, now: datetime | None = None) -> bool:
         """Return True when sunrise saving is enabled and within schedule OR sun above horizon."""
@@ -794,8 +902,11 @@ class SmartPIDRuntime:
         )
         if rolled_back is not None:
             self._applied_auto_params = rolled_back
+            self.snapshot.safety.applied_params = rolled_back
             self.fallback_reason = self.snapshot.safety.last_fallback_reason
+            self._snapshot_generation += 1
             self._dirty = True
+            self.store.async_delay_save(self.snapshot.to_dict, delay=600)
             _LOGGER.warning(
                 "Adaptive auto-tuning rolled back due to >30%% performance degradation on %s",
                 self.entry.title,
@@ -823,6 +934,10 @@ class SmartPIDRuntime:
         self.tuning_mode = mode
         if mode != TUNING_MODE_AUTO:
             self._applied_auto_params = None
+            if self.snapshot.safety.applied_params is not None:
+                self.snapshot.safety.applied_params = None
+                self._dirty = True
+                self.store.async_delay_save(self.snapshot.to_dict, delay=600)
         new_options = dict(self.entry.options)
         new_options[CONF_TUNING_MODE] = mode
         al_sec = new_options.get("adaptive_learning")
@@ -839,6 +954,35 @@ class SmartPIDRuntime:
             return
         self.prediction_mode = mode
         self.recommended = self._recompute_recommended()
+        if self.tuning_mode == TUNING_MODE_AUTO:
+            stage, _ = self.get_confidence()
+            if (
+                stage in (ConfidenceStage.TUNED, ConfidenceStage.OPTIMIZED)
+                and not _same_pid_gains(self.recommended, self._applied_auto_params)
+            ):
+                can_apply, reason = self.snapshot.safety.can_auto_apply(
+                    self._active_rls().sample_count,
+                    self.snapshot.coasting.accepted_count,
+                )
+                if can_apply:
+                    prev = (
+                        self._applied_auto_params
+                        if self._applied_auto_params is not None
+                        else self.baseline
+                    )
+                    base_mae = self.snapshot.safety.mean_absolute_error
+                    self.snapshot.safety.begin_application(
+                        prev_params=prev,
+                        baseline_mae=max(0.15, base_mae) if base_mae is not None else 0.3,
+                        baseline_overshoot=0.4,
+                        applied_params=self.recommended,
+                    )
+                    self._applied_auto_params = self.recommended
+                    self.fallback_reason = None
+                    self._dirty = True
+                    self.store.async_delay_save(self.snapshot.to_dict, delay=600)
+                elif self._applied_auto_params is None:
+                    self.fallback_reason = reason
         new_options = dict(self.entry.options)
         new_options[CONF_PREDICTION_MODE] = mode
         al_sec = new_options.get("adaptive_learning")
@@ -915,11 +1059,14 @@ class SmartPIDRuntime:
     async def async_reset_learning(self) -> None:
         """Reset all learned models, coasting history, and safety snapshots."""
         tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
+        self._reset_generation += 1
+        self._snapshot_generation += 1
         self.snapshot = LearningStateSnapshot(
             inertia_profile=self.inertia_profile,
             tau_em_min=tau_em,
             max_coast_window_min=coast_win,
             peak_confirm_delta=peak_delta,
+            learning_unit=self.learning_unit,
         )
         self.recommended = self._recompute_recommended()
         self._applied_auto_params = None
@@ -1007,8 +1154,38 @@ class SmartPIDRuntime:
             "vent_cooldown_min": vent_cooldown_min,
         }
 
-    async def async_apply_bootstrapped_snapshot(self, snapshot: LearningStateSnapshot) -> None:
+    async def async_apply_bootstrapped_snapshot(
+        self,
+        snapshot: LearningStateSnapshot,
+        *,
+        expected_snapshot_generation: int | None = None,
+        expected_reset_generation: int | None = None,
+        expected_apply_generation: int | None = None,
+    ) -> None:
         """Atomically replace learning snapshot from historical bootstrap, persist, and notify."""
+        if not self.is_active_runtime():
+            raise HomeAssistantError("Runtime is unloaded or no longer active.")
+        if (
+            expected_reset_generation is not None
+            and self._reset_generation != expected_reset_generation
+        ):
+            raise HomeAssistantError("Learning state was reset while bootstrap was running.")
+        if (
+            expected_apply_generation is not None
+            and self._apply_generation != expected_apply_generation
+        ):
+            raise HomeAssistantError("Another bootstrap snapshot was already applied while running.")
+        if (
+            expected_snapshot_generation is not None
+            and self._snapshot_generation != expected_snapshot_generation
+        ):
+            raise HomeAssistantError("Learning snapshot changed while bootstrap was running.")
+        if snapshot.learning_unit is not None and snapshot.learning_unit != self.learning_unit:
+            raise HomeAssistantError(
+                f"Bootstrapped snapshot unit {snapshot.learning_unit!r} does not match runtime unit {self.learning_unit!r}."
+            )
+        snapshot.learning_unit = self.learning_unit
+
         tau_em, coast_win, peak_delta = self._resolve_coasting_settings()
         snapshot.coasting.apply_profile_settings(
             self.inertia_profile,
@@ -1016,9 +1193,11 @@ class SmartPIDRuntime:
             max_coast_window_min=coast_win,
             peak_confirm_delta=peak_delta,
         )
+        self._snapshot_generation += 1
+        self._apply_generation += 1
         self.snapshot = snapshot
         self.recommended = self._recompute_recommended()
-        self._applied_auto_params = None
+        self._applied_auto_params = snapshot.safety.applied_params
         self.fallback_reason = None
         self._block_minutes = 0
         self._block_start_val = None
@@ -1032,6 +1211,8 @@ class SmartPIDRuntime:
         self._device_unavailable_since = None
         self._dirty = False
         await self.store.async_save(self.snapshot)
+        if not self.is_active_runtime():
+            return
         self._notify_subscribers()
 
     async def _async_recorder_bootstrap(self) -> None:
@@ -1047,6 +1228,8 @@ class SmartPIDRuntime:
         if not indoor_id:
             return
 
+        start_gen = self._snapshot_generation
+        start_reset_gen = self._reset_generation
         end_time = dt_util.utcnow()
         start_time = end_time - timedelta(days=3)
         try:
@@ -1062,11 +1245,19 @@ class SmartPIDRuntime:
             _LOGGER.debug("Recorder bootstrap skipped safely: %s", err)
             return
 
+        if (
+            not self.is_active_runtime()
+            or self._snapshot_generation != start_gen
+            or self._reset_generation != start_reset_gen
+        ):
+            return
+
         states = (history or {}).get(indoor_id, []) if isinstance(history, Mapping) else []
         if len(states) < 2:
             return
 
         rls = self._active_rls()
+        updated_rls = False
         for prev_st, curr_st in zip(states, states[1:]):
             try:
                 v0 = float(prev_st.state)
@@ -1078,9 +1269,12 @@ class SmartPIDRuntime:
                     dy = (v1 - v0) / dt_min
                     if abs(dy) <= 0.2:
                         rls.update([0.5, 0.0] if self.is_humidity else [0.5, 0.0, 0.0], dy)
+                        updated_rls = True
             except (ValueError, TypeError, AttributeError):
                 continue
 
+        if updated_rls:
+            self._snapshot_generation += 1
         self.recommended = self._recompute_recommended(rls)
         self._dirty = True
         self._notify_subscribers()

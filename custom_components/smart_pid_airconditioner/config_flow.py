@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 from typing import Any
 
@@ -17,10 +18,15 @@ from homeassistant.helpers.selector import (
 
 from .config_utils import get_entry_setting
 from .const import (
+    CONF_AUX_TEMP_SENSOR,
     CONF_AVAILABLE_FAN_MODES,
     CONF_AVAILABLE_HVAC_MODES,
     CONF_CONTROL_MODE,
+    CONF_COUPLED_AC,
+    CONF_COUPLED_DEHUMIDIFIER,
     CONF_THERMOSTAT_TYPE,
+    CONF_VENT_SENSORS,
+    CONF_VENT_SWITCH,
     CONTROL_MODES,
     CONTROL_MODE_SWITCH_PWM,
     DEFAULT_AVAILABLE_FAN_MODES,
@@ -82,10 +88,47 @@ __all__ = [
 ]
 
 
+def _merge_options(
+    existing_options: Mapping[str, Any],
+    step1_payload: Mapping[str, Any],
+    step2_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge OptionsFlow step payloads while keeping nested sections synchronized."""
+    new_options: dict[str, Any] = {
+        **existing_options,
+        **step1_payload,
+        **step2_payload,
+    }
+    for sec_name in ("ventilation", "adaptive_learning", "ki_group"):
+        existing_sec = new_options.get(sec_name)
+        if isinstance(existing_sec, Mapping):
+            updated_sec = dict(existing_sec)
+            for key in list(updated_sec):
+                if key in step1_payload:
+                    updated_sec[key] = step1_payload[key]
+            opt_keys = (
+                (CONF_VENT_SWITCH, CONF_VENT_SENSORS)
+                if sec_name == "ventilation"
+                else (
+                    (CONF_AUX_TEMP_SENSOR, CONF_COUPLED_AC, CONF_COUPLED_DEHUMIDIFIER)
+                    if sec_name == "adaptive_learning"
+                    else ()
+                )
+            )
+            for opt_key in opt_keys:
+                if opt_key in step1_payload:
+                    updated_sec[opt_key] = step1_payload[opt_key]
+            new_options[sec_name] = updated_sec
+    if new_options.get(CONF_CONTROL_MODE) == CONTROL_MODE_SWITCH_PWM:
+        new_options.pop(CONF_AVAILABLE_HVAC_MODES, None)
+        new_options.pop(CONF_AVAILABLE_FAN_MODES, None)
+    return new_options
+
+
 class SmartPIDThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Smart PID Thermostat."""
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self) -> None:
         """Initialize config flow."""
@@ -301,11 +344,11 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlowWithReload):
         if user_input is not None:
             errors, processed = process_pwm_sections_input(user_input)
             if not errors:
-                new_options = {
-                    **self.config_entry.options,
-                    **self._options_data,
-                    **processed,
-                }
+                new_options = _merge_options(
+                    self.config_entry.options,
+                    self._options_data,
+                    processed,
+                )
                 return self.async_create_entry(title="", data=new_options)
 
         schema = build_pwm_sections_schema(self._get_val)
@@ -325,11 +368,11 @@ class SmartPIDThermostatOptionsFlow(config_entries.OptionsFlowWithReload):
                 user_input, self._get_val
             )
             if not errors:
-                new_options = {
-                    **self.config_entry.options,
-                    **self._options_data,
-                    **prepared,
-                }
+                new_options = _merge_options(
+                    self.config_entry.options,
+                    self._options_data,
+                    prepared,
+                )
                 return self.async_create_entry(title="", data=new_options)
 
         selected_hvac_modes = (

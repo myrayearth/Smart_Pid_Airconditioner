@@ -205,6 +205,8 @@ async def test_integral_freeze_and_pwm_off_during_ventilation(hass) -> None:
     assert entity._pwm_state is False
     assert entity.extra_state_attributes["ventilation_state"] == "ventilating"
     assert entity.extra_state_attributes["learning_blocked"] is True
+    await entity.async_will_remove_from_hass()
+    await hass.async_block_till_done()
 
 
 @pytest.mark.asyncio
@@ -269,3 +271,5 @@ async def test_section_0_transitions_dwell_and_integral_freeze(hass) -> None:
     dt_util.set_utcnow(t4)
     await entity._async_calculate_and_control(now=t4, force=False)
     assert entity._active_section in (1, 2, 3, 4)
+    await entity.async_will_remove_from_hass()
+    await hass.async_block_till_done()

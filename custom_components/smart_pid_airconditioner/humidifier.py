@@ -30,6 +30,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
+    async_call_later,
     async_track_point_in_time,
     async_track_state_change_event,
     async_track_time_interval,
@@ -185,6 +186,16 @@ from .const import (
     MODE_DEHUMIDITY,
     MODE_FAN_ONLY,
     MODE_SILENT,
+    CONF_SEC0_ACTION,
+    CONF_SEC0_DELTA,
+    CONF_SEC0_THRESHOLD,
+    DEFAULT_SEC0_ACTION,
+    DEFAULT_SEC0_DELTA_DEHUMIDIFY,
+    DEFAULT_SEC0_DELTA_HUMIDIFY,
+    DEFAULT_SEC0_THRESHOLD,
+    SEC0_ACTION_FAN_ONLY,
+    SEC0_ACTION_OFF,
+    SEC0_ACTION_SETBACK,
     CONF_VENT_COOLDOWN_MIN,
     CONF_VENT_DEBOUNCE_SEC,
     CONF_VENT_LOGIC,
@@ -311,6 +322,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._pid_e: float = 0.0
         self._pid_output: float = 0.0
         self._active_section: int = 1
+        self._section_entered_at: datetime | None = None
         self._vent_status: VentStatus = VentStatus(VentState.NORMAL, False, False, 0, False)
         self._raw_target_humidity: float = self._target_humidity
         self._dispatched_humidity: int | None = None
@@ -339,6 +351,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         self._last_switch_off_time: datetime | None = None
         self._last_switch_on_times: dict[str, datetime] = {}
         self._last_switch_off_times: dict[str, datetime] = {}
+        self._last_run_durations: dict[str, float] = {}
         self._pwm_duty_cycle: float = 0.0
         self._pwm_on_time: float = 0.0
         self._sensor_stale_count: int = 0
@@ -513,6 +526,17 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             setattr(self, f"_sec{idx}_mode", mode_val)
             setattr(self, f"_sec{idx}_apply_hvac_mode", apply_mode)
             setattr(self, f"_sec{idx}_hvac_mode", mode_val)
+
+        self._sec0_threshold: float = float(
+            self._get_setting(CONF_SEC0_THRESHOLD, DEFAULT_SEC0_THRESHOLD)
+        )
+        self._sec0_action: str = str(
+            self._get_setting(CONF_SEC0_ACTION, DEFAULT_SEC0_ACTION)
+        )
+        raw_sec0_delta = self._get_setting(CONF_SEC0_DELTA, None)
+        self._sec0_delta_explicit: float | None = (
+            float(raw_sec0_delta) if raw_sec0_delta is not None else None
+        )
 
         self._vent_guard = build_ventilation_guard(self._get_setting)
         self._manual_override_min: int = int(
@@ -709,12 +733,15 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             active_section=self._active_section,
             integral=self._integral,
             last_run_duration_sec=self._last_run_duration_sec,
+            last_run_durations={k: float(v) for k, v in self._last_run_durations.items()},
+            integral_format="per_minute",
         )
 
     async def async_added_to_hass(self) -> None:
         """Restore state and set up event listeners."""
         await super().async_added_to_hass()
 
+        max_i_lim = max(0.0, float(self._max_i))
         last_state = await self.async_get_last_state()
         if last_state is not None:
             self._is_on = (last_state.state == STATE_ON)
@@ -729,9 +756,9 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 self._current_mode = str(m)
 
             old_i = last_state.attributes.get("pid_i")
-            if old_i is not None and self._ki > 0:
+            if old_i is not None:
                 try:
-                    self._integral = float(old_i) / self._ki
+                    self._integral = max(-max_i_lim, min(max_i_lim, float(old_i)))
                 except (ValueError, TypeError):
                     pass
 
@@ -757,10 +784,26 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 self._last_switch_on_time = max(self._last_switch_on_times.values())
             if self._last_switch_off_times:
                 self._last_switch_off_time = max(self._last_switch_off_times.values())
-            if extra_data.active_section in (1, 2, 3, 4):
+            if extra_data.active_section in (0, 1, 2, 3, 4):
                 self._active_section = extra_data.active_section
+            for dev_id, dur in extra_data.last_run_durations.items():
+                if (
+                    isinstance(dur, (int, float))
+                    and not isinstance(dur, bool)
+                    and math.isfinite(float(dur))
+                ):
+                    self._last_run_durations[dev_id] = max(0.0, float(dur))
             if self._is_on:
-                self._integral = float(extra_data.integral)
+                restored_i = float(extra_data.integral)
+                if extra_data.integral_format != "per_minute":
+                    dt_factor = (
+                        float(self._sample_period) / 60.0
+                        if self._sample_period > 0
+                        else 1.0
+                    )
+                    restored_i = restored_i * float(self._ki) * dt_factor
+                if math.isfinite(restored_i):
+                    self._integral = max(-max_i_lim, min(max_i_lim, restored_i))
             self._last_run_duration_sec = max(0.0, float(extra_data.last_run_duration_sec))
 
         self._restore_reload_off()
@@ -1065,36 +1108,68 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 self._device_unavailable = is_unavail
             if is_unavail:
                 return
+            old_state = event.data.get("old_state")
+            new_lower = new_state.state.lower()
+            old_lower = old_state.state.lower() if old_state is not None else None
+            cur_st = self.hass.states.get(entity_id)
+            cur_lower = (
+                cur_st.state.lower()
+                if cur_st is not None and cur_st.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+                else None
+            )
             if (
                 self._control_mode == CONTROL_MODE_SWITCH_PWM
                 and entity_id == self._active_target_device_id()
             ):
-                self._pwm_state = new_state.state.lower() == STATE_ON
+                self._pwm_state = (cur_lower if cur_lower is not None else new_lower) == STATE_ON
                 self.async_write_ha_state()
             if (
                 self._control_mode == CONTROL_MODE_SWITCH_PWM
-                and new_state.state.lower() == STATE_OFF
+                and new_lower == STATE_OFF
                 and entity_id in self._unverified_off_devices
             ):
                 prior_run_dur = self._unverified_off_devices.get(
-                    entity_id, self._last_run_duration_sec
+                    entity_id,
+                    self._last_run_durations.get(entity_id, self._last_run_duration_sec),
                 )
                 off_at = dt_util.utcnow()
                 self._record_confirmed_off(
                     entity_id, off_at, run_dur_override=prior_run_dur
                 )
-                eff = self._compute_effective_min_off(prior_run_dur)
+                eff = self._compute_effective_min_off(
+                    prior_run_dur, device_id=entity_id
+                )
                 if eff > 0:
                     deadline = off_at + timedelta(seconds=eff)
                     prev_dl = self._reload_min_off_deadlines.get(entity_id)
                     if prev_dl is None or deadline > prev_dl:
                         self._reload_min_off_deadlines[entity_id] = deadline
+            elif self._control_mode == CONTROL_MODE_SWITCH_PWM:
+                prev_on = self._last_switch_on_times.get(entity_id)
+                prev_off = self._last_switch_off_times.get(entity_id)
+                if (
+                    new_lower == STATE_ON
+                    and cur_lower == STATE_ON
+                    and not self._switch_guard.is_off_pending(entity_id)
+                ):
+                    if prev_on is None or (prev_off is not None and prev_off >= prev_on):
+                        on_at = dt_util.utcnow()
+                        self._last_switch_on_times[entity_id] = on_at
+                        if entity_id == self._active_target_device_id():
+                            self._last_switch_on_time = on_at
+                elif new_lower == STATE_OFF and cur_lower == STATE_OFF:
+                    if (
+                        prev_on is not None
+                        and (prev_off is None or prev_on > prev_off)
+                    ) or (old_lower == STATE_ON and prev_off is None):
+                        self._record_confirmed_off(entity_id, dt_util.utcnow())
             if (
                 self._control_mode == CONTROL_MODE_SWITCH_PWM
                 and self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY
                 and self._is_on
                 and entity_id == self._inactive_target_device_id()
-                and new_state.state.lower() == STATE_ON
+                and new_lower == STATE_ON
+                and cur_lower == STATE_ON
             ):
                 _LOGGER.warning(
                     "Inactive PWM device %s turned ON unexpectedly while active! Forcing it OFF.",
@@ -1197,8 +1272,9 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the humidifier."""
         self._is_on = False
-        await self._async_turn_off_all_devices()
+        self._pwm_cycle_id += 1
         self._cancel_pwm_timers()
+        await self._async_turn_off_all_devices(force=True)
         self._reset_pid_state()
         self.async_write_ha_state()
 
@@ -1254,21 +1330,78 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
     # ---------------------------------------------------------
     # PID Section Mapping
     # ---------------------------------------------------------
-    def _determine_active_section(self, output: float) -> int:
-        """Map PID output percentage to section 1..4 with hysteresis."""
+    def _is_physically_running(self) -> bool:
+        """Return True if the physical humidifier/dehumidifier or PWM switch is actively running."""
+        if self.hass is None:
+            return False
+        if self._control_mode == CONTROL_MODE_SWITCH_PWM:
+            any_known = False
+            for dev_id in self._pwm_device_ids():
+                st = self.hass.states.get(dev_id)
+                if st is not None and st.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                    any_known = True
+                    if st.state == STATE_ON:
+                        return True
+            if any_known:
+                return False
+            return bool(self._pwm_state)
+
+        target_id = self._active_target_device_id()
+        if not target_id:
+            return False
+        st = self.hass.states.get(target_id)
+        if st is None or st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return False
+        if st.state != STATE_ON:
+            return False
+        action = st.attributes.get("action") or st.attributes.get("hvac_action")
+        if action is not None:
+            action_lower = str(action).lower().strip()
+            if action_lower in ("idle", "off"):
+                return False
+            if action_lower in ("humidifying", "drying", "heating", "cooling"):
+                return True
+        return True
+
+    def _determine_active_section(
+        self,
+        output: float,
+        now: datetime | None = None,
+        force_sec0: bool = False,
+    ) -> int:
+        """Map PID output percentage to section 0..4 with hysteresis and dwell."""
         return determine_active_section(
             output=output,
             current_sec=self._active_section,
             sec1_max=self._sec1_max,
             sec2_max=self._sec2_max,
             sec3_max=self._sec3_max,
-            allow_sec0=False,
+            sec0_threshold=self._sec0_threshold,
+            section_entered_at=self._section_entered_at,
+            now=now,
+            force_sec0=force_sec0,
+            allow_sec0=True,
         )
 
     def _get_section_parameters(
         self, section: int
     ) -> tuple[bool, float, bool, str, bool, str]:
         """Return (apply_temp, delta, apply_action, action, apply_mode, mode)."""
+        if section == 0:
+            if self._sec0_action == SEC0_ACTION_OFF:
+                return (False, 0.0, True, "off", False, "")
+            if self._sec0_action == SEC0_ACTION_FAN_ONLY:
+                return (False, 0.0, True, "on", True, MODE_FAN_ONLY)
+            delta = (
+                self._sec0_delta_explicit
+                if self._sec0_delta_explicit is not None
+                else (
+                    DEFAULT_SEC0_DELTA_HUMIDIFY
+                    if self._is_heating
+                    else DEFAULT_SEC0_DELTA_DEHUMIDIFY
+                )
+            )
+            return (True, delta, False, DEFAULT_SEC_ACTION, False, "")
         idx = section if section in (1, 2, 3) else 4
         return (
             getattr(self, f"_sec{idx}_apply_temp"),
@@ -1401,8 +1534,11 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                         filtered_d=self._filtered_d,
                         last_d_calc_time=self._last_d_calc_time,
                         prev_val=getattr(self, "_prev_room_humidity", None),
-                        freeze_integral=self._vent_status.should_pause_control,
-                        per_minute_integral=False,
+                        freeze_integral=(
+                            self._vent_status.should_pause_control
+                            or self._active_section == 0
+                        ),
+                        per_minute_integral=True,
                     )
                     error = step.error
                     p_term = step.p_term
@@ -1450,7 +1586,10 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     and indoor_val_valid
                 )
                 early_stop_pred = (
-                    self._runtime.get_early_stop_prediction()
+                    self._runtime.get_early_stop_prediction_in_control_units(
+                        current_rh=self._indoor_humidity,
+                        is_heating=self._is_heating,
+                    )
                     if self._runtime is not None
                     else 0.0
                 )
@@ -1461,14 +1600,8 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     and self._pid_error <= early_stop_pred
                 )
 
-                is_running = (
-                    self._is_on
-                    and not self._vent_status.should_pause_control
-                    and not watchdog_resting
-                    and not coupled_ac_inhibit
-                    and self._pid_output > 0.0
-                )
-                if is_running:
+                physically_running = self._is_physically_running()
+                if self._is_on and not watchdog_resting and physically_running:
                     if self._continuous_run_start is None:
                         self._continuous_run_start = now
                     elif (
@@ -1482,8 +1615,23 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 else:
                     self._continuous_run_start = None
 
-                # Map section
-                new_section = self._determine_active_section(self._pid_output)
+                force_sec0 = bool(
+                    self._fail_safe_active
+                    or not self._is_on
+                    or self._vent_status.should_pause_control
+                    or watchdog_resting
+                    or coupled_ac_inhibit
+                    or early_stop_triggered
+                )
+                new_section = self._determine_active_section(
+                    self._pid_output,
+                    now=now,
+                    force_sec0=force_sec0,
+                )
+                if new_section != self._active_section:
+                    self._section_entered_at = now
+                elif self._section_entered_at is None:
+                    self._section_entered_at = now
                 self._active_section = new_section
 
                 (
@@ -1525,22 +1673,85 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                             early_stop_active=early_stop_triggered,
                         )
 
-                if manual_override_active:
-                    _report_hum_obs(self._is_on)
+                # Safety watchdog takes precedence over manual override and Section 0 setback
+                if watchdog_resting:
+                    self._cancel_pwm_timers()
+                    self._pwm_state = False
+                    self._active_section = 0
+                    self._last_dispatched_section = 0
+                    self._section_entered_at = now
+                    await self._async_turn_off_all_devices(force=True)
+                    _report_hum_obs(False)
                     return
 
-                # When OFF, VENTILATING, watchdog resting, coupled AC cooling, or early-stop: turn off
+                if manual_override_active:
+                    _report_hum_obs(self._is_physically_running())
+                    return
+
+                # When OFF, VENTILATING, coupled AC cooling, or early-stop: turn off
                 if (
                     not self._is_on
                     or self._vent_status.should_pause_control
-                    or watchdog_resting
                     or coupled_ac_inhibit
                     or early_stop_triggered
                 ):
                     self._cancel_pwm_timers()
                     self._pwm_state = False
-                    await self._async_turn_off_all_devices()
+                    await self._async_turn_off_all_devices(force=True)
                     _report_hum_obs(False)
+                    return
+
+                # Fail-safe in climate_delta mode: stay in Section 0 standby and never wake an OFF slave
+                if (
+                    self._control_mode == CONTROL_MODE_CLIMATE_DELTA
+                    and self._fail_safe_active
+                ):
+                    self._active_section = 0
+                    if self._sec0_action == SEC0_ACTION_OFF:
+                        self._last_dispatched_section = 0
+                        await self._async_turn_off_all_devices(force=True)
+                        _report_hum_obs(False)
+                        return
+                    target_id = self._active_target_device_id()
+                    slave_state = (
+                        self.hass.states.get(target_id)
+                        if (self.hass is not None and target_id)
+                        else None
+                    )
+                    if slave_state is None or slave_state.state != STATE_ON:
+                        self._last_dispatched_section = 0
+                        _report_hum_obs(False)
+                        return
+                    (
+                        s0_apply_temp,
+                        s0_delta,
+                        s0_apply_action,
+                        s0_action,
+                        s0_apply_mode,
+                        s0_mode,
+                    ) = self._get_section_parameters(0)
+                    s0_hum = (
+                        self._target_humidity + s0_delta
+                        if s0_apply_temp
+                        else self._target_humidity
+                    )
+                    s0_int_hum = int(
+                        round(max(self._min_humidity, min(self._max_humidity, s0_hum)))
+                    )
+                    self._dispatched_humidity = s0_int_hum
+                    self._dispatched_action = s0_action if s0_apply_action else None
+                    self._dispatched_mode = s0_mode if s0_apply_mode else None
+                    await self._async_dispatch_control(
+                        section=0,
+                        target_humidity=s0_int_hum,
+                        apply_temp=s0_apply_temp,
+                        apply_action=s0_apply_action,
+                        action=s0_action,
+                        apply_mode=s0_apply_mode,
+                        mode=s0_mode,
+                        force=force,
+                    )
+                    _report_hum_obs(self._is_physically_running())
                     return
 
                 # When ON: dispatch control
@@ -1554,7 +1765,29 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     mode=mode,
                     force=force,
                 )
-                _report_hum_obs(True)
+                if self._control_mode == CONTROL_MODE_SWITCH_PWM:
+                    actual_active = bool(self._pwm_state)
+                elif apply_action and action == "off":
+                    actual_active = False
+                else:
+                    target_id = self._active_target_device_id()
+                    slave_state = (
+                        self.hass.states.get(target_id)
+                        if (self.hass is not None and target_id)
+                        else None
+                    )
+                    actual_active = (
+                        self._is_physically_running()
+                        if slave_state is not None
+                        else True
+                    )
+                if (
+                    actual_active
+                    and self._continuous_run_start is None
+                    and self._is_physically_running()
+                ):
+                    self._continuous_run_start = now
+                _report_hum_obs(actual_active)
 
             except Exception as ex:
                 _LOGGER.exception("Unexpected error in humidifier calculate_and_control: %s", ex)
@@ -1727,6 +1960,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             return
         self._cancel_pwm_timers()
         self._pwm_cycle_id += 1
+        cycle_id = self._pwm_cycle_id
 
         self._cycle_start_time = now
         self._cycle_end_time = now + timedelta(seconds=self._pwm_duration)
@@ -1750,13 +1984,19 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
 
         # Full OFF
         if duty_cycle <= 0.0 or on_time < float(self._min_on_time):
-            await self._async_turn_off_switch(active_dev)
+            await self._async_turn_off_switch(active_dev, force=False)
             self._schedule_next_cycle(self._cycle_end_time)
             return
 
         # Full ON
-        if duty_cycle >= 1.0 or off_time < self._compute_effective_min_off():
-            turned_on = await self._async_turn_on_switch(active_dev)
+        if duty_cycle >= 1.0 or off_time < self._compute_effective_min_off(device_id=active_dev):
+            self._cycle_turn_off_time = None
+            turned_on = await self._async_turn_on_switch(
+                active_dev,
+                expected_cycle_id=cycle_id,
+                expected_device=active_dev,
+                on_deadline=self._cycle_end_time,
+            )
             self._pwm_state = bool(turned_on)
             self._schedule_next_cycle(self._cycle_end_time)
             return
@@ -1765,14 +2005,116 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         turn_off_time = now + timedelta(seconds=on_time)
         self._cycle_turn_off_time = turn_off_time
 
-        turned_on = await self._async_turn_on_switch(active_dev)
+        turned_on = await self._async_turn_on_switch(
+            active_dev,
+            expected_cycle_id=cycle_id,
+            expected_device=active_dev,
+            on_deadline=turn_off_time,
+        )
         self._pwm_state = bool(turned_on)
 
         if turned_on:
+            on_at = self._last_switch_on_times.get(active_dev, dt_util.utcnow())
+            actual_off_time = (
+                max(turn_off_time, on_at + timedelta(seconds=float(self._min_on_time)))
+                if self._min_on_time > 0
+                else turn_off_time
+            )
+            self._cycle_turn_off_time = actual_off_time
             self._pwm_turn_off_cancel = async_track_point_in_time(
-                self.hass, self._async_pwm_turn_off_callback, turn_off_time
+                self.hass, self._async_pwm_turn_off_callback, actual_off_time
             )
         self._schedule_next_cycle(self._cycle_end_time)
+
+    def _schedule_deferred_turn_on(
+        self,
+        delay_sec: float,
+        cycle_id: int,
+        target_dev: str,
+        on_deadline: datetime,
+    ) -> None:
+        """Schedule a deferred PWM switch turn-on once min_off expires."""
+        if self._pwm_turn_on_cancel is not None:
+            self._pwm_turn_on_cancel()
+            self._pwm_turn_on_cancel = None
+        if self.hass is None or self._shutting_down:
+            return
+
+        @callback
+        def _on_timer(_now: datetime) -> None:
+            self._pwm_turn_on_cancel = None
+            self._run_async(
+                self._async_deferred_turn_on(cycle_id, target_dev, on_deadline)
+            )
+
+        self._pwm_turn_on_cancel = async_call_later(
+            self.hass, max(0.05, float(delay_sec)), _on_timer
+        )
+
+    async def _async_deferred_turn_on(
+        self, cycle_id: int, target_dev: str, on_deadline: datetime
+    ) -> None:
+        """Execute deferred PWM switch turn-on if cycle and safety conditions still hold."""
+        if (
+            self._shutting_down
+            or self.hass is None
+            or not self._is_on
+            or cycle_id != self._pwm_cycle_id
+            or target_dev != self._active_target_device_id()
+        ):
+            return
+        if (
+            self._vent_status.should_pause_control
+            or (
+                self._watchdog_rest_until is not None
+                and dt_util.utcnow() < self._watchdog_rest_until
+            )
+            or (
+                self._runtime is not None
+                and not self._is_heating
+                and self._runtime.is_coupled_ac_cooling()
+            )
+        ):
+            return
+        turned_on = await self._async_turn_on_switch(
+            target_dev,
+            expected_cycle_id=cycle_id,
+            expected_device=target_dev,
+            on_deadline=on_deadline,
+        )
+        if not turned_on:
+            return
+        self._pwm_state = True
+        on_at = self._last_switch_on_times.get(target_dev, dt_util.utcnow())
+        desired_off = (
+            max(on_deadline, on_at + timedelta(seconds=float(self._min_on_time)))
+            if self._min_on_time > 0
+            else on_deadline
+        )
+        if (
+            desired_off > dt_util.utcnow()
+            and (self._cycle_end_time is None or desired_off < self._cycle_end_time)
+        ):
+            self._cycle_turn_off_time = desired_off
+            if self._pwm_turn_off_cancel is not None:
+                self._pwm_turn_off_cancel()
+            self._pwm_turn_off_cancel = async_track_point_in_time(
+                self.hass, self._async_pwm_turn_off_callback, desired_off
+            )
+        self.async_write_ha_state()
+
+    async def _async_deferred_turn_off(
+        self, expected_cycle_id: int, device_id: str
+    ) -> None:
+        """Execute deferred PWM switch turn-off once min_on expires."""
+        if self._shutting_down or self.hass is None:
+            return
+        if expected_cycle_id != self._pwm_cycle_id:
+            return
+        if device_id != self._active_target_device_id():
+            return
+        await self._async_turn_off_switch(device_id, force=True)
+        self.async_write_ha_state()
 
     def _schedule_next_cycle(self, cycle_end_time: datetime) -> None:
         """Schedule next PWM cycle."""
@@ -1785,7 +2127,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         if self._shutting_down or self.hass is None:
             return
         active_dev = self._active_target_device_id()
-        await self._async_turn_off_switch(active_dev)
+        await self._async_turn_off_switch(active_dev, force=False)
         self.async_write_ha_state()
 
     async def _async_pwm_cycle_callback(self, now: datetime) -> None:
@@ -1809,13 +2151,18 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             if d
         ]
 
-    def _compute_effective_min_off(self, run_duration_sec: float | None = None) -> float:
+    def _compute_effective_min_off(
+        self,
+        run_duration_sec: float | None = None,
+        *,
+        device_id: str | None = None,
+    ) -> float:
         """Compute effective minimum OFF protection time in seconds."""
-        run_dur = (
-            self._last_run_duration_sec
-            if run_duration_sec is None
-            else max(0.0, float(run_duration_sec))
-        )
+        if run_duration_sec is not None:
+            run_dur = max(0.0, float(run_duration_sec))
+        else:
+            dev = device_id or self._active_target_device_id()
+            run_dur = self._last_run_durations.get(dev, self._last_run_duration_sec)
         return compute_effective_min_off(
             self._min_off_time,
             run_dur,
@@ -1834,18 +2181,20 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         last_off = self._last_switch_off_times.get(dev_id, self._last_switch_off_time)
         active_dev = self._active_target_device_id()
         is_active_target = dev_id == active_dev
+        had_active_run = run_dur_override is not None or (
+            last_on is not None and (last_off is None or last_on > last_off)
+        )
         if run_dur_override is not None:
             run_dur = max(0.0, float(run_dur_override))
         elif last_on is not None and (last_off is None or last_on > last_off):
             run_dur = max(0.0, (off_at - last_on).total_seconds())
         else:
-            run_dur = self._last_run_duration_sec
+            run_dur = self._last_run_durations.get(dev_id, self._last_run_duration_sec)
 
-        if is_active_target and (
-            run_dur_override is not None
-            or (last_on is not None and (last_off is None or last_on > last_off))
-        ):
-            self._last_run_duration_sec = run_dur
+        if had_active_run:
+            self._last_run_durations[dev_id] = run_dur
+            if is_active_target:
+                self._last_run_duration_sec = run_dur
 
         self._last_switch_off_times[dev_id] = off_at
         if (
@@ -1875,7 +2224,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         shutdown_records: dict[str, tuple[datetime, float]] = {}
         unverified_devices: dict[str, float] = {}
 
-        for dev_id in self._pwm_device_ids():
+        async def _shutdown_single_device(dev_id: str) -> None:
             st = self.hass.states.get(dev_id)
             state_val = st.state if st is not None else None
             is_active_target = dev_id == active_dev
@@ -1888,10 +2237,12 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 STATE_UNAVAILABLE,
             )
             was_unverified = dev_id in self._unverified_off_devices
+            inflight_on = self._switch_guard.has_inflight_on(dev_id)
             needs_shutdown = (
                 state_is_on
                 or internal_active
                 or was_unverified
+                or inflight_on
                 or (
                     state_is_indeterminate
                     and controller_active
@@ -1899,7 +2250,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 )
             )
             if not needs_shutdown:
-                continue
+                return
 
             now_before = dt_util.utcnow()
             last_on = self._last_switch_on_times.get(dev_id, self._last_switch_on_time)
@@ -1908,12 +2259,14 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             elif last_on is not None:
                 run_dur = max(0.0, (now_before - last_on).total_seconds())
             else:
-                run_dur = self._last_run_duration_sec
+                run_dur = self._last_run_durations.get(
+                    dev_id, self._last_run_duration_sec
+                )
 
             confirmed_off = False
             try:
                 confirmed_off = await self._switch_guard.async_turn_off(
-                    dev_id, confirm=True
+                    dev_id, confirm=True, deadline_timeout=4.0
                 )
                 if not confirmed_off:
                     _LOGGER.error(
@@ -1937,7 +2290,9 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 recorded_dur = self._record_confirmed_off(
                     dev_id,
                     off_at,
-                    run_dur_override=run_dur if (is_active_target and last_on is not None) or was_unverified else None,
+                    run_dur_override=run_dur
+                    if (is_active_target and last_on is not None) or was_unverified
+                    else None,
                 )
                 shutdown_records[dev_id] = (off_at, recorded_dur)
             else:
@@ -1947,6 +2302,10 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 if is_active_target:
                     self._pwm_state = bool(cur_st is not None and cur_st.state == STATE_ON)
 
+        await asyncio.gather(
+            *(_shutdown_single_device(dev_id) for dev_id in self._pwm_device_ids()),
+            return_exceptions=True,
+        )
         return shutdown_records, unverified_devices
 
     def _record_reload_off(
@@ -1976,7 +2335,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             if shutdown_records and dev_id in shutdown_records:
                 reload_unverified.pop(dev_id, None)
                 off_at, run_dur = shutdown_records[dev_id]
-                eff = self._compute_effective_min_off(run_dur)
+                eff = self._compute_effective_min_off(run_dur, device_id=dev_id)
                 deadline = (
                     off_at + timedelta(seconds=eff) if eff > 0 else None
                 )
@@ -1998,7 +2357,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 run_dur = (
                     max(0.0, (now - last_on).total_seconds())
                     if last_on is not None
-                    else self._last_run_duration_sec
+                    else self._last_run_durations.get(dev_id, self._last_run_duration_sec)
                 )
                 reload_off.pop(dev_id, None)
                 reload_unverified[dev_id] = run_dur
@@ -2008,7 +2367,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 dev_id,
                 self._last_switch_off_time if dev_id == active_dev else None,
             )
-            eff = self._compute_effective_min_off()
+            eff = self._compute_effective_min_off(device_id=dev_id)
             deadline = (
                 last_off + timedelta(seconds=eff)
                 if last_off is not None and eff > 0
@@ -2099,7 +2458,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 return False
             off_at = dt_util.utcnow()
             self._record_confirmed_off(dev_id, off_at, run_dur_override=prior_run_dur)
-            eff = self._compute_effective_min_off(prior_run_dur)
+            eff = self._compute_effective_min_off(prior_run_dur, device_id=dev_id)
             if eff > 0:
                 deadline = off_at + timedelta(seconds=eff)
                 prev_dl = self._reload_min_off_deadlines.get(dev_id)
@@ -2107,7 +2466,14 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                     self._reload_min_off_deadlines[dev_id] = deadline
         return True
 
-    async def _async_turn_on_switch(self, device_id: str) -> bool:
+    async def _async_turn_on_switch(
+        self,
+        device_id: str,
+        *,
+        expected_cycle_id: int | None = None,
+        expected_device: str | None = None,
+        on_deadline: datetime | None = None,
+    ) -> bool:
         """Turn on switch/input_boolean after enforcing min_off, reload guard, and dual-relay interlock."""
         if self._shutting_down or not device_id or self.hass is None:
             return False
@@ -2123,59 +2489,124 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
 
         now = dt_util.utcnow()
         reload_deadline = self._reload_min_off_deadlines.get(device_id)
+        reload_remaining = 0.0
         if reload_deadline is not None:
             if now < reload_deadline:
-                _LOGGER.info(
-                    "Anti-short-cycling: switch %s ON blocked by reload carry-over (%.1fs remaining)",
-                    device_id,
-                    (reload_deadline - now).total_seconds(),
-                )
-                return False
-            self._reload_min_off_deadlines.pop(device_id, None)
+                reload_remaining = (reload_deadline - now).total_seconds()
+            else:
+                self._reload_min_off_deadlines.pop(device_id, None)
 
         if self._thermostat_type == THERMOSTAT_TYPE_HUMIDITY_DEHUMIDITY:
             last_off = self._last_switch_off_times.get(device_id)
         else:
             last_off = self._last_switch_off_times.get(device_id, self._last_switch_off_time)
-        effective_min_off = self._compute_effective_min_off()
+        effective_min_off = self._compute_effective_min_off(device_id=device_id)
+        off_remaining = 0.0
         if last_off is not None and effective_min_off > 0.0:
             elapsed_off = (now - last_off).total_seconds()
             if elapsed_off < effective_min_off:
-                _LOGGER.info(
-                    "Anti-short-cycling: switch %s ON blocked (%.1fs < effective min_off %.1fs)",
-                    device_id,
-                    elapsed_off,
-                    effective_min_off,
-                )
-                return False
+                off_remaining = effective_min_off - elapsed_off
+
+        remaining_off = max(reload_remaining, off_remaining)
+        if remaining_off > 0.05:
+            _LOGGER.info(
+                "Anti-short-cycling: switch %s ON blocked (%.1fs remaining cooldown)",
+                device_id,
+                remaining_off,
+            )
+            if (
+                expected_cycle_id is not None
+                and expected_device == device_id
+                and on_deadline is not None
+            ):
+                ready_at = now + timedelta(seconds=remaining_off)
+                usable_run_sec = (on_deadline - ready_at).total_seconds()
+                if usable_run_sec >= max(0.05, float(self._min_on_time)):
+                    self._schedule_deferred_turn_on(
+                        remaining_off, expected_cycle_id, device_id, on_deadline
+                    )
+            return False
 
         st = self.hass.states.get(device_id)
         if st is not None and st.state == STATE_ON:
+            prev_on = self._last_switch_on_times.get(device_id)
+            prev_off = self._last_switch_off_times.get(device_id)
+            if prev_on is None or (prev_off is not None and prev_off >= prev_on):
+                self._last_switch_on_time = now
+                self._last_switch_on_times[device_id] = now
             return True
         _LOGGER.info("Turning ON switch %s", device_id)
         if await self._switch_guard.async_turn_on(device_id, confirm=False):
-            self._last_switch_on_time = now
-            self._last_switch_on_times[device_id] = now
+            on_at = dt_util.utcnow()
+            self._last_switch_on_time = on_at
+            self._last_switch_on_times[device_id] = on_at
             return True
         return False
 
-    async def _async_turn_off_switch(self, device_id: str) -> bool:
+    async def _async_turn_off_switch(
+        self, device_id: str, *, force: bool = False
+    ) -> bool:
         """Turn off switch/input_boolean and record OFF timestamp only upon confirmation."""
         if not device_id or self.hass is None:
             return False
+        now = dt_util.utcnow()
+        last_on = self._last_switch_on_times.get(device_id, self._last_switch_on_time)
+        last_off = self._last_switch_off_times.get(device_id, self._last_switch_off_time)
         if (
             self._switch_guard.is_confirmed_off(device_id)
             and not self._switch_guard.is_off_pending(device_id)
+            and not self._switch_guard.has_inflight_on(device_id)
             and device_id not in self._unverified_off_devices
         ):
+            if last_on is not None and (last_off is None or last_on > last_off):
+                self._record_confirmed_off(device_id, now)
             if device_id == self._active_target_device_id():
                 self._pwm_state = False
             return True
 
+        cur_st = self.hass.states.get(device_id)
+        is_currently_on = cur_st is not None and cur_st.state == STATE_ON
+        if (
+            not force
+            and self._min_on_time > 0
+            and last_on is not None
+            and (last_off is None or last_on >= last_off)
+            and (
+                is_currently_on
+                or (device_id == self._active_target_device_id() and self._pwm_state)
+            )
+        ):
+            elapsed_on = (now - last_on).total_seconds()
+            remaining_on = float(self._min_on_time) - elapsed_on
+            if remaining_on > 0.05:
+                _LOGGER.info(
+                    "Anti-short-cycling: switch %s OFF deferred by %.1fs (elapsed_on=%.1fs < min_on=%ds)",
+                    device_id,
+                    remaining_on,
+                    elapsed_on,
+                    self._min_on_time,
+                )
+                if self._pwm_turn_off_cancel is not None:
+                    self._pwm_turn_off_cancel()
+                    self._pwm_turn_off_cancel = None
+                expected_cycle = self._pwm_cycle_id
+                defer_at = now + timedelta(seconds=remaining_on)
+                if (
+                    device_id == self._active_target_device_id()
+                    and self._cycle_end_time is not None
+                    and defer_at < self._cycle_end_time
+                ):
+                    self._cycle_turn_off_time = defer_at
+                self._pwm_turn_off_cancel = async_track_point_in_time(
+                    self.hass,
+                    lambda _t, _cid=expected_cycle, _dev=device_id: self._run_async(
+                        self._async_deferred_turn_off(_cid, _dev)
+                    ),
+                    defer_at,
+                )
+                return False
+
         _LOGGER.info("Turning OFF switch %s", device_id)
-        now = dt_util.utcnow()
-        last_on = self._last_switch_on_times.get(device_id, self._last_switch_on_time)
-        last_off = self._last_switch_off_times.get(device_id, self._last_switch_off_time)
         try:
             confirmed = await self._switch_guard.async_turn_off(device_id, confirm=True)
         except Exception as err:
@@ -2183,15 +2614,16 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             confirmed = False
 
         if confirmed:
-            self._record_confirmed_off(device_id, now)
+            confirmed_at = dt_util.utcnow()
+            self._record_confirmed_off(device_id, confirmed_at)
             if device_id == self._active_target_device_id():
                 self._pwm_state = False
             return True
 
         run_dur = (
-            max(0.0, (now - last_on).total_seconds())
+            max(0.0, (dt_util.utcnow() - last_on).total_seconds())
             if last_on is not None and (last_off is None or last_on > last_off)
-            else self._last_run_duration_sec
+            else self._last_run_durations.get(device_id, self._last_run_duration_sec)
         )
         self._unverified_off_devices[device_id] = run_dur
         if device_id == self._active_target_device_id():
@@ -2206,6 +2638,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         if (
             self._switch_guard.is_confirmed_off(device_id)
             and not self._switch_guard.is_off_pending(device_id)
+            and not self._switch_guard.has_inflight_on(device_id)
             and device_id not in self._unverified_off_devices
         ):
             return True
@@ -2226,7 +2659,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         run_dur = (
             max(0.0, (now - last_on).total_seconds())
             if last_on is not None and (last_off is None or last_on > last_off)
-            else self._last_run_duration_sec
+            else self._last_run_durations.get(device_id, self._last_run_duration_sec)
         )
         self._unverified_off_devices[device_id] = run_dur
         _LOGGER.error(
@@ -2236,23 +2669,26 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
         )
         return False
 
-    async def _async_turn_off_all_devices(self) -> None:
-        """Turn off all associated slave/switch target devices."""
+    async def _async_turn_off_all_devices(self, *, force: bool = False) -> None:
+        """Turn off all associated slave/switch target devices in parallel."""
         devices = self._pwm_device_ids()
-        first_turned_off = False
+        targets: list[str] = []
         for dev in devices:
             if not dev:
                 continue
             if (
                 self._switch_guard.is_confirmed_off(dev)
                 and not self._switch_guard.is_off_pending(dev)
+                and not self._switch_guard.has_inflight_on(dev)
                 and dev not in self._unverified_off_devices
             ):
                 continue
-            if first_turned_off:
-                await asyncio.sleep(0.5)
-            await self._async_turn_off_specific_device(dev)
-            first_turned_off = True
+            targets.append(dev)
+        if targets:
+            await asyncio.gather(
+                *(self._async_turn_off_specific_device(dev) for dev in targets),
+                return_exceptions=True,
+            )
 
     async def _async_keep_alive_handler(self, now: datetime) -> None:
         """Periodic keep-alive handler ensuring switch state integrity via SwitchCommandGuard."""
@@ -2273,7 +2709,7 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
                 and self._runtime.is_coupled_ac_cooling()
             )
         ):
-            await self._async_turn_off_all_devices()
+            await self._async_turn_off_all_devices(force=True)
             return
 
         active_dev = self._active_target_device_id()
@@ -2301,10 +2737,13 @@ class SmartPIDHumidifierEntity(HumidifierEntity, RestoreEntity):
             if cur_st is not None and cur_st.state == STATE_ON:
                 await self._switch_guard.async_turn_on(active_dev, confirm=False)
             else:
-                await self._async_turn_on_switch(active_dev)
+                turned_on = await self._async_turn_on_switch(active_dev)
+                if not turned_on:
+                    self._pwm_state = False
+                    self.async_write_ha_state()
             return
 
-        await self._async_turn_off_switch(active_dev)
+        await self._async_turn_off_switch(active_dev, force=False)
         inactive_dev = self._inactive_target_device_id(active_dev)
         if inactive_dev:
             inact_st = self.hass.states.get(inactive_dev)

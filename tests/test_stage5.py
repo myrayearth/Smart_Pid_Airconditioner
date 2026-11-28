@@ -119,6 +119,21 @@ async def test_manual_override_context_and_safety_watchdog(hass) -> None:
         {"hvac_modes": ["off", "cool"], "fan_modes": ["low", "high"], "min_temp": 18, "max_temp": 30},
     )
 
+    async def _handle_set_hvac_mode(call) -> None:
+        eid = call.data["entity_id"]
+        cur = hass.states.get(eid)
+        attrs = dict(cur.attributes) if cur is not None else {}
+        hass.states.async_set(eid, call.data["hvac_mode"], attrs)
+
+    async def _handle_turn_off(call) -> None:
+        eid = call.data["entity_id"]
+        cur = hass.states.get(eid)
+        attrs = dict(cur.attributes) if cur is not None else {}
+        hass.states.async_set(eid, "off", attrs)
+
+    hass.services.async_register("climate", "set_hvac_mode", _handle_set_hvac_mode)
+    hass.services.async_register("climate", "turn_off", _handle_turn_off)
+
     entry = ConfigEntry(
         entry_id="wd_test",
         title="Watchdog",
@@ -161,6 +176,8 @@ async def test_manual_override_context_and_safety_watchdog(hass) -> None:
     await entity._async_calculate_and_control(now=t2, force=False)
     assert entity._watchdog_rest_until is not None
     assert entity._active_section == 0
+    await entity.async_will_remove_from_hass()
+    await hass.async_block_till_done()
 
 
 @pytest.mark.asyncio

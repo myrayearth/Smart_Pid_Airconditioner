@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import math
 import re
@@ -113,7 +113,7 @@ def build_ventilation_guard(get_setting: Any) -> VentilationGuard:
     if isinstance(vent_sensors, str):
         vent_sensors = [vent_sensors] if vent_sensors else []
     vent_logic = str(get_setting(CONF_VENT_LOGIC, DEFAULT_VENT_LOGIC))
-    vent_switch = get_setting(CONF_VENT_SWITCH, None)
+    vent_switch = get_setting(CONF_VENT_SWITCH, None) or None
     vent_debounce = duration_to_seconds(
         get_setting(CONF_VENT_DEBOUNCE_SEC, DEFAULT_VENT_DEBOUNCE_SEC),
         DEFAULT_VENT_DEBOUNCE_SEC,
@@ -171,7 +171,7 @@ def _normalize_temp_unit(unit: Any) -> str | None:
     return None
 
 
-def _convert_temperature_to_celsius(val: float, unit: Any) -> float:
+def convert_temperature_to_celsius(val: float, unit: Any) -> float:
     """Convert temperature value to Celsius when unit is Fahrenheit or Kelvin."""
     norm = _normalize_temp_unit(unit)
     if norm == "F":
@@ -179,6 +179,39 @@ def _convert_temperature_to_celsius(val: float, unit: Any) -> float:
     if norm == "K":
         return val - 273.15
     return val
+
+
+def convert_temperature_from_celsius(val_c: float, unit: Any) -> float:
+    """Convert internal Celsius temperature value to target unit (°F, K, or °C)."""
+    norm = _normalize_temp_unit(unit)
+    if norm == "F":
+        return (val_c * 9.0 / 5.0) + 32.0
+    if norm == "K":
+        return val_c + 273.15
+    return val_c
+
+
+def normalize_temperature_value(val: Any, unit: Any) -> float | None:
+    """Parse a raw temperature attribute/state value and normalize it to finite Celsius."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        if not _is_finite_number(val):
+            return None
+        c_val = convert_temperature_to_celsius(float(val), unit)
+        return c_val if math.isfinite(c_val) else None
+    if isinstance(val, str):
+        parsed, inline_unit = _parse_temp_string(val)
+        if parsed is None:
+            return None
+        c_val = convert_temperature_to_celsius(parsed, inline_unit or unit)
+        return c_val if math.isfinite(c_val) else None
+    return None
+
+
+def _convert_temperature_to_celsius(val: float, unit: Any) -> float:
+    """Internal alias preserving backwards compatibility."""
+    return convert_temperature_to_celsius(val, unit)
 
 
 def _parse_temp_string(raw: str) -> tuple[float | None, str | None]:
@@ -361,6 +394,9 @@ class SmartPIDExtraStoredData(ExtraStoredData):
     active_section: int
     integral: float
     last_run_duration_sec: float = 0.0
+    overheat_latched: bool = False
+    last_run_durations: dict[str, float] = field(default_factory=dict)
+    integral_format: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return a dict representation of the extra data."""
@@ -370,6 +406,13 @@ class SmartPIDExtraStoredData(ExtraStoredData):
             "active_section": self.active_section,
             "integral": self.integral,
             "last_run_duration_sec": self.last_run_duration_sec,
+            "overheat_latched": bool(self.overheat_latched),
+            "last_run_durations": {
+                str(k): max(0.0, float(v))
+                for k, v in self.last_run_durations.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+            },
+            "integral_format": self.integral_format,
         }
 
     @classmethod
@@ -394,12 +437,26 @@ class SmartPIDExtraStoredData(ExtraStoredData):
                 integral = 0.0
             last_run_dur = float(data.get("last_run_duration_sec", 0.0))
             last_run_dur = max(0.0, last_run_dur) if math.isfinite(last_run_dur) else 0.0
+            overheat_latched = bool(data.get("overheat_latched", False))
+            raw_durs = data.get("last_run_durations")
+            last_run_durations: dict[str, float] = {}
+            if isinstance(raw_durs, Mapping):
+                for k, v in raw_durs.items():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        fv = float(v)
+                        if math.isfinite(fv) and fv >= 0.0:
+                            last_run_durations[str(k)] = fv
+            raw_fmt = data.get("integral_format")
+            integral_format = str(raw_fmt) if isinstance(raw_fmt, str) and raw_fmt else None
             return cls(
                 last_switch_on_times=on_times,
                 last_switch_off_times=off_times,
                 active_section=active_sec,
                 integral=integral,
                 last_run_duration_sec=last_run_dur,
+                overheat_latched=overheat_latched,
+                last_run_durations=last_run_durations,
+                integral_format=integral_format,
             )
         except (ValueError, TypeError):
             return None

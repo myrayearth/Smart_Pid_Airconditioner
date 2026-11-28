@@ -165,7 +165,7 @@ async def test_i_term_per_minute_and_v1_migration(hass) -> None:
     )
     ok = await async_migrate_entry(hass, v1_entry)
     assert ok is True
-    assert v1_entry.version == 2
+    assert v1_entry.version == 3
     assert v1_entry.data[CONF_KI] == pytest.approx(3.0)
     assert v1_entry.data["ki_group"][CONF_KI] == pytest.approx(3.0)
     assert v1_entry.options[CONF_KI] == pytest.approx(1.2)

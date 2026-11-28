@@ -279,6 +279,12 @@ def _install_ha_stubs() -> None:
             self._tasks.append(task)
             return task
 
+        async def async_add_executor_job(
+            self, target: Callable[..., Any], *args: Any
+        ) -> Any:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, target, *args)
+
         async def async_block_till_done(self) -> None:
             while self._tasks:
                 batch = list(self._tasks)

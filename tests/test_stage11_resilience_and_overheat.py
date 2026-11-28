@@ -182,6 +182,7 @@ async def test_state_reported_refreshes_timestamps_and_prevents_failsafe_climate
     assert entity._fail_safe_active is False
 
     await entity.async_will_remove_from_hass()
+    await hass.async_block_till_done()
     assert hass.bus.listener_count("state_reported") == 0
 
 
@@ -253,6 +254,7 @@ async def test_state_reported_humidifier_and_missing_bus_compat(hass) -> None:
     assert hum._fail_safe_active is False
 
     await hum.async_will_remove_from_hass()
+    await hass.async_block_till_done()
     assert hass.bus.listener_count("state_reported") == 0
 
 

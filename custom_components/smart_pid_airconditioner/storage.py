@@ -36,6 +36,7 @@ class LearningStateSnapshot:
         tau_em_min: float | None = None,
         max_coast_window_min: float | None = None,
         peak_confirm_delta: float | None = None,
+        learning_unit: str | None = None,
     ) -> None:
         self.temp_rls = temp_rls or HuberRLS(
             n_features=3,
@@ -54,9 +55,11 @@ class LearningStateSnapshot:
             peak_confirm_delta=0.1 if peak_confirm_delta is None else peak_confirm_delta,
         )
         self.safety = safety or TuningSafetyManager()
+        self.learning_unit: str | None = learning_unit
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "learning_unit": self.learning_unit,
             "temp_rls": self.temp_rls.to_dict(),
             "hum_rls": self.hum_rls.to_dict(),
             "coasting": self.coasting.to_dict(),
@@ -71,6 +74,12 @@ class LearningStateSnapshot:
         hum_rls = HuberRLS.from_dict(data["hum_rls"]) if "hum_rls" in data else None
         if hum_rls is not None and hum_rls.n_features != 2:
             raise ValueError(f"Invalid hum_rls feature count: {hum_rls.n_features}")
+        learning_unit_raw = data.get("learning_unit")
+        learning_unit = (
+            learning_unit_raw
+            if isinstance(learning_unit_raw, str) and learning_unit_raw
+            else None
+        )
         return cls(
             temp_rls=temp_rls,
             hum_rls=hum_rls,
@@ -84,6 +93,7 @@ class LearningStateSnapshot:
                 if "safety" in data
                 else None
             ),
+            learning_unit=learning_unit,
         )
 
 
@@ -107,12 +117,32 @@ class ModelStore:
         tau_em_min: float | None = None,
         max_coast_window_min: float | None = None,
         peak_confirm_delta: float | None = None,
+        expected_learning_unit: str | None = None,
     ) -> LearningStateSnapshot:
         """Load persisted learning state or return fresh defaults."""
         raw = await self._store.async_load()
         if isinstance(raw, dict):
             try:
                 snap = LearningStateSnapshot.from_dict(raw)
+                if (
+                    expected_learning_unit is not None
+                    and snap.learning_unit is not None
+                    and snap.learning_unit != expected_learning_unit
+                ):
+                    _LOGGER.warning(
+                        "Learning unit mismatch in persisted snapshot (%s != %s); resetting to defaults",
+                        snap.learning_unit,
+                        expected_learning_unit,
+                    )
+                    return LearningStateSnapshot(
+                        inertia_profile=inertia_profile,
+                        tau_em_min=tau_em_min,
+                        max_coast_window_min=max_coast_window_min,
+                        peak_confirm_delta=peak_confirm_delta,
+                        learning_unit=expected_learning_unit,
+                    )
+                if snap.learning_unit is None and expected_learning_unit is not None:
+                    snap.learning_unit = expected_learning_unit
                 snap.coasting.apply_profile_settings(
                     inertia_profile,
                     tau_em_min=tau_em_min,
@@ -130,6 +160,7 @@ class ModelStore:
             tau_em_min=tau_em_min,
             max_coast_window_min=max_coast_window_min,
             peak_confirm_delta=peak_confirm_delta,
+            learning_unit=expected_learning_unit,
         )
 
     async def async_save(self, snapshot: LearningStateSnapshot) -> None:
